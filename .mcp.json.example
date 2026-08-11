@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "planbraid": {
+      "type": "http",
+      "url": "https://YOUR_PLANBRAID_HOST/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PLANBRAID_TOKEN}"
+      }
+    }
+  }
+}

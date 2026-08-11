@@ -1,0 +1,10 @@
+{
+  "description": "Synchronize Codex sessions and completed turns with Planbraid.",
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3, "statusMessage": "Connecting Planbraid" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }],
+    "PostToolUse": [{ "matcher": "apply_patch|Bash|mcp__.*", "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3, "statusMessage": "Syncing Planbraid" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }]
+  }
+}

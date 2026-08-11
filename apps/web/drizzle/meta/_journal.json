@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1786335502286,
+      "tag": "0000_fair_gravity",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1786343860873,
+      "tag": "0001_swift_dakota_north",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786345071683,
+      "tag": "0002_safe_captain_stacy",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1786394557673,
+      "tag": "0003_special_lockheed",
+      "breakpoints": true
+    }
+  ]
+}

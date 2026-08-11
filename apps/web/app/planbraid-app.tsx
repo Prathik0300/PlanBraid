@@ -1,0 +1,500 @@
+"use client";
+
+/* Dialog backdrops are non-interactive presentation layers; every dialog includes a keyboard-accessible close button. */
+/* eslint-disable jsx-a11y/no-static-element-interactions, jsx-a11y/no-autofocus */
+
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { authClient } from "@/lib/auth-client";
+import { firstValidationMessage, passwordSchema } from "@/lib/auth-validation";
+import { GoogleIcon } from "@/app/google-icon";
+import type { Command, DashboardState, Notification, Project, Provider, Source, WorkEvent, WorkItem, WorkStatus } from "@/lib/contracts";
+import { deriveColumn, isStartedWhileBlocked } from "@/lib/graph/column.ts";
+import { DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
+import claudeLogo from "@lobehub/icons-static-svg/icons/claude-color.svg";
+import codexLogo from "@lobehub/icons-static-svg/icons/codex-color.svg";
+import copilotLogo from "@lobehub/icons-static-svg/icons/copilot-color.svg";
+import cursorLogo from "@lobehub/icons-static-svg/icons/cursor.svg";
+import geminiLogo from "@lobehub/icons-static-svg/icons/gemini-color.svg";
+import openAILogo from "@lobehub/icons-static-svg/icons/openai.svg";
+import windsurfLogo from "@lobehub/icons-static-svg/icons/windsurf.svg";
+
+type View = "stream" | "board" | "list" | "inbox" | "agents";
+type Theme = "dark" | "light";
+type McpConnection = { id: string; name: string; scopes: string[]; lastUsedAt: string | null; createdAt: string };
+type BundledLogo = string | { src: string };
+
+const statusMeta: Record<WorkStatus, { label: string; dot: string }> = {
+  proposed: { label: "Proposed", dot: "○" }, planned: { label: "Planned", dot: "◌" }, ready: { label: "Ready", dot: "◇" },
+  in_progress: { label: "In progress", dot: "●" }, blocked: { label: "Blocked", dot: "◆" }, in_review: { label: "Review", dot: "◈" },
+  done: { label: "Done", dot: "✓" }, cancelled: { label: "Cancelled", dot: "×" },
+};
+const providerLabel: Record<string, string> = {
+  codex: "Codex", openai: "OpenAI", chatgpt: "ChatGPT", claude: "Claude", anthropic: "Anthropic",
+  gemini: "Gemini", google: "Google", copilot: "GitHub Copilot", github_copilot: "GitHub Copilot", cursor: "Cursor",
+  windsurf: "Windsurf", human: "You", system: "Planbraid",
+};
+const providerLogo: Record<string, BundledLogo> = {
+  codex: codexLogo, openai: openAILogo, chatgpt: openAILogo, claude: claudeLogo, anthropic: claudeLogo,
+  gemini: geminiLogo, copilot: copilotLogo, github_copilot: copilotLogo, cursor: cursorLogo, windsurf: windsurfLogo,
+};
+
+function requestId(prefix = "ui") { return `${prefix}-${crypto.randomUUID()}`; }
+
+/** Distinct providers that proposed a work item: its own source plus every alias's source. */
+function corroboratingProviders(item: WorkItem, aliases: DashboardState["aliases"], sources: Source[]) {
+  const providers = new Set<string>();
+  const ownSource = sources.find((source) => source.id === item.sourceId);
+  if (ownSource) providers.add(ownSource.provider);
+  for (const alias of aliases) {
+    const source = sources.find((entry) => entry.id === alias.sourceId);
+    if (source) providers.add(source.provider);
+  }
+  return [...providers];
+}
+
+/**
+ * The still-unresolved hard prerequisites behind an item's blockingCount, resolved to
+ * their actual work items so the UI can name them rather than just show a number. Kept
+ * separate from blockingCount itself (the authoritative, server-maintained value that
+ * deriveColumn reads); this is a client-side re-derivation purely for display.
+ */
+function unresolvedBlockers(item: WorkItem, dependencies: DashboardState["dependencies"], allItems: WorkItem[]) {
+  const dagTypes: readonly string[] = DAG_EDGE_TYPES;
+  return dependencies
+    .filter((edge) => edge.toWorkItemId === item.id && dagTypes.includes(edge.type))
+    .map((edge) => allItems.find((entry) => entry.id === edge.fromWorkItemId))
+    .filter((entry): entry is WorkItem => entry != null && !["done", "cancelled"].includes(entry.status));
+}
+
+export function PlanbraidApp() {
+  // Hooked here, not just inside ProfileDialog, so the header and sidebar avatars stay
+  // in sync with the same session the dialog reads: one source of truth, not three.
+  const { data: session } = authClient.useSession();
+  const avatarUrl = session?.user.image ?? null;
+  const [data, setData] = useState<DashboardState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [projectId, setProjectId] = useState("");
+  const [sourceId, setSourceId] = useState<string | null>(null);
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [view, setView] = useState<View>("stream");
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<WorkStatus | "all">("all");
+  const [newUpdates, setNewUpdates] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [theme, setTheme] = useState<Theme>("dark");
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [mutating, setMutating] = useState(false);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const refresh = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    try {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      if (!response.ok) throw new Error("Planbraid could not load project state");
+      const state = await response.json() as DashboardState;
+      setData(state);
+      setProjectId((current) => {
+        if (current && state.projects.some((project) => project.id === current)) return current;
+        return [...state.projects].sort((a, b) => state.workItems.filter((item) => item.projectId === b.id).length - state.workItems.filter((item) => item.projectId === a.id).length)[0]?.id ?? "";
+      });
+      setError(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Planbraid could not load");
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("planbraid-theme") ?? window.localStorage.getItem("relayboard-theme");
+    setTheme(saved === "dark" || saved === "light" ? saved : window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("planbraid-theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    const project = data?.projects.find((entry) => entry.id === projectId);
+    const after = project?.revision ?? 0;
+    const stream = new EventSource(`/api/events?projectId=${encodeURIComponent(projectId)}&after=${after}`);
+    stream.addEventListener("project-event", (message) => {
+      setNewUpdates((count) => count + 1);
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = setTimeout(() => void refresh(true), 250);
+      try {
+        const event = JSON.parse((message as MessageEvent).data) as { summary?: string; event_type?: string };
+        void showSystemNotification(event.event_type?.includes("blocked") ? "Planbraid needs attention" : "Planbraid update", event.summary ?? "Project work changed");
+      } catch { /* reconnect refresh is authoritative */ }
+    });
+    stream.onerror = () => stream.close();
+    const fallback = setInterval(() => void refresh(true), 15000);
+    return () => { stream.close(); clearInterval(fallback); if (refreshTimer.current) clearTimeout(refreshTimer.current); };
+  }, [projectId, data?.projects, refresh]);
+
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setCommandOpen(true); }
+      if (event.key === "Escape") { setSelectedItemId(null); setCommandOpen(false); setSetupOpen(false); setProfileOpen(false); setSidebarOpen(false); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const project = data?.projects.find((entry) => entry.id === projectId) ?? null;
+  const projectItems = useMemo(() => (data?.workItems ?? []).filter((item) => item.projectId === projectId), [data, projectId]);
+  const sources = useMemo(() => (data?.sources ?? []).filter((source) => source.projectId === projectId), [data, projectId]);
+  const filteredItems = useMemo(() => projectItems.filter((item) => (!sourceId || item.sourceId === sourceId) && (statusFilter === "all" || deriveColumn(item) === statusFilter) && (!query || `${item.itemKey} ${item.title} ${item.description}`.toLowerCase().includes(query.toLowerCase()))), [projectItems, sourceId, statusFilter, query]);
+  const events = useMemo(() => (data?.events ?? []).filter((event) => {
+    if (event.projectId !== projectId || (sourceId && event.sourceId !== sourceId) || (query && !event.summary.toLowerCase().includes(query.toLowerCase()))) return false;
+    if (statusFilter === "all") return true;
+    const item = projectItems.find((entry) => entry.id === event.workItemId);
+    return item ? deriveColumn(item) === statusFilter : false;
+  }), [data, projectId, sourceId, query, statusFilter, projectItems]);
+  const selectedItem = data?.workItems.find((item) => item.id === selectedItemId) ?? null;
+  const unread = data?.notifications.filter((notification) => !notification.readAt).length ?? 0;
+
+  async function command(command: Command, success: string) {
+    setMutating(true);
+    try {
+      const response = await fetch("/api/commands", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) });
+      const body = await response.json() as { error?: { code: string; message: string } };
+      if (!response.ok) throw new Error(body.error ? `${body.error.message} (${body.error.code})` : "Update failed");
+      setToast(success);
+      setTimeout(() => setToast(null), 2800);
+      await refresh(true);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Update failed"); }
+    finally { setMutating(false); }
+  }
+
+  function settleSidebarAfterSelection() {
+    if (window.matchMedia("(max-width: 900px)").matches) setSidebarOpen(false);
+  }
+
+  if (loading && !data) return <LoadingShell />;
+  if (error && !data) return <ErrorState message={error} retry={() => void refresh()} />;
+
+  return (
+    <main className={`app-shell ${sidebarOpen ? "sidebar-open" : ""}`}>
+      <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen(true)} onProfile={() => setProfileOpen(true)} />
+      <section className="workspace" aria-label="Unified project workspace">
+        <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} sidebarOpen={sidebarOpen} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
+        {project && view !== "inbox" && view !== "agents" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} />}
+        {newUpdates > 0 && <button className="new-updates" onClick={() => { setNewUpdates(0); window.scrollTo({ top: 0, behavior: "smooth" }); }}>↑ {newUpdates} new {newUpdates === 1 ? "update" : "updates"}</button>}
+        <div className="workspace-body">
+          {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen(true)} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
+          {project && view === "stream" && <Stream events={events} items={projectItems} sources={sources} onItem={setSelectedItemId} />}
+          {project && view === "board" && <Board items={filteredItems} sources={sources} aliases={data?.aliases ?? []} dependencies={data?.dependencies ?? []} onItem={setSelectedItemId} onTransition={(item, status) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status, idempotencyKey: requestId("drag") }, `${item.itemKey} moved to ${statusMeta[status].label}`)} />}
+          {project && view === "list" && <ListView items={filteredItems} sources={sources} onItem={setSelectedItemId} />}
+          {project && view === "inbox" && <Inbox notifications={data!.notifications.filter((entry) => entry.projectId === projectId)} onOpen={(notification) => { if (notification.workItemId) setSelectedItemId(notification.workItemId); void command({ action: "mark_notification", notificationId: notification.id, read: true, idempotencyKey: requestId("read") }, "Notification marked read"); }} onResolve={(notification) => void command({ action: "mark_notification", notificationId: notification.id, read: true, resolved: true, idempotencyKey: requestId("resolve") }, "Action resolved")} />}
+          {project && view === "agents" && <Agents sources={sources} items={projectItems} />}
+        </div>
+        {project && view !== "inbox" && view !== "agents" && <Composer project={project} sources={sources} busy={mutating} onCreate={(title, source) => void command({ action: "create_item", projectId, title, sourceId: source || undefined, status: "proposed", idempotencyKey: requestId("create") }, "Task added to the unified plan")} />}
+      </section>
+      {selectedItem && <TaskDrawer item={selectedItem} source={sources.find((entry) => entry.id === selectedItem.sourceId) ?? null} sources={sources} events={(data?.events ?? []).filter((event) => event.workItemId === selectedItem.id)} evidence={(data?.evidence ?? []).filter((entry) => entry.workItemId === selectedItem.id)} dependencies={(data?.dependencies ?? []).filter((entry) => entry.fromWorkItemId === selectedItem.id || entry.toWorkItemId === selectedItem.id)} aliases={(data?.aliases ?? []).filter((entry) => entry.workItemId === selectedItem.id)} allItems={projectItems} busy={mutating} close={() => setSelectedItemId(null)} transition={(status, reason) => void command({ action: "transition_item", projectId: selectedItem.projectId, itemId: selectedItem.id, expectedVersion: selectedItem.version, status, reason, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("transition") }, `${selectedItem.itemKey} is now ${statusMeta[status].label}`)} note={(summary) => void command({ action: "add_note", projectId: selectedItem.projectId, itemId: selectedItem.id, summary, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("note") }, "Progress recorded")} splitAlias={(aliasId) => void command({ action: "split_alias", projectId: selectedItem.projectId, aliasId, idempotencyKey: requestId("split") }, "Moved back into its own task")} />}
+      {commandOpen && <CommandDialog projects={data!.projects} currentProject={projectId} close={() => setCommandOpen(false)} create={(name, directory) => { void command({ action: "create_project", name, directory, idempotencyKey: requestId("project") }, "Project created"); setCommandOpen(false); }} />}
+      {setupOpen && <SetupDialog project={project} close={() => setSetupOpen(false)} toast={setToast} />}
+      {profileOpen && <ProfileDialog viewer={data!.viewer} close={() => setProfileOpen(false)} />}
+      {toast && <div className="toast" role="status">{toast}</div>}
+      {project && <nav className="mobile-nav" aria-label="Mobile navigation">
+        <button className={view === "stream" ? "active" : ""} onClick={() => setView("stream")}>Activity</button><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>Board</button><button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>Inbox{unread ? ` · ${unread}` : ""}</button><button className={view === "agents" ? "active" : ""} onClick={() => setView("agents")}>Agents</button>
+      </nav>}
+    </main>
+  );
+}
+
+function LoadingShell() { return <div className="loading-screen"><div className="brand-mark graphic" aria-hidden="true" /><div><strong>Planbraid</strong><span>Braiding your project work…</span></div></div>; }
+function ErrorState({ message, retry }: { message: string; retry: () => void }) { return <div className="error-screen"><div className="brand-mark graphic" aria-hidden="true" /><h1>Couldn’t open Planbraid</h1><p>{message}</p><button onClick={retry}>Try again</button></div>; }
+
+function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSelect, onSource, open, toggle, onNew, onProfile }: { data: DashboardState; avatarUrl: string | null; selected: string; selectedSource: string | null; sources: Source[]; onSelect: (id: string) => void; onSource: (id: string | null) => void; open: boolean; toggle: () => void; onNew: () => void; onProfile: () => void }) {
+  return <aside className={`project-rail ${open ? "open" : "collapsed"}`} aria-label="Projects and agent conversations">
+    <div className="rail-brand">
+      {open && <><span className="planbraid-logo" aria-hidden="true" /><strong>Planbraid</strong></>}
+      <button className="icon-button sidebar-toggle" onClick={toggle} aria-label={`${open ? "Collapse" : "Expand"} projects and agents`} aria-expanded={open}>
+        <span className="hamburger-icon" aria-hidden="true"><span /><span /><span /></span>
+      </button>
+    </div>
+    {open && <><button className="new-project" onClick={onNew}><span>＋</span> New project</button>
+    <div className="rail-label">Projects</div>
+    <div className="project-list">{data.projects.map((project) => {
+      const taskCount = data.workItems.filter((item) => item.projectId === project.id).length;
+      const activeCount = data.sources.filter((source) => source.projectId === project.id && source.status === "active").length;
+      return <button key={project.id} className={`project-row ${selected === project.id ? "selected" : ""}`} onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1)}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>;
+    })}</div>
+    <div className="rail-divider" />
+    <div className="rail-label">Chats & agents</div>
+    <div className="agent-list"><button className={`source-row all-sources ${selectedSource === null ? "active" : ""}`} onClick={() => onSource(null)}><span className="all-agent-icon">◎</span><span><strong>All activity</strong><small>Every connected conversation</small></span></button>{sources.map((source) => <button key={source.id} className={`source-row ${selectedSource === source.id ? "active" : ""}`} onClick={() => onSource(source.id)}><ProviderIcon provider={source.provider} /><span><strong>{providerLabel[source.provider] ?? source.provider}</strong><small>{source.title}</small></span><span className={`presence ${source.status}`} title={source.status} /></button>)}</div>
+    <button className="rail-footer" onClick={onProfile}><span className="avatar">{avatarUrl ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(avatarUrl)})` }} aria-hidden="true" /> : data.viewer.name.slice(0, 1).toUpperCase()}</span><span><strong>{data.viewer.name}</strong><small>Account &amp; profile</small></span><b aria-hidden="true">›</b></button></>}
+  </aside>;
+}
+
+function Header({ project, itemCount, sources, unread, view, setView, query, setQuery, theme, sidebarOpen, toggleTheme, onSetup, viewer, avatarUrl, onProfile }: { project: Project | null; itemCount: number; sources: Source[]; unread: number; view: View; setView: (view: View) => void; query: string; setQuery: (query: string) => void; theme: Theme; sidebarOpen: boolean; toggleTheme: () => void; onSetup: () => void; viewer: DashboardState["viewer"]; avatarUrl: string | null; onProfile: () => void }) {
+  return <><header className="workspace-header">
+    {(!sidebarOpen || project) && <div className="workspace-heading">{!sidebarOpen && <span className="workspace-brand"><span className="planbraid-logo" aria-hidden="true" /><strong>Planbraid</strong></span>}{!sidebarOpen && project && <span className="workspace-heading-divider" aria-hidden="true" />}{project && <span className="workspace-project"><h1>{project.name}</h1><p>{itemCount} {itemCount === 1 ? "task" : "tasks"} · {sources.length} connected {sources.length === 1 ? "conversation" : "conversations"}</p></span>}</div>}
+    <div className="header-actions">{project && <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search tasks and updates" aria-label="Search tasks and updates"/></label>}{project && <div className="sync-pill" aria-label={`${sources.filter((source) => source.status === "active").length} active agents`}><span className="presence active" /> Live</div>}<button className={`theme-switch ${theme}`} role="switch" aria-checked={theme === "light"} onClick={toggleTheme} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}><span className="theme-switch-thumb" aria-hidden="true"><span className="theme-switch-icon moon">☾</span><span className="theme-switch-icon sun">☼</span></span></button><button className="setup-button" onClick={onSetup}>Connect agent</button><button className="profile-trigger" onClick={onProfile} aria-label="Open account and profile" title="Account and profile"><span className="avatar">{avatarUrl ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(avatarUrl)})` }} aria-hidden="true" /> : viewer.name.slice(0, 1).toUpperCase()}</span></button></div>
+  </header>{project && <nav className="view-tabs" aria-label="Project views">{(["stream", "board", "list", "inbox", "agents"] as View[]).map((entry) => <button key={entry} className={view === entry ? "active" : ""} aria-pressed={view === entry} onClick={() => setView(entry)}>{entry === "stream" ? "Activity" : entry[0].toUpperCase() + entry.slice(1)}{entry === "inbox" && unread > 0 ? <b>{unread}</b> : null}</button>)}</nav>}</>;
+}
+
+function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; close: () => void }) {
+  const { data: session, isPending } = authClient.useSession();
+  const [name, setName] = useState(viewer.name);
+  const [providers, setProviders] = useState<string[]>([]);
+  const [googleEnabled, setGoogleEnabled] = useState(false);
+  const [accountsLoaded, setAccountsLoaded] = useState(false);
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const local = viewer.email.endsWith("@planbraid.local");
+
+  useEffect(() => {
+    if (local) return;
+    void Promise.all([
+      authClient.listAccounts(),
+      fetch("/api/account/config", { cache: "no-store" }).then((response) => response.json()),
+    ]).then(([accounts, config]) => {
+      setProviders((accounts.data ?? []).map((account) => account.providerId));
+      setGoogleEnabled(Boolean((config as { data?: { googleEnabled?: boolean } }).data?.googleEnabled));
+      setAccountsLoaded(true);
+    }).catch(() => { setAccountsLoaded(true); setMessage("Account details could not be refreshed."); });
+  }, [local]);
+
+  async function saveProfile(event: FormEvent) {
+    event.preventDefault();
+    const cleanName = name.trim();
+    if (local || cleanName.length < 2) return;
+    setBusy(true);
+    setMessage(null);
+    const result = await authClient.updateUser({ name: cleanName });
+    if (result.error) { setMessage(result.error.message || "Profile update failed"); setBusy(false); return; }
+    window.location.reload();
+  }
+
+  async function signOut() {
+    setBusy(true);
+    await authClient.signOut();
+    window.location.assign("/sign-in");
+  }
+
+  async function linkGoogle() {
+    setBusy(true);
+    const result = await authClient.linkSocial({ provider: "google", callbackURL: "/" });
+    if (result?.error) { setMessage(result.error.message || "Google connection failed"); setBusy(false); }
+  }
+
+  async function addPassword(event: FormEvent) {
+    event.preventDefault();
+    const parsed = passwordSchema.safeParse(newPassword);
+    if (!parsed.success) { setMessage(firstValidationMessage(parsed.error)); return; }
+    if (newPassword !== confirmPassword) { setMessage("The two passwords do not match."); return; }
+    setBusy(true);
+    setMessage(null);
+    const response = await fetch("/api/account/password", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: parsed.data }) });
+    const body = await response.json() as { error?: { message?: string } };
+    if (!response.ok) { setMessage(body.error?.message ?? "Password setup failed"); setBusy(false); return; }
+    setProviders((current) => [...new Set([...current, "credential"])]);
+    setNewPassword("");
+    setConfirmPassword("");
+    setMessage("Email and password sign-in is now connected to this same account.");
+    setBusy(false);
+  }
+
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><section className="profile-dialog" role="dialog" aria-modal="true" aria-labelledby="profile-title">
+    <header><div><span className="eyebrow">PLANBRAID ACCOUNT</span><h2 id="profile-title">Account &amp; profile</h2><p>Your identity and persistent workspace settings.</p></div><button className="icon-button" onClick={close} aria-label="Close account and profile">×</button></header>
+    <div className="profile-identity"><span className="profile-avatar">{session?.user.image ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(session.user.image)})` }} aria-hidden="true" /> : viewer.name.slice(0, 1).toUpperCase()}</span><span><strong>{session?.user.name || viewer.name}</strong><small>{session?.user.email || viewer.email}</small></span></div>
+    {local ? <div className="profile-local-note"><strong>Local development workspace</strong><p>Account sessions are required on the hosted Planbraid app. Localhost keeps a developer-only workspace so the product can be tested without creating an account.</p></div> : <>
+      <form className="profile-form" onSubmit={saveProfile}><label><span>Display name</span><input value={name} onChange={(event) => setName(event.target.value)} minLength={2} maxLength={80} disabled={isPending || busy} /></label><label><span>Email</span><input value={session?.user.email || viewer.email} disabled /></label><button className="primary-wide" disabled={busy || isPending || name.trim() === (session?.user.name || viewer.name)}>Save profile</button></form>
+      <div className="login-methods"><div><h3>Sign-in methods</h3><p>Methods with the same verified email belong to this one account and workspace.</p></div><div className={`login-method ${accountsLoaded && !providers.includes("credential") ? "unavailable" : ""}`}><span className="method-icon">@</span><span><strong>Email &amp; password</strong><small>{providers.includes("credential") ? "Connected to this account" : accountsLoaded ? "No password set" : "Checking…"}</small></span><b>{providers.includes("credential") ? "Connected" : accountsLoaded ? "Not set" : "…"}</b></div>{accountsLoaded && !providers.includes("credential") && <form className="password-setup" onSubmit={addPassword}><strong>Add password sign-in</strong><p>You signed up with Google. Set a password if you also want to sign in with this account&apos;s email address.</p><p className="field-hint">Use 10 or more characters with uppercase, lowercase, a number, and a special character.</p><label><span>New password</span><input type="password" autoComplete="new-password" minLength={10} maxLength={128} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label><label><span>Confirm password</span><input type="password" autoComplete="new-password" minLength={10} maxLength={128} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required /></label><button className="primary-wide" disabled={busy}>Add password</button></form>}{providers.includes("google") ? <div className="login-method"><ProviderIcon provider="google" /><span><strong>Google</strong><small>Connected to this account</small></span><b>Connected</b></div> : googleEnabled ? <button className="login-method connect-method" disabled={busy} onClick={() => void linkGoogle()}><ProviderIcon provider="google" /><span><strong>Google</strong><small>Add another secure sign-in method</small></span><b>Connect</b></button> : <div className="login-method unavailable"><ProviderIcon provider="google" /><span><strong>Google</strong><small>Waiting for OAuth credentials</small></span><b>Setup needed</b></div>}</div>
+      {message && <div className="auth-error" role="status">{message}</div>}
+      <div className="profile-actions"><button className="signout-button" disabled={busy} onClick={() => void signOut()}>Sign out</button><small>Signing out does not disconnect your authorized MCP agents.</small></div>
+    </>}
+  </section></div>;
+}
+
+function FilterBar({ items, filter, setFilter, source, clearSource }: { items: WorkItem[]; filter: WorkStatus | "all"; setFilter: (status: WorkStatus | "all") => void; source: Source | null; clearSource: () => void }) {
+  const statuses: Array<WorkStatus | "all"> = ["all", "in_progress", "ready", "blocked", "in_review", "done"];
+  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}</div>;
+}
+
+function Stream({ events, items, sources, onItem }: { events: WorkEvent[]; items: WorkItem[]; sources: Source[]; onItem: (id: string) => void }) {
+  if (!events.length) return <Empty title="No updates in this view" body="Change the source or search filter, or create the first task update." />;
+  return <div className="stream" aria-live="polite">{events.map((event, index) => {
+    const day = new Date(event.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: new Date(event.createdAt).getFullYear() !== new Date().getFullYear() ? "numeric" : undefined });
+    const item = items.find((entry) => entry.id === event.workItemId);
+    const source = sources.find((entry) => entry.id === event.sourceId);
+    const previousDay = index > 0 ? new Date(events[index - 1].createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: new Date(events[index - 1].createdAt).getFullYear() !== new Date().getFullYear() ? "numeric" : undefined }) : "";
+    const separator = day !== previousDay;
+    return <div key={event.id}>{separator && <div className="day-separator"><span>{day}</span></div>}<article className={`event-card ${eventTone(event)}`}><div className="event-icon"><ProviderIcon provider={(source?.provider ?? (event.actorName.toLowerCase() as Provider))} /></div><div className="event-content"><div className="event-meta"><strong>{event.actorName}</strong><span>{eventAction(event.eventType)}</span><time title={new Date(event.createdAt).toLocaleString()}>{relative(event.createdAt)}</time></div><p>{event.summary}</p>{item && <button className="event-task" onClick={() => onItem(item.id)}><span className={`status-dot ${item.status}`}>{statusMeta[item.status].dot}</span><b>{item.itemKey}</b><span>{item.title}</span><small>{statusMeta[item.status].label}</small></button>}{event.eventType === "interaction.completed" && <div className="interaction-chip">Turn reconciled · {String(event.metadata.reconciliation ?? "recorded").replaceAll("_", " ")}</div>}</div></article></div>;
+  })}</div>;
+}
+
+function Board({ items, sources, aliases, dependencies, onItem, onTransition }: { items: WorkItem[]; sources: Source[]; aliases: DashboardState["aliases"]; dependencies: DashboardState["dependencies"]; onItem: (id: string) => void; onTransition: (item: WorkItem, status: WorkStatus) => void }) {
+  const columns: WorkStatus[] = ["proposed", "planned", "ready", "in_progress", "blocked", "in_review", "done"];
+  // Grouped by the derived column, not raw status: a card here moves on its own once
+  // its last blocker resolves, with no write to the card's own row. See lib/graph/column.ts.
+  const byColumn = new Map(columns.map((status) => [status, items.filter((item) => deriveColumn(item) === status)]));
+  return <div className="board">{columns.map((status) => <section className="board-column" key={status}><header><span className={`status-dot ${status}`}>{statusMeta[status].dot}</span><strong>{statusMeta[status].label}</strong><b>{byColumn.get(status)?.length ?? 0}</b></header><div className="board-stack">{byColumn.get(status)?.map((item) => <TaskCard key={item.id} item={item} source={sources.find((source) => source.id === item.sourceId)} aliases={aliases.filter((alias) => alias.workItemId === item.id)} sources={sources} dependencies={dependencies} allItems={items} onClick={() => onItem(item.id)} onMove={(next) => onTransition(item, next)} />)}</div></section>)}</div>;
+}
+
+function TaskCard({ item, source, aliases, sources, dependencies, allItems, onClick, onMove }: { item: WorkItem; source?: Source; aliases: DashboardState["aliases"]; sources: Source[]; dependencies: DashboardState["dependencies"]; allItems: WorkItem[]; onClick: () => void; onMove: (status: WorkStatus) => void }) {
+  const corroborated = corroboratingProviders(item, aliases, sources).length > 1;
+  const aliasTitle = aliases.map((alias) => `${providerLabel[sources.find((entry) => entry.id === alias.sourceId)?.provider ?? ""] ?? "Another agent"} also proposed: "${alias.title}"`).join("\n");
+  const column = deriveColumn(item);
+  const waitingOn = column === "blocked" && item.status !== "blocked" ? unresolvedBlockers(item, dependencies, allItems) : [];
+  const anomaly = isStartedWhileBlocked(item);
+  return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="blocker-copy">Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}<footer>{source ? <span><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</span> : <span>Manual</span>}<span>{item.assignee ?? "Unassigned"}</span></footer></button><select aria-label={`Move ${item.itemKey}`} value={item.status} onChange={(event) => onMove(event.target.value as WorkStatus)}>{Object.entries(statusMeta).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></article>;
+}
+
+function ListView({ items, sources, onItem }: { items: WorkItem[]; sources: Source[]; onItem: (id: string) => void }) {
+  return <div className="list-view"><div className="list-head"><span>Work item</span><span>Status</span><span>Source</span><span>Owner</span><span>Updated</span></div>{items.map((item) => { const source = sources.find((entry) => entry.id === item.sourceId); const column = deriveColumn(item); return <button className="list-row" key={item.id} onClick={() => onItem(item.id)}><span className="list-title"><span className={`priority ${item.priority}`} /><b>{item.itemKey}</b><strong>{item.title}</strong></span><span className={`status-badge ${column}`}>{statusMeta[column].dot} {statusMeta[column].label}</span><span>{source ? <><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</> : "Manual"}</span><span>{item.assignee ?? "Unassigned"}</span><span>{relative(item.updatedAt)}</span></button>; })}</div>;
+}
+
+function Inbox({ notifications, onOpen, onResolve }: { notifications: Notification[]; onOpen: (notification: Notification) => void; onResolve: (notification: Notification) => void }) {
+  const [tab, setTab] = useState<"action" | "updates" | "all">("action");
+  const visible = notifications.filter((notification) => tab === "all" || tab === "action" ? (tab === "all" || notification.requiresAction && !notification.resolvedAt) : !notification.requiresAction);
+  return <div className="inbox"><div className="inbox-heading"><span><h2>Inbox</h2><p>Decisions, completed turns, blockers, and agent health.</p></span><div className="segment"><button className={tab === "action" ? "active" : ""} onClick={() => setTab("action")}>Needs action</button><button className={tab === "updates" ? "active" : ""} onClick={() => setTab("updates")}>Updates</button><button className={tab === "all" ? "active" : ""} onClick={() => setTab("all")}>All</button></div></div>{visible.length ? <div className="inbox-list">{visible.map((notification) => <article className={`notification-card ${notification.readAt ? "read" : ""}`} key={notification.id}><span className={`notification-priority ${notification.priority}`}>!</span><button className="notification-main" onClick={() => onOpen(notification)}><div><strong>{notification.title}</strong><time>{relative(notification.createdAt)}</time></div><p>{notification.body}</p><small>{notification.eventType.replaceAll("_", " ").replaceAll(".", " · ")}</small></button>{notification.requiresAction && !notification.resolvedAt && <button className="resolve-button" onClick={() => onResolve(notification)}>Resolve</button>}</article>)}</div> : <Empty title="You’re caught up" body="Nothing in this notification view needs your attention." />}</div>;
+}
+
+function Agents({ sources, items }: { sources: Source[]; items: WorkItem[] }) { return <div className="agents-view"><div className="inbox-heading"><span><h2>Connected agents</h2><p>Sessions, coding spaces, capture assurance, and current work.</p></span></div><div className="agent-grid">{sources.map((source) => <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{providerLabel[source.provider]}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{items.filter((item) => item.sourceId === source.id && !["done", "cancelled"].includes(item.status)).map((item) => <span key={item.id}><b>{item.itemKey}</b> {item.title}</span>)}</div></article>)}</div></div>; }
+
+function Composer({ project, sources, busy, onCreate }: { project: Project | null; sources: Source[]; busy: boolean; onCreate: (title: string, source: string) => void }) {
+  const [title, setTitle] = useState(""); const [source, setSource] = useState("");
+  function submit(event: FormEvent) { event.preventDefault(); if (!title.trim()) return; onCreate(title.trim(), source); setTitle(""); }
+  return <form className="composer" onSubmit={submit}><span className="composer-plus">＋</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={`Add work to ${project?.name ?? "this project"}…`} aria-label="New task title"/><select value={source} onChange={(event) => setSource(event.target.value)} aria-label="Task source"><option value="">Manual</option>{sources.map((entry) => <option value={entry.id} key={entry.id}>{providerLabel[entry.provider]} · {entry.title}</option>)}</select><button disabled={busy || !title.trim()}>{busy ? "Saving…" : "Add task"}</button></form>;
+}
+
+function TaskDrawer({ item, source, sources, events, evidence, dependencies, aliases, allItems, busy, close, transition, note, splitAlias }: { item: WorkItem; source: Source | null; sources: Source[]; events: WorkEvent[]; evidence: DashboardState["evidence"]; dependencies: DashboardState["dependencies"]; aliases: DashboardState["aliases"]; allItems: WorkItem[]; busy: boolean; close: () => void; transition: (status: WorkStatus, reason?: string) => void; note: (summary: string) => void; splitAlias: (aliasId: string) => void }) {
+  const [tab, setTab] = useState<"overview" | "activity" | "evidence">("overview"); const [noteText, setNoteText] = useState("");
+  const corroboratedProviders = corroboratingProviders(item, aliases, sources);
+  const waitingOn = unresolvedBlockers(item, dependencies, allItems);
+  const anomaly = isStartedWhileBlocked(item);
+  return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><aside className="task-drawer" aria-label={`${item.itemKey} details`}><header className="drawer-header"><span className={`status-badge ${item.status}`}>{statusMeta[item.status].dot} {statusMeta[item.status].label}</span><button className="icon-button" onClick={close} aria-label="Close task">×</button></header><div className="drawer-title"><small>{item.itemKey} · v{item.version}</small><h2>{item.title}</h2><p>{item.description || "No description has been added yet."}</p>{corroboratedProviders.length > 1 && <p className="corroboration-banner">Proposed independently by {corroboratedProviders.map((provider) => providerLabel[provider] ?? provider).join(" and ")}.</p>}{anomaly && <p className="anomaly-banner">⚠ In progress, but {waitingOn.length ? `${waitingOn.map((entry) => entry.itemKey).join(", ")} is still unresolved` : "a prerequisite is still unresolved"}.</p>}</div><div className="drawer-fields"><label>Status<select value={item.status} disabled={busy} onChange={(event) => transition(event.target.value as WorkStatus, event.target.value === "blocked" ? "Blocked from task detail" : undefined)}>{Object.entries(statusMeta).map(([value, meta]) => <option value={value} key={value}>{meta.label}</option>)}</select></label><label>Priority<strong className={`priority-value ${item.priority}`}>{item.priority}</strong></label><label>Owner<strong>{item.assignee ?? "Unassigned"}</strong></label><label>Source<strong>{source ? <><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</> : "Manual"}</strong></label></div><nav className="drawer-tabs"><button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button><button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity {events.length}</button><button className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>Evidence {evidence.length}</button></nav><div className="drawer-body">{tab === "overview" && <><section><h3>Completion</h3><div className="confidence"><span>{item.completionConfidence}</span><span>{item.verificationStatus}</span></div></section>{item.blockerReason && <section className="blocker-panel"><h3>Blocker</h3><p>{item.blockerReason}</p></section>}{waitingOn.length > 0 && <section className="blocker-panel"><h3>Waiting on</h3>{waitingOn.map((entry) => <p key={entry.id}><b>{entry.itemKey}</b> {entry.title} · {statusMeta[entry.status].label}</p>)}</section>}<section><h3>Dependencies</h3>{dependencies.length ? dependencies.map((edge) => { const linkedId = edge.fromWorkItemId === item.id ? edge.toWorkItemId : edge.fromWorkItemId; const linked = allItems.find((entry) => entry.id === linkedId); return <div className="dependency-row" key={edge.id}><span>{edge.type}</span><b>{linked?.itemKey}</b><p>{linked?.title}</p></div>; }) : <p className="muted">No dependencies.</p>}</section>{aliases.length > 0 && <section><h3>Also proposed</h3>{aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return <div className="alias-row" key={alias.id}><ProviderIcon provider={(aliasSource?.provider ?? "system") as Provider} /><span><strong>{alias.title}</strong><small>{providerLabel[aliasSource?.provider ?? ""] ?? "Another agent"} · {relative(alias.createdAt)} · {alias.matchReason}</small></span><button className="alias-split" disabled={busy} onClick={() => splitAlias(alias.id)}>Not the same, make separate task</button></div>; })}</section>}</>}{tab === "activity" && events.map((event) => <div className="mini-event" key={event.id}><ProviderIcon provider={(source?.provider ?? "system") as Provider}/><span><strong>{event.summary}</strong><small>{event.actorName} · {relative(event.createdAt)}</small></span></div>)}{tab === "evidence" && (evidence.length ? evidence.map((entry) => <div className="evidence-row" key={entry.id}><span>✓</span><span><strong>{entry.label}</strong><small>{entry.type} · {entry.result ?? "recorded"}</small></span></div>) : <p className="muted">No evidence attached yet.</p>)}</div><form className="drawer-note" onSubmit={(event) => { event.preventDefault(); if (!noteText.trim()) return; note(noteText.trim()); setNoteText(""); }}><input value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="Add a progress update…"/><button disabled={!noteText.trim() || busy}>Add</button></form></aside></div>;
+}
+
+function CommandDialog({ projects, currentProject, close, create }: { projects: Project[]; currentProject: string; close: () => void; create: (name: string, directory: string) => void }) { const [mode, setMode] = useState<"search" | "project">("search"); const [value, setValue] = useState(""); const [directory, setDirectory] = useState(""); return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><div className="command-dialog" role="dialog" aria-modal="true" aria-label="Command palette"><header><span>⌕</span><input autoFocus value={value} onChange={(event) => setValue(event.target.value)} placeholder={mode === "project" ? "Project name" : "Type a command or project…"}/><kbd>esc</kbd></header>{mode === "project" ? <div className="project-form"><label>Directory or repository<input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="/Projects/new-app"/></label><button onClick={() => value.trim() && create(value.trim(), directory.trim())}>Create project</button></div> : <div className="command-results"><button onClick={() => setMode("project")}><span>＋</span><b>Create a new project</b><small>Register a directory or initiative</small></button>{projects.map((project) => <a href={`/?project=${project.id}`} key={project.id} className={project.id === currentProject ? "current" : ""}><span className="project-glyph">{project.name[0]}</span><b>Open {project.name}</b><small>{project.directory || project.description}</small></a>)}</div>}</div></div>; }
+
+function SetupDialog({ project, close, toast }: { project: Project | null; close: () => void; toast: (message: string) => void }) {
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState<"oauth" | "token">("oauth");
+  const [connections, setConnections] = useState<McpConnection[]>([]);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [pushEnabled, setPushEnabled] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window) || Notification.permission !== "granted") return;
+      const registration = await navigator.serviceWorker.getRegistration("/sw.js");
+      const subscription = await registration?.pushManager.getSubscription();
+      if (!cancelled && subscription) setPushEnabled(true);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  const loadConnections = useCallback(async () => {
+    const response = await fetch("/api/tokens", { headers: { accept: "application/json" } });
+    const body = await response.json() as { data?: McpConnection[] };
+    if (response.ok) setConnections(body.data ?? []);
+  }, []);
+  async function generate() {
+    setBusy(true);
+    try {
+      const response = await fetch("/api/tokens", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: `${project?.name ?? "Project"} coding agents` }) });
+      const body = await response.json() as { data?: { token: string }; error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not generate an agent token");
+      setToken(body.data?.token ?? "");
+      await loadConnections();
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not generate an agent token"); }
+    finally { setBusy(false); }
+  }
+  async function revoke(id: string) {
+    setRevokingId(id);
+    try {
+      const response = await fetch("/api/tokens", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) });
+      const body = await response.json() as { error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not revoke this connection");
+      setConnections((current) => current.filter((entry) => entry.id !== id));
+      toast("MCP connection revoked");
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not revoke this connection"); }
+    finally { setRevokingId(null); }
+  }
+  async function alerts() {
+    if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) return toast("This browser does not support Web Push");
+    if (pushEnabled) {
+      try {
+        const registration = await navigator.serviceWorker.getRegistration("/sw.js");
+        const subscription = await registration?.pushManager.getSubscription();
+        if (subscription) {
+          await fetch("/api/push/subscriptions", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: subscription.endpoint }) });
+          await subscription.unsubscribe();
+        }
+        setPushEnabled(false);
+        toast("Push alerts disabled");
+      } catch (error) { toast(error instanceof Error ? error.message : "Could not disable push alerts"); }
+      return;
+    }
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") return toast("Notification permission was not enabled");
+      await navigator.serviceWorker.register("/sw.js");
+      const keyResponse = await fetch("/api/push/key", { cache: "no-store" });
+      const keyBody = await keyResponse.json() as { data?: { publicKey?: string }; error?: { message?: string } };
+      if (!keyResponse.ok || !keyBody.data?.publicKey) throw new Error(keyBody.error?.message ?? "Web Push is not configured");
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription() ?? await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlKey(keyBody.data.publicKey) });
+      const saveResponse = await fetch("/api/push/subscriptions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subscription: subscription.toJSON(), mode: "all_interactions" }) });
+      if (!saveResponse.ok) throw new Error("The browser subscription could not be saved");
+      setPushEnabled(true);
+      toast("Push alerts enabled - even when Planbraid is closed");
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not enable push alerts"); }
+  }
+  const endpoint = typeof location !== "undefined" ? `${location.origin}/mcp` : "/mcp";
+  const oauthConfig = JSON.stringify({ mcpServers: { planbraid: { type: "http", url: endpoint } } }, null, 2);
+  const tokenConfig = JSON.stringify({ mcpServers: { planbraid: { type: "http", url: endpoint, headers: { Authorization: `Bearer ${token || "<PLANBRAID_TOKEN>"}` } } } }, null, 2);
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <div className="setup-dialog" role="dialog" aria-modal="true" aria-label="Connect coding agents">
+      <header><span><small>REMOTE MCP ACCESS</small><h2>Connect Planbraid to an agent</h2></span><button className="icon-button" onClick={close} aria-label="Close connection setup">×</button></header>
+      <div className="setup-body">
+      <p>Connect any MCP-compatible client to Planbraid - hosted coding agents, local model runners, custom tools, or personal models. Planbraid does not restrict which provider or model you use.</p>
+      {!project && <div className="connection-scope-note"><strong>No project required</strong><span>This connection belongs to your Planbraid account. Your agent can create a project or connect work to one later.</span></div>}
+      <div className="connection-tabs" role="tablist" aria-label="MCP authentication method"><button role="tab" aria-selected={mode === "oauth"} className={mode === "oauth" ? "active" : ""} onClick={() => setMode("oauth")}><strong>OAuth</strong><small>Recommended</small></button><button role="tab" aria-selected={mode === "token"} className={mode === "token" ? "active" : ""} onClick={() => { setMode("token"); void loadConnections(); }}><strong>Access token</strong><small>Standard MCP config</small></button></div>
+      {mode === "oauth" ? <section className="oauth-setup-card connection-panel" role="tabpanel">
+        <header><span><span className="oauth-lock">✓</span><strong>Automatic OAuth access</strong></span></header>
+        <ol><li>Open your client&apos;s <strong>MCP servers</strong> or <strong>Connectors</strong> settings.</li><li>Add a remote HTTP server and paste the Planbraid URL below.</li><li>Your client opens Planbraid in a browser. Sign in and approve read/write access.</li></ol>
+        <div className="endpoint-box"><small>Remote MCP server URL</small><code>{endpoint}</code><button onClick={() => { void navigator.clipboard.writeText(endpoint); toast("MCP URL copied"); }}>Copy URL</button></div>
+        <div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => { void navigator.clipboard.writeText(oauthConfig); toast("OAuth MCP config copied"); }}>Copy config</button></span><pre>{oauthConfig}</pre></div>
+        <p className="oauth-help">Planbraid uses standard MCP and OAuth discovery. The connected client identifies its own provider, session, and optional model when it begins reporting work.</p>
+      </section> : <section className="token-setup-card connection-panel" role="tabpanel">
+        <header><span><span className="token-key">⌁</span><strong>Bearer token access</strong></span></header>
+        <p>For clients without OAuth, create a personal token and send it in the <code>Authorization</code> header. The secret is shown only once.</p>
+        {token ? <><div className="token-box"><small>New token - copy it now</small><code>{token}</code><button onClick={() => { void navigator.clipboard.writeText(token); toast("Token copied"); }}>Copy</button></div><div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => { void navigator.clipboard.writeText(tokenConfig); toast("Token MCP config copied"); }}>Copy config</button></span><pre>{tokenConfig}</pre></div></> : <button className="primary-wide" onClick={() => void generate()} disabled={busy}>{busy ? "Generating…" : `Generate access token for ${project?.name ?? "Planbraid"}`}</button>}
+        <div className="connection-list"><h3>Active token connections <span>{connections.length}</span></h3>{connections.length ? connections.map((entry) => <div className="connection-row" key={entry.id}><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => void revoke(entry.id)} disabled={revokingId === entry.id}>{revokingId === entry.id ? "Revoking…" : "Revoke"}</button></div>) : <p className="oauth-help">No active bearer-token connections.</p>}</div>
+      </section>}
+      <div className="access-note"><strong>Network access required</strong><span>The MCP URL must be reachable by the agent without a hosting-level sign-in wall. Planbraid still protects every project request with OAuth or a bearer token.</span></div>
+      <button className="secondary-wide" onClick={() => void alerts()}>{pushEnabled ? "Disable browser alerts" : "Enable browser alerts"}</button>
+      <div className="setup-note"><strong>Per-turn synchronization</strong><span>Connected agents can read current project state, record todo lifecycle changes, and reconcile every completed interaction.</span></div>
+      </div>
+    </div>
+  </div>;
+}
+
+function ProviderIcon({ provider }: { provider: Provider | string }) {
+  const key = provider.toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+  const bundledLogo = providerLogo[key];
+  const logo = typeof bundledLogo === "string" ? bundledLogo : bundledLogo?.src;
+  const label = providerLabel[key] ?? provider;
+  // These are tiny bundled SVG marks; an image optimizer would add overhead without reducing payload.
+  return <span className={`provider-icon ${key}`} role="img" aria-label={`${label} logo`} title={label}>{key === "google" ? <GoogleIcon /> : logo ? <img src={logo} alt="" aria-hidden="true" /> : <span className="provider-fallback" aria-hidden="true">◇</span>}</span>; // eslint-disable-line @next/next/no-img-element
+}
+function Assurance({ value }: { value: Source["assurance"] }) { return <span className={`assurance ${value}`} title={`Capture assurance: ${value}`}>{value === "enforced" ? "✓" : value === "observed" ? "◉" : value === "instructed" ? "↗" : "○"}</span>; }
+function Empty({ title, body, action, onAction, secondaryAction, onSecondaryAction }: { title: string; body: string; action?: string; onAction?: () => void; secondaryAction?: string; onSecondaryAction?: () => void }) { return <div className="empty-state"><span>☷</span><h3>{title}</h3><p>{body}</p><div className="empty-actions">{action && onAction && <button onClick={onAction}>{action}</button>}{secondaryAction && onSecondaryAction && <button className="secondary" onClick={onSecondaryAction}>{secondaryAction}</button>}</div></div>; }
+function relative(value: string) { const delta = Date.now() - new Date(value).getTime(); const minutes = Math.max(0, Math.floor(delta / 60000)); if (minutes < 1) return "now"; if (minutes < 60) return `${minutes}m`; const hours = Math.floor(minutes / 60); if (hours < 24) return `${hours}h`; return `${Math.floor(hours / 24)}d`; }
+function eventAction(event: string) { return ({ "work_item.created": "created work", "work_item.started": "started work", "work_item.blocked": "reported a blocker", "work_item.completion_reported": "requested review", "work_item.completion_verified": "completed work", "work_item.progress_reported": "shared progress", "interaction.completed": "completed a turn", "evidence.attached": "attached evidence" } as Record<string, string>)[event] ?? event.replaceAll("_", " ").replace("work item.", ""); }
+function eventTone(event: WorkEvent) { if (event.eventType.includes("unblocked")) return "success"; if (event.eventType.includes("blocked") || event.eventType.includes("failed")) return "danger"; if (event.eventType.includes("verified") || event.toStatus === "done") return "success"; if (event.eventType.includes("review")) return "review"; return "normal"; }
+async function showSystemNotification(title: string, body: string) { if (typeof Notification === "undefined" || Notification.permission !== "granted" || document.visibilityState === "visible") return; const registration = await navigator.serviceWorker.ready; await registration.showNotification(title, { body, icon: "/planbraid-mark.png", badge: "/planbraid-mark.png", tag: `planbraid-${title}`, data: { url: "/" } }); }
+function base64UrlKey(value: string) { const padded = value + "=".repeat((4 - value.length % 4) % 4); const binary = atob(padded.replace(/-/g, "+").replace(/_/g, "/")); const bytes = new Uint8Array(binary.length); for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index); return bytes.buffer; }

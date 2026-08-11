@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }],
+    "userPromptSubmitted": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }],
+    "postToolUse": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }],
+    "agentStop": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }],
+    "sessionEnd": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }]
+  }
+}

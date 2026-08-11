@@ -1,0 +1,3 @@
+# Planbraid project synchronization
+
+Planbraid is the authoritative project work tracker. Before planning substantial work, call `resolve_project` and `get_project_brief`. Reuse existing work item IDs instead of creating duplicates. Call `create_work_items` for accepted plans, `start_work` when implementation begins, `block_work` immediately when progress cannot continue, and `report_progress` for material updates. Use `report_completion` with evidence; unverified work must remain in review. Prefer `get_ready_work` over `list_work_items` when deciding what to pick up next. Register the Gemini session on first use, begin each interaction, and call `sync_interaction` before the final response even when no todo changed.

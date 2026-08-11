@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }],
+    "PostToolUse": [{ "matcher": "Write|Edit|Bash|mcp__.*", "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "node \"$PLANBRAID_BRIDGE_PATH\"", "timeout": 3 }] }]
+  }
+}
