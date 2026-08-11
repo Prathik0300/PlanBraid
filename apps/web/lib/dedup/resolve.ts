@@ -8,6 +8,7 @@
  * canonical items with live claims.
  */
 
+import type { PgD1 } from "@/db/pg-d1";
 import type { WorkItem } from "@/lib/contracts";
 import { buildSignature, fingerprint } from "./signature.ts";
 import { bestMatch, explain, type Candidate, type Proposal } from "./match.ts";
@@ -114,7 +115,7 @@ export async function resolveProposals(
 }
 
 export function aliasStatement(
-  db: D1Database,
+  db: PgD1,
   input: {
     organizationId: string; projectId: string; workItemId: string; title: string; description: string;
     sourceId?: string | null; score: number; method: string; reason: string;

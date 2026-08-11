@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTestDb } from "./support/local-d1.mjs";
+import { createTestDb } from "./support/local-pg.mjs";
 import { principal, setupProject, createItem } from "./support/fixtures.mjs";
 import { executeCommand, organizationFor, recomputeBlockingCounts } from "@/lib/store.ts";
 

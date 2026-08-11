@@ -13,6 +13,7 @@ See `PRODUCT_ARCHITECTURE_PLAN.md` for the canonical architecture, `IMPLEMENTATI
 ```text
 cd apps/web
 npm ci
+cp .env.example .env.local   # fill in DATABASE_URL (Neon or any Postgres) and the rest
 npm run dev
 ```
 
@@ -37,6 +38,6 @@ npm run lint
 npm test
 ```
 
-`npm test` runs the domain-logic suites (deduplication, dependency graph, auto-unblock, ready-work ranking, derived board columns — against a real in-memory database, see `tests/support/local-d1.mjs`), then builds and runs the rendered-HTML/build suite.
+`npm test` runs the domain-logic suites (deduplication, dependency graph, auto-unblock, ready-work ranking, derived board columns — against a real embedded Postgres, see `tests/support/local-pg.mjs`), then builds and runs the rendered-HTML/build suite.
 
-The build packages the Cloudflare-compatible worker, static application, D1 metadata, and generated migration. Production access is private by default through Sites; localhost is the only anonymous demo environment.
+The app is a standard Next.js application, deployed on Vercel with a Postgres database (Neon). Every push to `main` on the connected GitHub repo auto-deploys via Vercel's native Git integration; pull requests get preview deployments. Localhost is the only anonymous demo environment — hosted access always requires an account.

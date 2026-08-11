@@ -1,14 +1,50 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
-import test from "node:test";
+import test, { after, before } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const APP_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+// Real HTTP requests against a `next start` production server, rather than importing a
+// bundled worker entry point directly (the old vinext/Cloudflare approach) — Next.js
+// doesn't expose an equivalent single-function fetch handler to import, and this is
+// closer to how the app is actually served anyway.
+const PORT = 4100 + (process.pid % 400);
+const BASE_URL = `http://localhost:${PORT}`;
+let serverProcess;
+
+async function waitForServer(timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(BASE_URL);
+      return;
+    } catch { /* not listening yet */ }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("next start did not become ready in time");
+}
+
+before(async () => {
+  serverProcess = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "-p", String(PORT)], {
+    cwd: APP_ROOT,
+    // A placeholder is enough: none of the routes exercised below (the app shell and
+    // OAuth discovery metadata) ever touch the database, and lib/runtime-env.ts's DB
+    // getter only opens a connection on first access.
+    env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL ?? "postgres://placeholder/placeholder", NODE_ENV: "production" },
+    stdio: "pipe",
+  });
+  serverProcess.on("error", (error) => { throw error; });
+  await waitForServer();
+});
+
+after(() => {
+  serverProcess?.kill();
+});
 
 async function render(path = "/") {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-  return worker.fetch(new Request(`http://localhost${path}`, { headers: { accept: "text/html" } }), {
-    ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
-  }, { waitUntil() {}, passThroughOnException() {} });
+  return fetch(`${BASE_URL}${path}`, { headers: { accept: "text/html" } });
 }
 
 function contrastRatio(foreground, background) {
@@ -35,8 +71,8 @@ test("server-renders the Planbraid application shell", async () => {
   const html = await response.text();
   assert.match(html, /<title>Planbraid - One plan across every agent<\/title>/i);
   assert.match(html, /Unified, source-aware project work/i);
-  assert.match(html, /<link rel="icon" href="\/planbraid-favicon\.png" type="image\/png" sizes="512x512">/i);
-  assert.match(html, /<link rel="shortcut icon" href="\/planbraid-favicon\.png">/i);
+  assert.match(html, /<link rel="icon" href="\/planbraid-favicon\.png" type="image\/png" sizes="512x512"\/?>/i);
+  assert.match(html, /<link rel="shortcut icon" href="\/planbraid-favicon\.png"\/?>/i);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
@@ -44,14 +80,14 @@ test("publishes MCP OAuth discovery metadata", async () => {
   const protectedResponse = await render("/.well-known/oauth-protected-resource");
   assert.equal(protectedResponse.status, 200);
   const protectedMetadata = await protectedResponse.json();
-  assert.equal(protectedMetadata.resource, "http://localhost/mcp");
-  assert.deepEqual(protectedMetadata.authorization_servers, ["http://localhost"]);
+  assert.equal(protectedMetadata.resource, `${BASE_URL}/mcp`);
+  assert.deepEqual(protectedMetadata.authorization_servers, [BASE_URL]);
   assert.deepEqual(protectedMetadata.scopes_supported, ["work:read", "work:write"]);
 
   const authorizationResponse = await render("/.well-known/oauth-authorization-server");
   assert.equal(authorizationResponse.status, 200);
   const authorizationMetadata = await authorizationResponse.json();
-  assert.equal(authorizationMetadata.registration_endpoint, "http://localhost/register");
+  assert.equal(authorizationMetadata.registration_endpoint, `${BASE_URL}/register`);
   assert.deepEqual(authorizationMetadata.code_challenge_methods_supported, ["S256"]);
   assert.ok(authorizationMetadata.grant_types_supported.includes("refresh_token"));
 });
@@ -67,14 +103,12 @@ test("publishes the Web Push subscription key without exposing account data or c
   assert.match(app, /fetch\("\/api\/push\/key", \{ cache: "no-store" \}\)/);
 });
 
-test("ships the product UI, service worker, manifest, and durable schema", async () => {
-  const [app, css, manifest, serviceWorker, hosting, schema] = await Promise.all([
+test("ships the product UI, service worker, and manifest", async () => {
+  const [app, css, manifest, serviceWorker] = await Promise.all([
     readFile(new URL("../app/planbraid-app.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"),
     readFile(new URL("../public/sw.js", import.meta.url), "utf8"),
-    readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
-    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
   ]);
   assert.match(app, /Chats & agents/);
   assert.match(app, /EventSource/);
@@ -84,9 +118,6 @@ test("ships the product UI, service worker, manifest, and durable schema", async
   assert.equal(JSON.parse(manifest).short_name, "Planbraid");
   assert.equal(JSON.parse(manifest).icons[0].src, "/planbraid-mark.png");
   assert.match(serviceWorker, /notificationclick/);
-  assert.equal(JSON.parse(hosting).d1, "DB");
-  assert.match(schema, /workItems/);
-  assert.match(schema, /idempotencyRecords/);
   await access(new URL("../public/planbraid-mark.png", import.meta.url));
   await access(new URL("../public/planbraid-favicon.png", import.meta.url));
   await access(new URL("../public/favicon.ico", import.meta.url));
@@ -94,13 +125,13 @@ test("ships the product UI, service worker, manifest, and durable schema", async
 });
 
 test("keeps primary navigation clear and every visible button actionable", async () => {
-  const [app, css, store, setup, oauth, worker, contracts] = await Promise.all([
+  const [app, css, store, setup, oauth, mcp, contracts] = await Promise.all([
     readFile(new URL("../app/planbraid-app.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../lib/store.ts", import.meta.url), "utf8"),
     readFile(new URL("../db/setup.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/oauth.ts", import.meta.url), "utf8"),
-    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/mcp/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/contracts.ts", import.meta.url), "utf8"),
   ]);
   const sidebar = app.slice(app.indexOf("function ProjectRail"), app.indexOf("function Header"));
@@ -188,9 +219,9 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(store, /revokeMcpToken/);
   assert.match(store, /const itemKey = `#\$\{sequence\}`/);
   assert.doesNotMatch(store, /const baseKey|Math\.random\(\).*project|`\$\{baseKey\}/);
-  assert.doesNotMatch(worker, /project\.key/);
-  assert.match(worker, /any MCP client, agent, or personal-model session/);
-  assert.match(worker, /Free-form client, agent, or provider name/);
+  assert.doesNotMatch(mcp, /project\.key/);
+  assert.match(mcp, /any MCP client, agent, or personal-model session/);
+  assert.match(mcp, /Free-form client, agent, or provider name/);
   assert.match(contracts, /export type Provider = string/);
   assert.match(setup, /CREATE TABLE IF NOT EXISTS data_migrations/);
   assert.match(setup, /CREATE TABLE IF NOT EXISTS oauth_clients/);
@@ -199,9 +230,9 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(oauth, /refresh_token/);
   assert.match(oauth, /Refresh token reuse was detected/);
   assert.match(oauth, /validRedirectUri/);
-  assert.match(worker, /WWW-Authenticate/);
-  assert.match(worker, /principal\.scopes\?\.includes/);
-  assert.doesNotMatch(worker, /2026-07-28/);
+  assert.match(mcp, /WWW-Authenticate/);
+  assert.match(mcp, /principal\.scopes\?\.includes/);
+  assert.doesNotMatch(mcp, /2026-07-28/);
   assert.doesNotMatch(store, /itemSeeds|MCP server implementation|Provider lifecycle plan|Web Push research|Concurrency review|Ember API/);
   for (const match of app.matchAll(/<button\b([^>]*)>/g)) {
     assert.match(match[1], /onClick=|type=|disabled=/, `Button without an action: ${match[0].slice(0, 120)}`);
@@ -283,7 +314,7 @@ test("uses standard hyphens in user-facing website copy", async () => {
     "../app/page.tsx",
     "../app/planbraid-app.tsx",
     "../public/manifest.webmanifest",
-    "../worker/index.ts",
+    "../app/mcp/route.ts",
   ].map((path) => readFile(new URL(path, import.meta.url), "utf8")));
   for (const source of sources) assert.doesNotMatch(source, /[–—]/);
 });

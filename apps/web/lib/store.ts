@@ -1,4 +1,5 @@
 import { ensureSchema } from "@/db/setup";
+import type { PgD1, PgD1PreparedStatement } from "@/db/pg-d1";
 import type { Command, DashboardState, Notification, Project, Source, WorkEvent, WorkItem, WorkStatus } from "@/lib/contracts";
 import type { Proposal } from "@/lib/dedup/match.ts";
 import { aliasStatement, resolveProposals } from "@/lib/dedup/resolve.ts";
@@ -63,7 +64,7 @@ function text(row: Row, key: string) { return String(row[key] ?? ""); }
 function nullable(row: Row, key: string) { return row[key] == null ? null : String(row[key]); }
 function number(row: Row, key: string) { return Number(row[key] ?? 0); }
 
-export async function organizationFor(db: D1Database, principal: Principal) {
+export async function organizationFor(db: PgD1, principal: Principal) {
   await ensureSchema(db);
   const existing = await db.prepare("SELECT id FROM organizations WHERE owner_user_id = ?").bind(principal.userId).first<{ id: string }>();
   const suffix = (await digest(principal.userId)).slice(0, 10);
@@ -75,10 +76,15 @@ export async function organizationFor(db: D1Database, principal: Principal) {
     return existing.id;
   }
 
+  // organizationId is deterministic per user, and Postgres genuinely runs concurrent
+  // requests in parallel (unlike D1, which serializes every query against a database) —
+  // two near-simultaneous first-load requests for a brand-new user can both reach this
+  // point believing no organization exists yet. ON CONFLICT DO NOTHING makes the losing
+  // insert a no-op instead of an unhandled unique-violation.
   await db.batch([
-    db.prepare("INSERT INTO organizations (id, name, owner_user_id) VALUES (?, ?, ?)").bind(organizationId, `${principal.displayName}'s workspace`, principal.userId),
-    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?)").bind(organizationId, LEGACY_DEMO_MIGRATION),
-    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?)").bind(organizationId, PROJECT_SHORTHAND_MIGRATION),
+    db.prepare("INSERT INTO organizations (id, name, owner_user_id) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING").bind(organizationId, `${principal.displayName}'s workspace`, principal.userId),
+    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, LEGACY_DEMO_MIGRATION),
+    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, PROJECT_SHORTHAND_MIGRATION),
   ]);
   return organizationId;
 }
@@ -86,7 +92,7 @@ export async function organizationFor(db: D1Database, principal: Principal) {
 const LEGACY_DEMO_MIGRATION = "2026-08-10-remove-built-in-demo-data";
 const PROJECT_SHORTHAND_MIGRATION = "2026-08-10-remove-generated-project-shorthands";
 
-async function removeLegacyDemoData(db: D1Database, organizationId: string, suffix: string) {
+async function removeLegacyDemoData(db: PgD1, organizationId: string, suffix: string) {
   const alreadyApplied = await db.prepare("SELECT 1 FROM data_migrations WHERE organization_id = ? AND migration_key = ?").bind(organizationId, LEGACY_DEMO_MIGRATION).first();
   if (alreadyApplied) return;
 
@@ -104,12 +110,12 @@ async function removeLegacyDemoData(db: D1Database, organizationId: string, suff
     db.prepare("DELETE FROM sources WHERE organization_id = ? AND project_id IN (?, ?)").bind(organizationId, ...projectIds),
     db.prepare("DELETE FROM coding_spaces WHERE organization_id = ? AND project_id IN (?, ?)").bind(organizationId, ...projectIds),
     db.prepare("DELETE FROM projects WHERE organization_id = ? AND id IN (?, ?)").bind(organizationId, ...projectIds),
-    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?)").bind(organizationId, LEGACY_DEMO_MIGRATION),
+    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, LEGACY_DEMO_MIGRATION),
   ];
   await db.batch(statements);
 }
 
-async function removeGeneratedProjectShorthands(db: D1Database, organizationId: string) {
+async function removeGeneratedProjectShorthands(db: PgD1, organizationId: string) {
   const alreadyApplied = await db.prepare("SELECT 1 FROM data_migrations WHERE organization_id = ? AND migration_key = ?").bind(organizationId, PROJECT_SHORTHAND_MIGRATION).first();
   if (alreadyApplied) return;
   await db.batch([
@@ -117,7 +123,7 @@ async function removeGeneratedProjectShorthands(db: D1Database, organizationId: 
     db.prepare("UPDATE notifications SET title = (SELECT replace(notifications.title, work_items.item_key, '#' || work_items.sequence) FROM work_items WHERE work_items.id = notifications.work_item_id), body = (SELECT replace(notifications.body, work_items.item_key, '#' || work_items.sequence) FROM work_items WHERE work_items.id = notifications.work_item_id) WHERE organization_id = ? AND work_item_id IS NOT NULL AND EXISTS (SELECT 1 FROM work_items WHERE work_items.id = notifications.work_item_id)").bind(organizationId),
     db.prepare("UPDATE work_items SET item_key = '#' || sequence WHERE organization_id = ?").bind(organizationId),
     db.prepare("UPDATE projects SET project_key = id WHERE organization_id = ?").bind(organizationId),
-    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?)").bind(organizationId, PROJECT_SHORTHAND_MIGRATION),
+    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, PROJECT_SHORTHAND_MIGRATION),
   ]);
 }
 
@@ -140,7 +146,7 @@ function mapAlias(row: Row) {
   return { id: text(row, "id"), workItemId: text(row, "work_item_id"), title: text(row, "title"), description: text(row, "description"), sourceId: nullable(row, "source_id"), matchMethod: text(row, "match_method"), matchReason: text(row, "match_reason"), createdAt: text(row, "created_at") };
 }
 
-export async function loadDashboard(db: D1Database, principal: Principal): Promise<DashboardState> {
+export async function loadDashboard(db: PgD1, principal: Principal): Promise<DashboardState> {
   const organizationId = await organizationFor(db, principal);
   const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows] = await db.batch([
     db.prepare("SELECT * FROM projects WHERE organization_id = ? ORDER BY updated_at DESC").bind(organizationId),
@@ -168,7 +174,7 @@ export async function loadDashboard(db: D1Database, principal: Principal): Promi
   };
 }
 
-async function ownedProject(db: D1Database, organizationId: string, projectId: string) {
+async function ownedProject(db: PgD1, organizationId: string, projectId: string) {
   const project = await db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ?").bind(projectId, organizationId).first<Row>();
   if (!project) throw domainError("NOT_FOUND", "Project not found", 404);
   return project;
@@ -178,26 +184,31 @@ function domainError(code: string, message: string, status = 422, details?: unkn
   return Object.assign(new Error(message), { code, status, details });
 }
 
-async function commitMutation(db: D1Database, statements: D1PreparedStatement[]) {
+async function commitMutation(db: PgD1, statements: PgD1PreparedStatement[]) {
   try {
     return await db.batch(statements);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/UNIQUE constraint failed|constraint failed|database is locked/i.test(message)) {
+    // Postgres reports a unique-violation as error code 23505 with a message like
+    // `duplicate key value violates unique constraint "..."`, not SQLite/D1's `UNIQUE
+    // constraint failed`/`database is locked` text — check both so this still maps to
+    // a 409 instead of leaking as a 500.
+    const code = (error as { code?: string }).code;
+    if (code === "23505" || /UNIQUE constraint failed|violates unique constraint|constraint failed|database is locked/i.test(message)) {
       throw domainError("CONCURRENT_MODIFICATION", "Project state changed while this operation was committing; reload and retry with the current version", 409, { retryable: true });
     }
     throw error;
   }
 }
 
-async function idempotentResult(db: D1Database, scope: string, key: string, requestHash: string) {
+async function idempotentResult(db: PgD1, scope: string, key: string, requestHash: string) {
   const row = await db.prepare("SELECT request_hash, response FROM idempotency_records WHERE scope = ? AND idempotency_key = ?").bind(scope, key).first<{ request_hash: string; response: string }>();
   if (!row) return null;
   if (row.request_hash !== requestHash) throw domainError("IDEMPOTENCY_MISMATCH", "This idempotency key was already used for another request", 409);
   return { ...parseJson<Record<string, unknown>>(row.response, {}), idempotentReplay: true };
 }
 
-export async function executeCommand(db: D1Database, principal: Principal, command: Command) {
+export async function executeCommand(db: PgD1, principal: Principal, command: Command) {
   const organizationId = await organizationFor(db, principal);
   const scope = `${organizationId}:${principal.userId}:${command.action}`;
   const requestHash = await digest(JSON.stringify(command));
@@ -438,9 +449,9 @@ export async function executeCommand(db: D1Database, principal: Principal, comma
 }
 
 /** Hard-downstream items (via DAG_EDGE_TYPES) of `itemId`, with their current blocking_count. */
-async function downstreamOf(db: D1Database, organizationId: string, projectId: string, itemId: string) {
+async function downstreamOf(db: PgD1, organizationId: string, projectId: string, itemId: string) {
   const rows = await db.prepare(
-    `SELECT wi.id AS id, wi.item_key AS itemKey, wi.blocking_count AS blockingCount FROM dependencies d
+    `SELECT wi.id AS id, wi.item_key AS "itemKey", wi.blocking_count AS "blockingCount" FROM dependencies d
        JOIN work_items wi ON wi.id = d.to_work_item_id
       WHERE d.from_work_item_id = ? AND d.project_id = ? AND wi.organization_id = ?
         AND d.type IN (${DAG_EDGE_TYPE_SQL_LIST})`,
@@ -453,7 +464,7 @@ async function downstreamOf(db: D1Database, organizationId: string, projectId: s
  * correcting any drift. Not wired to a scheduler yet (see IMPLEMENTATION_PLAN.md M3),
  * but safe to call any time, including from an ad hoc maintenance script.
  */
-export async function recomputeBlockingCounts(db: D1Database, organizationId: string, projectId: string) {
+export async function recomputeBlockingCounts(db: PgD1, organizationId: string, projectId: string) {
   await db.prepare(
     `UPDATE work_items SET blocking_count = (
        SELECT COUNT(*) FROM dependencies d
@@ -464,7 +475,7 @@ export async function recomputeBlockingCounts(db: D1Database, organizationId: st
   ).bind(...DAG_EDGE_TYPES, projectId, organizationId).run();
 }
 
-async function sourceActor(db: D1Database, organizationId: string, sourceId: string) {
+async function sourceActor(db: PgD1, organizationId: string, sourceId: string) {
   const row = await db.prepare("SELECT provider FROM sources WHERE id = ? AND organization_id = ?").bind(sourceId, organizationId).first<{ provider: string }>();
   if (!row) throw domainError("NOT_FOUND", "Source not found", 404);
   return row.provider.charAt(0).toUpperCase() + row.provider.slice(1);
@@ -491,7 +502,7 @@ const CYCLE_CHECK_MAX_DEPTH = 64;
  * CTE, so cost is proportional to the downstream reachable set rather than the
  * whole project's edge count.
  */
-async function dependencyWouldCycle(db: D1Database, projectId: string, fromId: string, toId: string) {
+async function dependencyWouldCycle(db: PgD1, projectId: string, fromId: string, toId: string) {
   const row = await db.prepare(
     `WITH RECURSIVE downstream(id, path, depth) AS (
        SELECT ? AS id, ? AS path, 0 AS depth
@@ -511,7 +522,7 @@ export function errorResponse(error: unknown) {
   return Response.json({ error: { code: typed.code ?? "INTERNAL_ERROR", message: typed.code ? typed.message : "Unexpected server error", details: typed.details, requestId: crypto.randomUUID() } }, { status: typed.status ?? 500 });
 }
 
-export async function createMcpToken(db: D1Database, principal: Principal, name: string) {
+export async function createMcpToken(db: PgD1, principal: Principal, name: string) {
   const organizationId = await organizationFor(db, principal);
   const tokenId = id("tok");
   const tokenName = name.trim().slice(0, 120) || "Agent connection";
@@ -522,14 +533,14 @@ export async function createMcpToken(db: D1Database, principal: Principal, name:
   return { id: tokenId, name: tokenName, token, endpoint: "/mcp", scopes: ["work:read", "work:write"] };
 }
 
-export async function listMcpTokens(db: D1Database, principal: Principal) {
+export async function listMcpTokens(db: PgD1, principal: Principal) {
   const organizationId = await organizationFor(db, principal);
   const rows = await db.prepare("SELECT id, name, scopes, last_used_at, created_at FROM mcp_tokens WHERE organization_id = ? AND owner_user_id = ? AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 100")
     .bind(organizationId, principal.userId).all<{ id: string; name: string; scopes: string; last_used_at: string | null; created_at: string }>();
   return rows.results.map((row) => ({ id: row.id, name: row.name, scopes: row.scopes.split(/[ ,]+/).filter(Boolean), lastUsedAt: row.last_used_at, createdAt: row.created_at }));
 }
 
-export async function revokeMcpToken(db: D1Database, principal: Principal, tokenId: string) {
+export async function revokeMcpToken(db: PgD1, principal: Principal, tokenId: string) {
   const organizationId = await organizationFor(db, principal);
   const revoked = await db.prepare("UPDATE mcp_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND owner_user_id = ? AND revoked_at IS NULL RETURNING id")
     .bind(tokenId, organizationId, principal.userId).first<{ id: string }>();
@@ -537,7 +548,7 @@ export async function revokeMcpToken(db: D1Database, principal: Principal, token
   return { id: revoked.id, revoked: true };
 }
 
-export async function principalFromBearer(db: D1Database, authorization: string | null, resource?: string): Promise<Principal | null> {
+export async function principalFromBearer(db: PgD1, authorization: string | null, resource?: string): Promise<Principal | null> {
   if (!authorization?.startsWith("Bearer ")) return null;
   const token = authorization.slice(7);
   const tokenHash = await digest(token);
@@ -554,7 +565,7 @@ export async function principalFromBearer(db: D1Database, authorization: string 
   return { userId: oauth.owner_user_id, email: `${oauth.owner_user_id}@planbraid.agent`, displayName: "OAuth-connected agent", scopes: oauth.scopes.split(/\s+/).filter(Boolean), authentication: "oauth" };
 }
 
-export async function recordInteraction(db: D1Database, principal: Principal, input: { projectId: string; sourceId: string; externalId: string; outcome?: string; summary?: string; event?: "started" | "completed"; sequence?: number }) {
+export async function recordInteraction(db: PgD1, principal: Principal, input: { projectId: string; sourceId: string; externalId: string; outcome?: string; summary?: string; event?: "started" | "completed"; sequence?: number }) {
   const organizationId = await organizationFor(db, principal);
   const project = await ownedProject(db, organizationId, input.projectId);
   const source = await db.prepare("SELECT * FROM sources WHERE id = ? AND project_id = ? AND organization_id = ?").bind(input.sourceId, input.projectId, organizationId).first<Row>();
@@ -563,14 +574,25 @@ export async function recordInteraction(db: D1Database, principal: Principal, in
   const interactionId = existing?.id ?? id("int");
   const event = input.event ?? "completed";
   if (event === "started") {
-    if (!existing) await db.prepare("INSERT INTO interactions (id, organization_id, project_id, source_id, external_id, sequence, status) VALUES (?, ?, ?, ?, ?, ?, 'started')").bind(interactionId, organizationId, input.projectId, input.sourceId, input.externalId, input.sequence ?? null).run();
+    if (!existing) {
+      // Two concurrent begin_interaction calls for the same external_id (a retried
+      // tool call, e.g.) can both see no existing row under Postgres's real
+      // concurrency; the loser's insert hits UNIQUE(source_id, external_id), not the
+      // id primary key, so fall back to the winner's row instead of throwing.
+      const inserted = await db.prepare("INSERT INTO interactions (id, organization_id, project_id, source_id, external_id, sequence, status) VALUES (?, ?, ?, ?, ?, ?, 'started') ON CONFLICT (source_id, external_id) DO NOTHING RETURNING id")
+        .bind(interactionId, organizationId, input.projectId, input.sourceId, input.externalId, input.sequence ?? null).first<{ id: string }>();
+      if (!inserted) {
+        const winner = await db.prepare("SELECT id FROM interactions WHERE source_id = ? AND external_id = ?").bind(input.sourceId, input.externalId).first<{ id: string }>();
+        return { interactionId: winner!.id, status: "started" };
+      }
+    }
     return { interactionId, status: "started" };
   }
   const now = new Date().toISOString();
   const currentRevision = number(project, "revision");
   const nextRevision = currentRevision + 1;
   const summary = input.summary?.trim().slice(0, 2000) || `${text(source, "provider")} interaction completed with no todo summary`;
-  const eventCount = await db.prepare("SELECT COUNT(*) AS count FROM work_events WHERE source_id = ? AND created_at >= COALESCE((SELECT started_at FROM interactions WHERE id = ?), datetime('now','-1 hour'))").bind(input.sourceId, interactionId).first<{ count: number }>();
+  const eventCount = await db.prepare("SELECT COUNT(*) AS count FROM work_events WHERE source_id = ? AND created_at >= COALESCE((SELECT started_at FROM interactions WHERE id = ?), now() - interval '1 hour')").bind(input.sourceId, interactionId).first<{ count: number }>();
   const reconciliation = Number(eventCount?.count ?? 0) > 0 ? "todos_changed" : "no_todo_change";
   const notificationId = id("ntf");
   await commitMutation(db, [
@@ -579,12 +601,12 @@ export async function recordInteraction(db: D1Database, principal: Principal, in
       : db.prepare("INSERT INTO interactions (id, organization_id, project_id, source_id, external_id, sequence, status, outcome, summary, reconciliation, started_at, completed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?)").bind(interactionId, organizationId, input.projectId, input.sourceId, input.externalId, input.sequence ?? null, input.outcome ?? "success", summary, reconciliation, now, now, now),
     db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, input.projectId, currentRevision),
     db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, source_id, interaction_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'interaction.completed', ?, ?, ?)").bind(id("evt"), organizationId, input.projectId, nextRevision, input.sourceId, interactionId, text(source, "provider").replace(/^./, (c) => c.toUpperCase()), summary, JSON.stringify({ reconciliation, outcome: input.outcome ?? "success" }), now),
-    db.prepare("INSERT OR IGNORE INTO notifications (id, organization_id, recipient_user_id, project_id, source_id, interaction_id, event_type, priority, title, body, deep_link, dedupe_key, requires_action, created_at) VALUES (?, ?, ?, ?, ?, ?, 'interaction.completed', ?, ?, ?, ?, ?, ?, ?)").bind(notificationId, organizationId, principal.userId, input.projectId, input.sourceId, interactionId, input.outcome === "failed" || input.outcome === "blocked" ? "high" : "normal", `${text(source, "provider")} interaction ${input.outcome ?? "completed"}`, summary, `/?project=${input.projectId}&source=${input.sourceId}`, `interaction:${interactionId}`, input.outcome === "blocked" ? 1 : 0, now),
+    db.prepare("INSERT INTO notifications (id, organization_id, recipient_user_id, project_id, source_id, interaction_id, event_type, priority, title, body, deep_link, dedupe_key, requires_action, created_at) VALUES (?, ?, ?, ?, ?, ?, 'interaction.completed', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (recipient_user_id, dedupe_key) DO NOTHING").bind(notificationId, organizationId, principal.userId, input.projectId, input.sourceId, interactionId, input.outcome === "failed" || input.outcome === "blocked" ? "high" : "normal", `${text(source, "provider")} interaction ${input.outcome ?? "completed"}`, summary, `/?project=${input.projectId}&source=${input.sourceId}`, `interaction:${interactionId}`, input.outcome === "blocked" ? 1 : 0, now),
   ]);
   return { interactionId, notificationId, reconciliation, projectRevision: nextRevision };
 }
 
-export async function registerSourceSession(db: D1Database, principal: Principal, input: { projectId: string; provider: string; externalId: string; title?: string; model?: string; codingSpaceId?: string; assurance?: string }) {
+export async function registerSourceSession(db: PgD1, principal: Principal, input: { projectId: string; provider: string; externalId: string; title?: string; model?: string; codingSpaceId?: string; assurance?: string }) {
   const organizationId = await organizationFor(db, principal);
   await ownedProject(db, organizationId, input.projectId);
   const provider = input.provider.trim().slice(0, 80);
@@ -596,8 +618,16 @@ export async function registerSourceSession(db: D1Database, principal: Principal
     return { sourceId: existing.id, idempotentReplay: true };
   }
   const sourceId = id("src");
-  await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)").bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed").run();
-  return { sourceId, idempotentReplay: false };
+  // Two concurrent register_agent_session calls for the same (project, provider,
+  // external_id) can both reach here believing no source exists yet (Postgres runs
+  // them in true parallel, unlike D1 which serialized every query). The losing insert
+  // hits sources' UNIQUE(project_id, provider, external_id), not the id primary key, so
+  // re-select on conflict rather than assume this insert is the row that landed.
+  const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
+    .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed").first<{ id: string }>();
+  if (inserted) return { sourceId: inserted.id, idempotentReplay: false };
+  const winner = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
+  return { sourceId: winner!.id, idempotentReplay: true };
 }
 
 /**
@@ -607,7 +637,7 @@ export async function registerSourceSession(db: D1Database, principal: Principal
  * wrong match stays reversible.
  */
 export async function createWorkItemsDeduplicated(
-  db: D1Database,
+  db: PgD1,
   principal: Principal,
   input: { projectId: string; proposals: Proposal[]; sourceId?: string; idempotencyKey: string },
 ) {
@@ -619,7 +649,7 @@ export async function createWorkItemsDeduplicated(
   const outcomes = await resolveProposals({ proposals: input.proposals, existingItems });
 
   const results: Record<string, unknown>[] = [];
-  const annotations: D1PreparedStatement[] = [];
+  const annotations: PgD1PreparedStatement[] = [];
   const createdByIndex = new Map<number, { itemId: string; itemKey: string }>();
   // Every outcome's final target (its own new item, or the canonical item it matched
   // into), keyed by batch index. Built for the depends_on resolution pass below, which
@@ -739,7 +769,7 @@ const PRIORITY_RANK: Record<WorkItem["priority"], number> = { urgent: 4, high: 3
  * finishing the highest-ranked item does the most to free up the rest of the graph.
  */
 export async function getReadyWork(
-  db: D1Database,
+  db: PgD1,
   principal: Principal,
   input: { projectId: string; sourceId?: string; limit?: number; avoidCollisions?: boolean },
 ) {
@@ -797,7 +827,7 @@ export async function getReadyWork(
   };
 }
 
-export async function updateSourceHeartbeat(db: D1Database, principal: Principal, input: { sourceId: string; state?: string; currentTaskIds?: string[]; end?: boolean }) {
+export async function updateSourceHeartbeat(db: PgD1, principal: Principal, input: { sourceId: string; state?: string; currentTaskIds?: string[]; end?: boolean }) {
   const organizationId = await organizationFor(db, principal);
   const result = await db.prepare("UPDATE sources SET status = ?, current_task_ids = ?, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? RETURNING id").bind(input.end ? "ended" : input.state ?? "active", JSON.stringify((input.currentTaskIds ?? []).slice(0, 100)), input.sourceId, organizationId).first();
   if (!result) throw domainError("NOT_FOUND", "Source session not found", 404);

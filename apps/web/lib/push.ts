@@ -1,4 +1,5 @@
 import webpush from "web-push";
+import type { PgD1 } from "@/db/pg-d1";
 
 export type PushEnvironment = {
   VAPID_PUBLIC_KEY?: string;
@@ -29,7 +30,7 @@ function invalidSubscription() {
   return Object.assign(new Error("The push subscription endpoint is not allowed"), { code: "INVALID_PUSH_SUBSCRIPTION", status: 422 });
 }
 
-export async function dispatchNotification(db: D1Database, notificationId: string, pushEnv: PushEnvironment) {
+export async function dispatchNotification(db: PgD1, notificationId: string, pushEnv: PushEnvironment) {
   if (!pushEnv.VAPID_PUBLIC_KEY || !pushEnv.VAPID_PRIVATE_KEY) {
     return { sent: 0, skipped: true, reason: "vapid_not_configured" };
   }

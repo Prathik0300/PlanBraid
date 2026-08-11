@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env } from "@/lib/runtime-env";
 import type { Command } from "@/lib/contracts";
 import { principalFromRequest } from "@/lib/app-principal";
 import { errorResponse, executeCommand } from "@/lib/store";

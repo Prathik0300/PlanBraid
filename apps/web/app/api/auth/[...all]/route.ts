@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env } from "@/lib/runtime-env";
 import { authFor, hostedAuthConfigured } from "@/lib/auth";
 import { ensureSchema } from "@/db/setup";
 import { emailSignUpSchema, firstValidationMessage } from "@/lib/auth-validation";

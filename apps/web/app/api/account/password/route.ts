@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env } from "@/lib/runtime-env";
 import { principalFromRequest } from "@/lib/app-principal";
 import { authFor } from "@/lib/auth";
 import { firstValidationMessage, passwordSchema } from "@/lib/auth-validation";

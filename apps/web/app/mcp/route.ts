@@ -1,64 +1,16 @@
-/** Cloudflare Worker entry point for the vinext-starter template. */
-import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
-import handler from "vinext/server/app-router-entry";
-import { ensureSchema } from "../db/setup";
-import type { DashboardState, WorkStatus } from "../lib/contracts";
-import { createWorkItemsDeduplicated, executeCommand, getReadyWork, loadDashboard, principalFromBearer, recordInteraction, registerSourceSession, updateSourceHeartbeat, type Principal } from "../lib/store";
-import { ANNOTATION_EDGE_TYPES, DAG_EDGE_TYPES } from "../lib/graph/edges.ts";
-import { dispatchNotification, type PushEnvironment } from "../lib/push";
-import { handleOAuthRoute, oauthChallenge } from "../lib/oauth";
+import { waitUntil } from "@vercel/functions";
+import type { PgD1 } from "@/db/pg-d1";
+import { ensureSchema } from "@/db/setup";
+import type { DashboardState, WorkStatus } from "@/lib/contracts";
+import { createWorkItemsDeduplicated, executeCommand, getReadyWork, loadDashboard, principalFromBearer, recordInteraction, registerSourceSession, updateSourceHeartbeat, type Principal } from "@/lib/store";
+import { ANNOTATION_EDGE_TYPES, DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
+import { dispatchNotification, type PushEnvironment } from "@/lib/push";
+import { oauthChallenge } from "@/lib/oauth";
+import { env as runtimeEnv } from "@/lib/runtime-env";
 
-interface Env extends PushEnvironment {
-  ASSETS: Fetcher;
-  DB: D1Database;
-  IMAGES: {
-    input(stream: ReadableStream): {
-      transform(options: Record<string, unknown>): {
-        output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
-      };
-    };
-  };
-}
+export const dynamic = "force-dynamic";
 
-interface ExecutionContext {
-  waitUntil(promise: Promise<unknown>): void;
-  passThroughOnException(): void;
-}
-
-// Image security config. SVG sources with .svg extension auto-skip the
-// optimization endpoint on the client side (served directly, no proxy).
-// To route SVGs through the optimizer (with security headers), set
-// dangerouslyAllowSVG: true in next.config.js and uncomment below:
-// const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
-
-const worker = {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-
-    const oauthResponse = await handleOAuthRoute(request, env);
-    if (oauthResponse) return oauthResponse;
-
-    if (url.pathname === "/mcp") {
-      return handleMcp(request, env, ctx);
-    }
-
-    if (url.pathname === "/_vinext/image") {
-      const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
-      return handleImageOptimization(request, {
-        fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))),
-        transformImage: async (body, { width, format, quality }) => {
-          const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality });
-          return result.response();
-        },
-      }, allowedWidths);
-    }
-
-    return handler.fetch(request, env, ctx);
-  },
-};
-
-export default worker;
-
+type Env = PushEnvironment & { DB: PgD1 };
 type RpcRequest = { jsonrpc?: string; id?: string | number | null; method?: string; params?: Record<string, unknown> };
 type Json = Record<string, unknown>;
 
@@ -94,7 +46,7 @@ function interactionSchema(event: string) {
   return { type: "object", required: ["project_id", "source_id", "external_interaction_id"], properties: { project_id: { type: "string" }, source_id: { type: "string" }, external_interaction_id: { type: "string" }, sequence: { type: "number" }, outcome: { type: "string" }, summary: { type: "string" }, event: { const: event } } };
 }
 
-async function handleMcp(request: Request, env: Env, ctx: ExecutionContext) {
+async function handleMcp(request: Request, env: Env) {
   await ensureSchema(env.DB);
   const resource = `${new URL(request.url).origin}/mcp`;
   const local = ["localhost", "127.0.0.1"].includes(new URL(request.url).hostname);
@@ -136,7 +88,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext) {
       const args = (rpc.params?.arguments ?? {}) as Json;
       const result = await callTool(env.DB, principal, name, args);
       if (typeof result.notificationId === "string") {
-        ctx.waitUntil(dispatchNotification(env.DB, result.notificationId, env));
+        waitUntil(dispatchNotification(env.DB, result.notificationId, env));
       }
       return rpcResult(rpc.id, { content: [{ type: "text", text: conciseResult(name, result) }], structuredContent: result, isError: false });
     }
@@ -147,7 +99,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext) {
   }
 }
 
-async function callTool(db: D1Database, principal: Principal, name: string, args: Json): Promise<Json> {
+async function callTool(db: PgD1, principal: Principal, name: string, args: Json): Promise<Json> {
   const state = async () => loadDashboard(db, principal);
   if (name === "resolve_project") {
     const data = await state();
@@ -248,7 +200,7 @@ function projectBrief(state: DashboardState, projectId: string) {
   return { project, revision: project.revision, active: items.filter((item) => item.status === "in_progress"), ready: items.filter((item) => item.status === "ready"), blocked: items.filter((item) => item.status === "blocked"), review: items.filter((item) => item.status === "in_review"), recentEvents: state.events.filter((event) => event.projectId === projectId).slice(0, 20), sources: state.sources.filter((source) => source.projectId === projectId), recommendedNextActions: items.filter((item) => item.status === "blocked").length ? ["Resolve blockers before creating duplicate work", "Review completion claims and evidence"] : ["Claim the highest-priority ready item", "Record new accepted plans"] };
 }
 
-async function resourceList(db: D1Database, principal: Principal) {
+async function resourceList(db: PgD1, principal: Principal) {
   const state = await loadDashboard(db, principal);
   return state.projects.flatMap((project) => [
     { uri: `planbraid://projects/${project.id}/brief`, name: `${project.name} brief`, description: "Current active, ready, blocked, review work and sources", mimeType: "application/json" },
@@ -256,7 +208,7 @@ async function resourceList(db: D1Database, principal: Principal) {
   ]);
 }
 
-async function readResource(db: D1Database, principal: Principal, uri: string) {
+async function readResource(db: PgD1, principal: Principal, uri: string) {
   const match = /^planbraid:\/\/projects\/([^/]+)\/(brief|active)$/.exec(uri);
   if (!match) throw toolError("NOT_FOUND", "Unknown resource", 404);
   const state = await loadDashboard(db, principal);
@@ -299,3 +251,11 @@ function optional(object: Json, key: string) { return object[key] == null ? unde
 function toolError(code: string, message: string, status = 422) { return Object.assign(new Error(message), { code, status }); }
 function rpcResult(id: RpcRequest["id"], result: unknown) { return Response.json({ jsonrpc: "2.0", id: id ?? null, result }, { headers: { "MCP-Protocol-Version": PROTOCOL_VERSIONS[0] } }); }
 function rpcError(id: RpcRequest["id"], code: number, message: string, status: number, headers?: Record<string, string>) { return Response.json({ jsonrpc: "2.0", id: id ?? null, error: { code, message } }, { status, headers: { "MCP-Protocol-Version": PROTOCOL_VERSIONS[0], "cache-control": "no-store", ...headers } }); }
+
+export async function GET(request: Request) {
+  return handleMcp(request, runtimeEnv);
+}
+
+export async function POST(request: Request) {
+  return handleMcp(request, runtimeEnv);
+}

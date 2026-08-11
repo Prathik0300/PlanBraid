@@ -1,10 +1,11 @@
 import { betterAuth } from "better-auth";
+import type { PgD1 } from "@/db/pg-d1";
 
 const LOCAL_SECRET = "planbraid-local-development-secret-change-before-hosting";
 const LOCAL_ORIGIN = "http://localhost:3000";
 
 export type AuthEnvironment = {
-  DB: D1Database;
+  DB: PgD1;
   BETTER_AUTH_SECRET?: string;
   BETTER_AUTH_URL?: string;
   GOOGLE_CLIENT_ID?: string;
@@ -28,7 +29,10 @@ function googleProvider(runtime: AuthEnvironment) {
 
 export function authFor(runtime: AuthEnvironment) {
  return betterAuth({
-  database: runtime.DB as never,
+  // better-auth's Kysely adapter detects the Postgres dialect by checking for a
+  // `.connect()` method on this object, so it needs the raw pg.Pool, not the PgD1
+  // wrapper — they share the same underlying pool/connection budget either way.
+  database: runtime.DB.pool,
   secret: runtime.BETTER_AUTH_SECRET || LOCAL_SECRET,
   baseURL: configuredOrigin(runtime),
   basePath: "/api/auth",

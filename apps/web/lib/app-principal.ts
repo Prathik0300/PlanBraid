@@ -1,4 +1,5 @@
 import { authFor, type AuthEnvironment } from "@/lib/auth";
+import type { PgD1 } from "@/db/pg-d1";
 import { ensureSchema } from "@/db/setup";
 import type { Principal } from "@/lib/store";
 
@@ -11,7 +12,7 @@ function authenticationRequired() {
   });
 }
 
-async function canonicalUserId(db: D1Database, request: Request, session: NonNullable<AuthSession>) {
+async function canonicalUserId(db: PgD1, request: Request, session: NonNullable<AuthSession>) {
   const existing = await db.prepare("SELECT canonical_user_id FROM auth_principal_links WHERE auth_user_id = ?")
     .bind(session.user.id).first<{ canonical_user_id: string }>();
   if (existing) return existing.canonical_user_id;
@@ -24,12 +25,12 @@ async function canonicalUserId(db: D1Database, request: Request, session: NonNul
     if (legacyWorkspace) candidate = legacyUserId;
   }
 
-  await db.prepare("INSERT OR IGNORE INTO auth_principal_links (auth_user_id, canonical_user_id) VALUES (?, ?)")
+  await db.prepare("INSERT INTO auth_principal_links (auth_user_id, canonical_user_id) VALUES (?, ?) ON CONFLICT (auth_user_id) DO NOTHING")
     .bind(session.user.id, candidate).run();
   let link = await db.prepare("SELECT canonical_user_id FROM auth_principal_links WHERE auth_user_id = ?")
     .bind(session.user.id).first<{ canonical_user_id: string }>();
   if (!link) {
-    await db.prepare("INSERT OR IGNORE INTO auth_principal_links (auth_user_id, canonical_user_id) VALUES (?, ?)")
+    await db.prepare("INSERT INTO auth_principal_links (auth_user_id, canonical_user_id) VALUES (?, ?) ON CONFLICT (auth_user_id) DO NOTHING")
       .bind(session.user.id, session.user.id).run();
     link = await db.prepare("SELECT canonical_user_id FROM auth_principal_links WHERE auth_user_id = ?")
       .bind(session.user.id).first<{ canonical_user_id: string }>();

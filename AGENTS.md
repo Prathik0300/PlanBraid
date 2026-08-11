@@ -24,6 +24,6 @@ npm test
 ./node_modules/.bin/tsc --noEmit --pretty false
 ```
 
-`npm test` runs the domain-logic suites (deduplication, dependency graph, auto-unblock propagation, ready-work ranking, derived board columns — against a real in-memory database, see `tests/support/local-d1.mjs`), then builds and runs the rendered-HTML/build suite.
+`npm test` runs the domain-logic suites (deduplication, dependency graph, auto-unblock propagation, ready-work ranking, derived board columns — against a real embedded Postgres, see `tests/support/local-pg.mjs`), then builds and runs the rendered-HTML/build suite.
 
 Do not put secrets into repository files, hook configs, logs, or command-line arguments. Use `PLANBRAID_TOKEN` and other credential environment variables (the bridge also reads `RELAYBOARD_TOKEN` etc. as a one-release fallback; prefer `PLANBRAID_*` in new setups).

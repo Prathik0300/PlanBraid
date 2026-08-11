@@ -1,12 +1,12 @@
 /**
  * Domain-logic tests for dependency edges, run against a real (in-memory) database via
- * the local-d1 harness (see tests/support/local-d1.mjs). Covers the two live bugs
+ * the local-pg harness (see tests/support/local-pg.mjs). Covers the two live bugs
  * fixed in M2 (unfiltered cycle check, duplicate edge misreported as a conflict) and
  * the new depends_on resolution path in create_work_items.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTestDb } from "./support/local-d1.mjs";
+import { createTestDb } from "./support/local-pg.mjs";
 import { principal, setupProject, createItem } from "./support/fixtures.mjs";
 import { createWorkItemsDeduplicated, executeCommand, organizationFor } from "@/lib/store.ts";
 

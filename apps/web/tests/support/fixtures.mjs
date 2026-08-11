@@ -1,4 +1,4 @@
-/** Shared setup helpers for store-layer tests running against the local-d1 harness. */
+/** Shared setup helpers for store-layer tests running against the local-pg harness. */
 import { executeCommand } from "@/lib/store.ts";
 
 export const principal = { userId: "u_graph", email: "graph@planbraid.local", displayName: "Graph Tester" };

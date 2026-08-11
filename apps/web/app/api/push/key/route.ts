@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env } from "@/lib/runtime-env";
 import { errorResponse } from "@/lib/store";
 
 export const dynamic = "force-dynamic";

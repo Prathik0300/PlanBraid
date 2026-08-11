@@ -8,10 +8,13 @@ reference for *why* and *how*; this is *what* and *in what order*.
 
 Sizes are relative: **S** = a sitting, **M** = a day or so, **L** = multi-day.
 
-**Status: M0–M6 shipped**, except the self-hosting/`wrangler.jsonc` half of M6, deferred
-by request until the OAuth/MCP flow is validated end to end (see §9). The milestone
-sections below are kept as the design record of what was built and why; §1 reflects
-current state.
+**Status: M0–M6 shipped.** The self-hosting/`wrangler.jsonc` half of M6 was deferred by
+request until the OAuth/MCP flow was validated end to end, then superseded: once that
+validation was done, the app was migrated off Cloudflare Workers/D1/`vinext` entirely
+(standard Next.js, Postgres via Neon, deployed on Vercel with GitHub CI/CD) rather than
+self-hosted on Cloudflare — the user's stated Vercel target from the start (see §9). The
+milestone sections below are kept as the design record of what was built and why against
+the original Cloudflare-based architecture; §1 reflects current state.
 
 ---
 
@@ -39,12 +42,13 @@ the started-while-blocked anomaly rendering correctly on the board and in the dr
 `get_ready_work` correctly excluding another live session's claim while still showing it
 to the session that holds it.
 
-### Deferred
+### Superseded
 
-Self-hosting (`wrangler.jsonc`, decoupling `vite.config.ts` from `.openai/hosting.json`)
-— held until the OAuth/MCP connection flow and the platform overall are validated
-working end to end; the user's stated plan after that is Vercel, not necessarily
-Cloudflare Workers/D1 as-is. See §9.
+Self-hosting on Cloudflare (`wrangler.jsonc`, decoupling `vite.config.ts` from
+`.openai/hosting.json`) was deferred until the OAuth/MCP connection flow and the
+platform overall were validated end to end. Once validated, the app moved directly to
+Vercel/Postgres/Next.js instead — the Cloudflare-specific self-hosting path was never
+built. See §9.
 
 ### Not built (deliberately)
 
@@ -204,12 +208,9 @@ tracks. That is the differentiator, and it needs no new data.
 | Item | Change | Status |
 |---|---|---|
 | Finish the rebrand | `RELAYBOARD_*` → `PLANBRAID_*` in `integrations/` (old names kept as a one-release fallback in the bridge script); renamed `relayboard-hook.mjs` → `planbraid-hook.mjs` and `relayboard-app.tsx` → `planbraid-app.tsx`; updated `README.md`, `AGENTS.md`, `.mcp.json.example`, `integrations/README.md`, `integrations/gemini/GEMINI.md` | **Done** |
-| Self-hosting | Add `wrangler.jsonc`; decouple `vite.config.ts` from `.openai/hosting.json`; deploy docs | **Deferred** — by request, until the OAuth/MCP flow and platform are validated end to end; planned target after that is Vercel |
-| Rotate credential | `apps/web/.dev.vars` holds a Google OAuth client secret in plaintext. It is correctly gitignored and never committed (verified — not in `git ls-files` or history) — rotate anyway if it is not disposable | **Flagged to the user**, not actionable by an agent |
-
-Self-hosting is the whole privacy answer for most people who ask, and it removes the
-single-platform dependency that currently blocks every alternative deployment — worth
-doing once the flow it's deferred behind is validated.
+| Self-hosting on Cloudflare | Add `wrangler.jsonc`; decouple `vite.config.ts` from `.openai/hosting.json`; deploy docs | **Superseded** — once the OAuth/MCP flow and platform were validated end to end, the app moved to Vercel/Postgres/Next.js instead of self-hosting on Cloudflare |
+| Migrate off Cloudflare/vinext/ChatGPT Sites to Vercel | Postgres (Neon) schema + `PgD1` compatibility shim replacing D1, `vinext` replaced with standard `next`, `worker/index.ts`'s `/mcp` and OAuth routing ported to Next.js route handlers, `.openai/hosting.json`/`vite.config.ts`/`wrangler` removed, Vercel + GitHub native CI/CD | **Done** |
+| Rotate credential | `apps/web/.env.local` (formerly `.dev.vars`) holds a Google OAuth client secret in plaintext. It is correctly gitignored and never committed (verified — not in `git ls-files` or history) — rotate anyway if it is not disposable | **Flagged to the user**, not actionable by an agent |
 
 ---
 

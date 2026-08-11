@@ -13,18 +13,13 @@ coverage/
 
 # build output
 .next/
-.vinext/
-.wrangler/
 out/
 dist/
-outputs/
-work/
 *.tsbuildinfo
 
 # env / secrets
 .env*
 !.env.example
-.dev.vars
 
 # misc
 .DS_Store

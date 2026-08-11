@@ -1,3 +1,4 @@
+import type { PgD1 } from "@/db/pg-d1";
 import { ensureSchema } from "@/db/setup";
 import { principalFromRequest } from "@/lib/app-principal";
 import type { AuthEnvironment } from "@/lib/auth";
@@ -71,7 +72,7 @@ function authorizationServerMetadata(request: Request) {
   }, 200, true);
 }
 
-async function registerClient(request: Request, db: D1Database) {
+async function registerClient(request: Request, db: PgD1) {
   const limited = await applyRateLimit(db, request, "register", 30);
   if (limited) return limited;
   if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) return oauthError("invalid_client_metadata", "Registration requires application/json", 400);
@@ -154,7 +155,7 @@ async function finishAuthorization(request: Request, runtime: AuthEnvironment) {
   return redirectWithParams(redirectUri, { code, state });
 }
 
-async function exchangeToken(request: Request, db: D1Database) {
+async function exchangeToken(request: Request, db: PgD1) {
   const limited = await applyRateLimit(db, request, "token", 180);
   if (limited) return limited;
   const form = await readForm(request);
@@ -168,7 +169,7 @@ async function exchangeToken(request: Request, db: D1Database) {
   return oauthError("unsupported_grant_type", "Supported grants are authorization_code and refresh_token", 400);
 }
 
-async function exchangeAuthorizationCode(db: D1Database, form: URLSearchParams, client: OAuthClient, request: Request) {
+async function exchangeAuthorizationCode(db: PgD1, form: URLSearchParams, client: OAuthClient, request: Request) {
   const code = form.get("code") ?? "";
   const row = await db.prepare("SELECT * FROM oauth_authorization_codes WHERE code_hash = ? AND client_id = ?").bind(await digest(code), client.id).first<Row>();
   if (!row || row.used_at || String(row.expires_at) <= new Date().toISOString()) return oauthError("invalid_grant", "Authorization code is invalid or expired", 400);
@@ -186,7 +187,7 @@ async function exchangeAuthorizationCode(db: D1Database, form: URLSearchParams, 
   });
 }
 
-async function exchangeRefreshToken(db: D1Database, form: URLSearchParams, client: OAuthClient, request: Request) {
+async function exchangeRefreshToken(db: PgD1, form: URLSearchParams, client: OAuthClient, request: Request) {
   const rawToken = form.get("refresh_token") ?? "";
   const row = await db.prepare("SELECT refresh.*, family.revoked_at AS family_revoked_at FROM oauth_refresh_tokens refresh JOIN oauth_token_families family ON family.id = refresh.family_id WHERE refresh.token_hash = ? AND refresh.client_id = ?").bind(await digest(rawToken), client.id).first<Row>();
   if (!row || String(row.expires_at) <= new Date().toISOString()) return oauthError("invalid_grant", "Refresh token is invalid or expired", 400);
@@ -211,7 +212,7 @@ async function exchangeRefreshToken(db: D1Database, form: URLSearchParams, clien
   });
 }
 
-async function revokeToken(request: Request, db: D1Database) {
+async function revokeToken(request: Request, db: PgD1) {
   const form = await readForm(request);
   if (!form) return oauthError("invalid_request", "Revocation requests must use application/x-www-form-urlencoded", 400);
   const client = await authenticateClient(db, request, form);
@@ -223,7 +224,7 @@ async function revokeToken(request: Request, db: D1Database) {
   return new Response(null, { status: 200, headers: noStoreHeaders() });
 }
 
-async function validateAuthorizationRequest(url: URL, db: D1Database): Promise<{ client: OAuthClient; redirectUri: string; scopes: string[]; resource: string; state: string | null; codeChallenge: string } | Response> {
+async function validateAuthorizationRequest(url: URL, db: PgD1): Promise<{ client: OAuthClient; redirectUri: string; scopes: string[]; resource: string; state: string | null; codeChallenge: string } | Response> {
   if (url.searchParams.get("response_type") !== "code") return oauthError("unsupported_response_type", "Only response_type=code is supported", 400);
   const client = await loadClient(db, url.searchParams.get("client_id") ?? "");
   if (!client) return oauthError("invalid_request", "Unknown OAuth client", 400);
@@ -239,7 +240,7 @@ async function validateAuthorizationRequest(url: URL, db: D1Database): Promise<{
   return { client, redirectUri, scopes, resource, state: url.searchParams.get("state"), codeChallenge };
 }
 
-async function authenticateClient(db: D1Database, request: Request, form: URLSearchParams): Promise<OAuthClient | Response> {
+async function authenticateClient(db: PgD1, request: Request, form: URLSearchParams): Promise<OAuthClient | Response> {
   const basic = parseBasicAuthorization(request.headers.get("authorization"));
   const clientId = basic?.id ?? form.get("client_id") ?? "";
   const client = await loadClient(db, clientId);
@@ -250,7 +251,7 @@ async function authenticateClient(db: D1Database, request: Request, form: URLSea
   return client;
 }
 
-async function loadClient(db: D1Database, clientId: string): Promise<OAuthClient | null> {
+async function loadClient(db: PgD1, clientId: string): Promise<OAuthClient | null> {
   if (!clientId || clientId.length > 200) return null;
   const row = await db.prepare("SELECT * FROM oauth_clients WHERE id = ? AND revoked_at IS NULL").bind(clientId).first<Row>();
   if (!row) return null;
@@ -260,14 +261,14 @@ async function loadClient(db: D1Database, clientId: string): Promise<OAuthClient
   };
 }
 
-async function issueTokenPair(db: D1Database, input: { clientId: string; organizationId: string; ownerUserId: string; scopes: string; resource: string; familyId: string }) {
+async function issueTokenPair(db: PgD1, input: { clientId: string; organizationId: string; ownerUserId: string; scopes: string; resource: string; familyId: string }) {
   const accessToken = randomToken("rla", 32);
   const refreshToken = randomToken("rlr", 40);
   const now = Date.now();
   const accessExpiresAt = new Date(now + ACCESS_TOKEN_SECONDS * 1000).toISOString();
   const refreshExpiresAt = new Date(now + REFRESH_TOKEN_SECONDS * 1000).toISOString();
   await db.batch([
-    db.prepare("INSERT OR IGNORE INTO oauth_token_families (id) VALUES (?)").bind(input.familyId),
+    db.prepare("INSERT INTO oauth_token_families (id) VALUES (?) ON CONFLICT (id) DO NOTHING").bind(input.familyId),
     db.prepare("INSERT INTO oauth_access_tokens (id, token_hash, client_id, organization_id, owner_user_id, scopes, resource, family_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .bind(randomToken("oat", 18), await digest(accessToken), input.clientId, input.organizationId, input.ownerUserId, input.scopes, input.resource, input.familyId, accessExpiresAt),
     db.prepare("INSERT INTO oauth_refresh_tokens (id, token_hash, client_id, organization_id, owner_user_id, scopes, resource, family_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -276,7 +277,7 @@ async function issueTokenPair(db: D1Database, input: { clientId: string; organiz
   return oauthJson({ access_token: accessToken, token_type: "Bearer", expires_in: ACCESS_TOKEN_SECONDS, refresh_token: refreshToken, scope: input.scopes });
 }
 
-async function revokeFamily(db: D1Database, familyId: string) {
+async function revokeFamily(db: PgD1, familyId: string) {
   await db.batch([
     db.prepare("INSERT INTO oauth_token_families (id, revoked_at) VALUES (?, CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET revoked_at = COALESCE(oauth_token_families.revoked_at, CURRENT_TIMESTAMP)").bind(familyId),
     db.prepare("UPDATE oauth_access_tokens SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE family_id = ?").bind(familyId),
@@ -284,7 +285,7 @@ async function revokeFamily(db: D1Database, familyId: string) {
   ]);
 }
 
-async function applyRateLimit(db: D1Database, request: Request, bucket: string, maximum: number): Promise<Response | null> {
+async function applyRateLimit(db: PgD1, request: Request, bucket: string, maximum: number): Promise<Response | null> {
   const ip = request.headers.get("cf-connecting-ip") ?? request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
   const hour = new Date().toISOString().slice(0, 13);
   const key = await digest(`${bucket}:${ip}`);
@@ -295,7 +296,7 @@ async function applyRateLimit(db: D1Database, request: Request, bucket: string, 
   return oauthError("temporarily_unavailable", "Too many OAuth requests; try again later", 429, { "retry-after": "3600" });
 }
 
-async function cleanupExpiredOAuthData(db: D1Database) {
+async function cleanupExpiredOAuthData(db: PgD1) {
   const now = new Date().toISOString();
   const inactiveClientCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const rateCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 13);
