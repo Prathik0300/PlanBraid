@@ -289,7 +289,10 @@ async function applyRateLimit(db: PgD1, request: Request, bucket: string, maximu
   const ip = request.headers.get("cf-connecting-ip") ?? request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
   const hour = new Date().toISOString().slice(0, 13);
   const key = await digest(`${bucket}:${ip}`);
-  const row = await db.prepare("INSERT INTO oauth_rate_limits (rate_key, window_start, request_count) VALUES (?, ?, 1) ON CONFLICT(rate_key, window_start) DO UPDATE SET request_count = request_count + 1 RETURNING request_count")
+  // Postgres treats a bare self-referencing column here as ambiguous between the
+  // target table and the implicit `excluded` row ON CONFLICT always exposes — must be
+  // table-qualified (SQLite/D1 never required this).
+  const row = await db.prepare("INSERT INTO oauth_rate_limits (rate_key, window_start, request_count) VALUES (?, ?, 1) ON CONFLICT(rate_key, window_start) DO UPDATE SET request_count = oauth_rate_limits.request_count + 1 RETURNING oauth_rate_limits.request_count AS request_count")
     .bind(key, hour).first<{ request_count: number }>();
   if (Number(row?.request_count ?? 1) === 1) await cleanupExpiredOAuthData(db);
   if (Number(row?.request_count ?? 1) <= maximum) return null;
