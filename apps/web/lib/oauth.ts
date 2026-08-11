@@ -140,7 +140,16 @@ async function finishAuthorization(request: Request, runtime: AuthEnvironment) {
   const decision = String(form.get("decision") ?? "deny");
   const row = await db.prepare("SELECT * FROM oauth_authorization_requests WHERE id = ? AND owner_user_id = ? AND used_at IS NULL AND expires_at > ?")
     .bind(requestId, principal.userId, new Date().toISOString()).first<Row>();
-  if (!row) return oauthHtml("Request expired", "Return to Claude and start the connection again.", 400);
+  if (!row) {
+    // Diagnostic-only: "Request expired" is shown for several distinct causes (no such
+    // row, wrong owner, already used, genuinely past expires_at) that were previously
+    // indistinguishable from the outside. Log which one it actually was without
+    // changing the response, so a reproduction pins down the real cause.
+    const diagnostic = await db.prepare("SELECT owner_user_id, used_at, expires_at FROM oauth_authorization_requests WHERE id = ?").bind(requestId).first<Row>();
+    if (!diagnostic) console.error(`[oauth] finishAuthorization: no oauth_authorization_requests row for id=${requestId}`);
+    else console.error(`[oauth] finishAuthorization: row found for id=${requestId} but rejected — ownerMatches=${diagnostic.owner_user_id === principal.userId} usedAt=${diagnostic.used_at} expiresAt=${diagnostic.expires_at} now=${new Date().toISOString()}`);
+    return oauthHtml("Request expired", "Return to Claude and start the connection again.", 400);
+  }
 
   const consumed = await db.prepare("UPDATE oauth_authorization_requests SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS NULL RETURNING id").bind(requestId).first();
   if (!consumed) return oauthHtml("Request already used", "Return to Claude and start the connection again.", 400);
