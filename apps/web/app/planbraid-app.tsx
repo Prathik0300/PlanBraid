@@ -385,6 +385,8 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
   const [mode, setMode] = useState<"oauth" | "token">("oauth");
   const [connections, setConnections] = useState<McpConnection[]>([]);
   const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [oauthConnections, setOauthConnections] = useState<McpConnection[]>([]);
+  const [revokingOAuthId, setRevokingOAuthId] = useState<string | null>(null);
   const [pushEnabled, setPushEnabled] = useState(false);
   useEffect(() => {
     let cancelled = false;
@@ -393,6 +395,15 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       const registration = await navigator.serviceWorker.getRegistration("/sw.js");
       const subscription = await registration?.pushManager.getSubscription();
       if (!cancelled && subscription) setPushEnabled(true);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const response = await fetch("/api/oauth-connections", { headers: { accept: "application/json" } });
+      const body = await response.json() as { data?: McpConnection[] };
+      if (!cancelled && response.ok) setOauthConnections(body.data ?? []);
     })();
     return () => { cancelled = true; };
   }, []);
@@ -422,6 +433,17 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       toast("MCP connection revoked");
     } catch (error) { toast(error instanceof Error ? error.message : "Could not revoke this connection"); }
     finally { setRevokingId(null); }
+  }
+  async function revokeOAuth(id: string) {
+    setRevokingOAuthId(id);
+    try {
+      const response = await fetch("/api/oauth-connections", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) });
+      const body = await response.json() as { error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not revoke this connection");
+      setOauthConnections((current) => current.filter((entry) => entry.id !== id));
+      toast("OAuth connection revoked");
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not revoke this connection"); }
+    finally { setRevokingOAuthId(null); }
   }
   async function alerts() {
     if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) return toast("This browser does not support Web Push");
@@ -469,6 +491,7 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
         <div className="endpoint-box"><small>Remote MCP server URL</small><code>{endpoint}</code><button onClick={() => { void navigator.clipboard.writeText(endpoint); toast("MCP URL copied"); }}>Copy URL</button></div>
         <div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => { void navigator.clipboard.writeText(oauthConfig); toast("OAuth MCP config copied"); }}>Copy config</button></span><pre>{oauthConfig}</pre></div>
         <p className="oauth-help">Planbraid uses standard MCP and OAuth discovery. The connected client identifies its own provider, session, and optional model when it begins reporting work.</p>
+        <div className="connection-list"><h3>Connected apps <span>{oauthConnections.length}</span></h3>{oauthConnections.length ? oauthConnections.map((entry) => <div className="connection-row" key={entry.id}><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => void revokeOAuth(entry.id)} disabled={revokingOAuthId === entry.id}>{revokingOAuthId === entry.id ? "Revoking…" : "Revoke"}</button></div>) : <p className="oauth-help">No connected apps yet.</p>}</div>
       </section> : <section className="token-setup-card connection-panel" role="tabpanel">
         <header><span><span className="token-key">⌁</span><strong>Bearer token access</strong></span></header>
         <p>For clients without OAuth, create a personal token and send it in the <code>Authorization</code> header. The secret is shown only once.</p>

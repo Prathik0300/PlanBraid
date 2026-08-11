@@ -285,6 +285,34 @@ async function revokeFamily(db: PgD1, familyId: string) {
   ]);
 }
 
+export type OAuthConnection = { id: string; name: string; scopes: string[]; lastUsedAt: string | null; createdAt: string };
+
+/** One row per non-revoked token family — a family is the unit `revokeFamily` acts on,
+ * so this is the unit the dashboard should show and let the user revoke. If the same
+ * client reconnects, that's a second family and a second row, which is accurate. */
+export async function listOAuthConnections(db: PgD1, principal: Principal, organizationId: string): Promise<OAuthConnection[]> {
+  const rows = await db.prepare(
+    `SELECT f.id AS family_id, c.client_name AS client_name, f.created_at AS connected_at, MAX(t.scopes) AS scopes, MAX(a.last_used_at) AS last_used_at
+       FROM oauth_token_families f
+       JOIN oauth_refresh_tokens t ON t.family_id = f.id
+       JOIN oauth_clients c ON c.id = t.client_id
+       LEFT JOIN oauth_access_tokens a ON a.family_id = f.id
+      WHERE f.revoked_at IS NULL AND t.owner_user_id = ? AND t.organization_id = ?
+      GROUP BY f.id, c.client_name, f.created_at
+      ORDER BY f.created_at DESC
+      LIMIT 100`,
+  ).bind(principal.userId, organizationId).all<{ family_id: string; client_name: string; connected_at: string; scopes: string | null; last_used_at: string | null }>();
+  return rows.results.map((row) => ({ id: row.family_id, name: row.client_name, scopes: (row.scopes ?? "").split(/\s+/).filter(Boolean), lastUsedAt: row.last_used_at, createdAt: row.connected_at }));
+}
+
+export async function revokeOAuthConnection(db: PgD1, principal: Principal, organizationId: string, familyId: string): Promise<{ id: string; revoked: true }> {
+  const owned = await db.prepare("SELECT id FROM oauth_refresh_tokens WHERE family_id = ? AND owner_user_id = ? AND organization_id = ? LIMIT 1")
+    .bind(familyId, principal.userId, organizationId).first<{ id: string }>();
+  if (!owned) throw Object.assign(new Error("OAuth connection not found"), { code: "NOT_FOUND", status: 404 });
+  await revokeFamily(db, familyId);
+  return { id: familyId, revoked: true };
+}
+
 async function applyRateLimit(db: PgD1, request: Request, bucket: string, maximum: number): Promise<Response | null> {
   const ip = request.headers.get("cf-connecting-ip") ?? request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
   const hour = new Date().toISOString().slice(0, 13);
