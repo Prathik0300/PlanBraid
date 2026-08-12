@@ -369,13 +369,22 @@ function parseScopes(value: string) {
   return [...new Set(value.trim().split(/\s+/).filter(Boolean))];
 }
 
-function validRedirectUri(value: string) {
+// RFC 8252 ("OAuth 2.0 for Native Apps") recommends two redirect patterns for
+// non-browser clients that can't use a fixed https:// callback: a loopback HTTP
+// server on an ephemeral port (Codex, local bridges), or a private-use URI scheme
+// registered with the OS (VS Code-based clients — GitHub Copilot Chat, Cursor — use
+// "vscode://...", JetBrains plugins use their own scheme, etc). Rejecting the second
+// pattern would silently break registration for that entire client category before
+// they ever reach the consent screen.
+const DANGEROUS_REDIRECT_SCHEMES = new Set(["javascript:", "data:", "vbscript:", "file:", "about:", "blob:"]);
+export function validRedirectUri(value: string) {
   if (value.length > 2048) return false;
   try {
     const url = new URL(value);
     if (url.hash || url.username || url.password) return false;
     if (url.protocol === "https:") return true;
-    return url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+    if (url.protocol === "http:") return ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+    return !DANGEROUS_REDIRECT_SCHEMES.has(url.protocol);
   } catch { return false; }
 }
 
@@ -490,7 +499,21 @@ function allowedMethods(pathname: string) { return pathname === "/authorize" ? "
 // clicking "Allow" rather than describing what it actually means.
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0"]);
 function describeRedirectDestination(url: URL) {
-  return LOOPBACK_HOSTNAMES.has(url.hostname) ? "an app running on this device" : url.host;
+  if (LOOPBACK_HOSTNAMES.has(url.hostname)) return "an app running on this device";
+  // A private-use URI scheme with no "//host" authority (e.g. "com.example.app:/cb",
+  // as opposed to "vscode://publisher.ext/cb") has an empty .host — fall back to the
+  // scheme itself so the sentence still reads as something, not a blank.
+  return url.host || url.protocol;
+}
+
+// WHATWG URL gives non-special schemes (custom private-use schemes like "vscode:" —
+// the RFC 8252 native-app redirect pattern VS Code-based clients such as GitHub
+// Copilot Chat and Cursor use) an *opaque* origin, serialized as the literal string
+// "null" — not a usable CSP source. CSP3's scheme-source form ("vscode:", matching any
+// URL with that scheme) is the correct equivalent for a directive that otherwise only
+// ever sees http/https origins.
+function cspFormActionSource(url: URL) {
+  return url.origin === "null" ? url.protocol : url.origin;
 }
 
 // Exported for direct testing: consentPage is otherwise only reachable through a fully
@@ -500,7 +523,7 @@ export function consentPage(clientName: string, redirectUri: string, scopes: str
   const permissions = scopes.map((scope) => scope === "work:write" ? "Create, update, block, and complete todo items" : "View your projects, todo items, sources, and activity");
   const permissionItems = permissions.map((permission) => `<li><span>✓</span>${escapeHtml(permission)}</li>`).join("");
   const redirectUrl = new URL(redirectUri);
-  const redirectOrigin = redirectUrl.origin;
+  const redirectOrigin = cspFormActionSource(redirectUrl);
   const redirectHost = describeRedirectDestination(redirectUrl);
   const body = `<main><div class="brand"><img src="/planbraid-mark.png" alt="">Planbraid</div><section><small>CONNECT MCP CLIENT</small><h1>Allow ${escapeHtml(clientName)} to use Planbraid?</h1><p>This connection will act for <strong>${escapeHtml(principal.email)}</strong>. The authorization result returns to <strong>${escapeHtml(redirectHost)}</strong>.</p><ul>${permissionItems}</ul><div class="notice">Access tokens expire after one hour. You can disconnect the connector to revoke future access.</div><form method="post" action="/authorize"><input type="hidden" name="request_id" value="${escapeHtml(requestId)}"><button class="approve" name="decision" value="approve">Allow access</button><button class="deny" name="decision" value="deny">Cancel</button></form></section><footer>OAuth 2.1 · PKCE · scoped access · refresh rotation</footer></main>`;
   // form-action must additionally allow the client's own (already-validated, registered)
