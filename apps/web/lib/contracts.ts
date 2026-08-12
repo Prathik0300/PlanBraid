@@ -119,10 +119,10 @@ export type Command =
   | { action: "create_project"; name: string; directory?: string; description?: string; gitRemote?: string; idempotencyKey: string }
   | { action: "update_project"; projectId: string; name?: string; description?: string; directory?: string; gitRemote?: string; idempotencyKey: string }
   | { action: "create_item"; projectId: string; title: string; description?: string; status?: WorkStatus; priority?: WorkItem["priority"]; sourceId?: string; contentFingerprint?: string; idempotencyKey: string }
-  | { action: "update_item"; projectId: string; itemId: string; expectedVersion: number; title?: string; description?: string; priority?: WorkItem["priority"]; assignee?: string | null; idempotencyKey: string }
+  | { action: "update_item"; projectId: string; itemId: string; expectedVersion: number; title?: string; description?: string; priority?: WorkItem["priority"]; assignee?: string | null; sourceId?: string; idempotencyKey: string }
   | { action: "transition_item"; projectId: string; itemId: string; expectedVersion: number; status: WorkStatus; reason?: string; sourceId?: string; idempotencyKey: string }
   | { action: "add_note"; projectId: string; itemId: string; summary: string; sourceId?: string; idempotencyKey: string }
   | { action: "add_evidence"; projectId: string; itemId: string; type: string; label: string; uri?: string; result?: string; sourceId?: string; idempotencyKey: string }
-  | { action: "add_dependency"; projectId: string; fromWorkItemId: string; toWorkItemId: string; type?: string; reason?: string; idempotencyKey: string }
+  | { action: "add_dependency"; projectId: string; fromWorkItemId: string; toWorkItemId: string; type?: string; reason?: string; sourceId?: string; idempotencyKey: string }
   | { action: "split_alias"; projectId: string; aliasId: string; idempotencyKey: string }
   | { action: "mark_notification"; notificationId: string; read?: boolean; resolved?: boolean; idempotencyKey: string };

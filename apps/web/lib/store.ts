@@ -371,10 +371,11 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     if (command.fromWorkItemId === command.toWorkItemId) throw domainError("BLOCKING_CYCLE", "A task cannot block itself");
     const [from, to] = await db.batch([
       db.prepare("SELECT id, status FROM work_items WHERE id = ? AND project_id = ? AND organization_id = ?").bind(command.fromWorkItemId, command.projectId, organizationId),
-      db.prepare("SELECT id FROM work_items WHERE id = ? AND project_id = ? AND organization_id = ?").bind(command.toWorkItemId, command.projectId, organizationId),
+      db.prepare("SELECT id, source_id FROM work_items WHERE id = ? AND project_id = ? AND organization_id = ?").bind(command.toWorkItemId, command.projectId, organizationId),
     ]);
     if (!from.results.length || !to.results.length) throw domainError("NOT_FOUND", "Dependency task not found", 404);
     const edgeType = command.type ?? "blocks";
+    const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(to.results[0], "source_id"));
     // A duplicate edge is a no-op, not a conflict: two agents independently declaring
     // the same prerequisite agree with each other. Without this check the INSERT below
     // trips the UNIQUE(from, to, type) constraint and commitMutation's generic handler
@@ -393,7 +394,7 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const statements = [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("INSERT INTO dependencies (id, organization_id, project_id, from_work_item_id, to_work_item_id, type, reason) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(dependencyId, organizationId, command.projectId, command.fromWorkItemId, command.toWorkItemId, edgeType, command.reason?.slice(0, 1000) ?? ""),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, 'dependency.added', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.toWorkItemId, principal.displayName, "Dependency added", now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'dependency.added', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.toWorkItemId, command.sourceId ?? nullable(to.results[0], "source_id"), actor, `${actor} added a dependency`, now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ];
     // Only a hard, unresolved prerequisite blocks anything. An edge to an already-done
@@ -472,11 +473,12 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const description = command.description == null ? text(item, "description") : command.description.trim().slice(0, 10000);
     const priority = command.priority ?? text(item, "priority");
     const assignee = command.assignee === undefined ? nullable(item, "assignee") : command.assignee;
+    const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
     const response = { itemId: command.itemId, version: command.expectedVersion + 1, projectRevision: nextRevision };
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("UPDATE work_items SET title = ?, description = ?, priority = ?, assignee = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?").bind(title, description, priority, assignee, now, command.itemId, command.expectedVersion),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, 'work_item.updated', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, principal.displayName, `${principal.displayName} updated ${itemKey}`, now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.updated', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? nullable(item, "source_id"), actor, `${actor} updated ${itemKey}`, now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
     return response;
@@ -859,7 +861,7 @@ export async function createWorkItemsDeduplicated(
         try {
           await executeCommand(db, principal, {
             action: "add_dependency", projectId: input.projectId, fromWorkItemId: prerequisite.itemId, toWorkItemId: target.itemId,
-            type: "blocks", idempotencyKey: `${input.idempotencyKey}:dep:${index}:${depIndex}`,
+            type: "blocks", sourceId: input.sourceId, idempotencyKey: `${input.idempotencyKey}:dep:${index}:${depIndex}`,
           });
           linked.push(prerequisite.itemKey);
         } catch (error) {
