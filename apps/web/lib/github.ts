@@ -17,18 +17,40 @@ export type GithubStatus = { connected: boolean; login: string | null; configure
 
 type Row = Record<string, unknown>;
 
+/**
+ * Accepts the bare slug, but also a pasted app or settings URL and stray whitespace.
+ * Copying the address bar out of GitHub's settings page is the obvious mistake, and
+ * naively encoding that whole string produced an install link to a page that does not
+ * exist, with nothing explaining why.
+ */
+export function normalizeAppSlug(raw: string | undefined) {
+  const trimmed = (raw ?? "").trim().replace(/[/\s]+$/, "");
+  if (!trimmed) return "";
+  // Match the URL shape rather than taking the last path segment, which would turn
+  // ".../settings/apps/" (slug omitted) into the slug "apps".
+  if (trimmed.includes("/")) {
+    const fromUrl = /github\.com\/(?:settings\/)?apps\/([a-z0-9][a-z0-9-]*)/i.exec(trimmed);
+    return fromUrl ? fromUrl[1].toLowerCase() : "";
+  }
+  // GitHub slugs are alphanumeric with hyphens; anything else is a paste accident we
+  // should refuse rather than turn into a dead link.
+  return /^[a-z0-9][a-z0-9-]*$/i.test(trimmed) ? trimmed.toLowerCase() : "";
+}
+
 export function githubConfigured() {
-  return Boolean(process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_CLIENT_ID && process.env.GITHUB_APP_CLIENT_SECRET);
+  return Boolean(normalizeAppSlug(process.env.GITHUB_APP_SLUG) && process.env.GITHUB_APP_CLIENT_ID?.trim() && process.env.GITHUB_APP_CLIENT_SECRET?.trim());
 }
 
 function configOrThrow() {
-  if (!githubConfigured()) throw Object.assign(new Error("GitHub is not configured for this deployment"), { code: "NOT_CONFIGURED", status: 503 });
-  return { slug: process.env.GITHUB_APP_SLUG!, clientId: process.env.GITHUB_APP_CLIENT_ID!, clientSecret: process.env.GITHUB_APP_CLIENT_SECRET! };
+  const slug = normalizeAppSlug(process.env.GITHUB_APP_SLUG);
+  if (!slug) throw Object.assign(new Error("GITHUB_APP_SLUG must be the app's slug, for example planbraid, not a full URL"), { code: "NOT_CONFIGURED", status: 503 });
+  if (!process.env.GITHUB_APP_CLIENT_ID?.trim() || !process.env.GITHUB_APP_CLIENT_SECRET?.trim()) throw Object.assign(new Error("GitHub is not configured for this deployment"), { code: "NOT_CONFIGURED", status: 503 });
+  return { slug, clientId: process.env.GITHUB_APP_CLIENT_ID.trim(), clientSecret: process.env.GITHUB_APP_CLIENT_SECRET.trim() };
 }
 
 /** GitHub's own install screen is where the user chooses which repositories to expose. */
 export function githubInstallUrl() {
-  return `https://github.com/apps/${encodeURIComponent(configOrThrow().slug)}/installations/new`;
+  return `https://github.com/apps/${configOrThrow().slug}/installations/new`;
 }
 
 export async function exchangeGithubCode(db: PgD1, principal: Principal, code: string) {
