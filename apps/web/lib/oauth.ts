@@ -29,7 +29,12 @@ export function oauthChallenge(request: Request, scope = SUPPORTED_SCOPES.join("
 }
 
 export async function handleOAuthRoute(request: Request, runtime: AuthEnvironment): Promise<Response | null> {
-  const { pathname } = new URL(request.url);
+  const url = new URL(request.url);
+  // Next.js no longer 308-redirects a trailing slash to the canonical path (see
+  // next.config.ts's skipTrailingSlashRedirect — some OAuth clients' HTTP libraries
+  // don't correctly re-send a POST body through that redirect), so both forms now
+  // reach here directly and must be treated as the same route.
+  const pathname = url.pathname.length > 1 && url.pathname.endsWith("/") ? url.pathname.slice(0, -1) : url.pathname;
   if (request.method === "OPTIONS" && ["/register", "/token", "/revoke"].includes(pathname)) return optionsResponse();
   if (pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-protected-resource/mcp") return protectedResourceMetadata(request);
   if (pathname === "/.well-known/oauth-authorization-server") return authorizationServerMetadata(request);
