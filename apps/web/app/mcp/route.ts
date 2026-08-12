@@ -18,6 +18,7 @@ const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18"];
 
 const tools = [
   { name: "resolve_project", description: "Resolve a canonical Planbraid project from an explicit ID, repository path, remote, or name. Call this before planning when project identity is uncertain.", inputSchema: { type: "object", properties: { project_id: { type: "string" }, query: { type: "string" } } } },
+  { name: "create_project", description: "Create a Planbraid project, optionally bound to the repository or directory it tracks. Always call resolve_project first: if it returns a match, use that project instead of creating a second one for the same work.", inputSchema: { type: "object", required: ["name", "idempotency_key"], properties: { name: { type: "string" }, directory: { type: "string", description: "Absolute path of the repository or working directory this project tracks, for example /Users/you/Projects/my-app." }, description: { type: "string" }, idempotency_key: { type: "string" } } } },
   { name: "get_project_brief", description: "Get compact current project context: active, ready, blocked, review, recent events, sources, and recommended next actions.", inputSchema: { type: "object", required: ["project_id"], properties: { project_id: { type: "string" }, focus: { type: "string" } } } },
   { name: "list_work_items", description: "List current project work with structured status/source filters.", inputSchema: { type: "object", required: ["project_id"], properties: { project_id: { type: "string" }, status: { type: "string" }, source_id: { type: "string" }, query: { type: "string" }, limit: { type: "number" } } } },
   { name: "get_ready_work", description: "Get work that is actually actionable right now: unblocked by dependencies, not claimed by another active session, ranked by how much finishing it unlocks. Prefer this over list_work_items when deciding what to work on next.", inputSchema: { type: "object", required: ["project_id"], properties: { project_id: { type: "string" }, source_id: { type: "string", description: "This session's source ID. Excludes work already claimed by other active sessions; does not exclude this session's own claims." }, limit: { type: "number", description: "Defaults to 5." }, avoid_collisions: { type: "boolean", description: "Defaults to true. Set false to see all unblocked work regardless of other sessions' claims." } } } },
@@ -73,7 +74,7 @@ async function handleMcp(request: Request, env: Env) {
   if (rpc.method === "initialize") {
     const requestedVersion = String(rpc.params?.protocolVersion ?? "");
     const protocolVersion = PROTOCOL_VERSIONS.includes(requestedVersion) ? requestedVersion : PROTOCOL_VERSIONS[0];
-    return rpcResult(rpc.id, { protocolVersion, capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false }, prompts: { listChanged: false } }, serverInfo: { name: "planbraid", title: "Planbraid - One Plan Across Every Agent", version: "0.1.0", description: "Plans, progress, blockers, and completions braided across any MCP-compatible client or model" }, instructions: "Read the project brief before planning. Register this client or model with its own free-form identity. Record accepted work, start/block/progress/completion changes, and sync every interaction. Completion requires evidence or remains in review. Use get_ready_work, not list_work_items, when deciding what to work on next." });
+    return rpcResult(rpc.id, { protocolVersion, capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false }, prompts: { listChanged: false } }, serverInfo: { name: "planbraid", title: "Planbraid - One Plan Across Every Agent", version: "0.1.0", description: "Plans, progress, blockers, and completions braided across any MCP-compatible client or model" }, instructions: "Start with resolve_project to find the project for the current repository or directory; if nothing matches, create_project binds a new one to that directory. Read the project brief before planning. Register this client or model with its own free-form identity. Record accepted work, start/block/progress/completion changes, and sync every interaction. Completion requires evidence or remains in review. Use get_ready_work, not list_work_items, when deciding what to work on next." });
   }
   if (rpc.method === "notifications/initialized" || rpc.method === "ping") return rpcResult(rpc.id, {});
 
@@ -107,6 +108,9 @@ async function callTool(db: PgD1, principal: Principal, name: string, args: Json
     const query = String(args.query ?? "").toLowerCase();
     const matches = explicit ? [explicit] : data.projects.filter((project) => !query || [project.name, project.directory, project.gitRemote ?? ""].some((value) => value.toLowerCase().includes(query)));
     return matches.length === 1 ? { project: matches[0], confidence: explicit ? "exact" : "matched" } : { matches, ambiguous: matches.length !== 1 };
+  }
+  if (name === "create_project") {
+    return executeCommand(db, principal, { action: "create_project", name: required(args, "name"), directory: optional(args, "directory"), description: optional(args, "description"), idempotencyKey: required(args, "idempotency_key") });
   }
   if (name === "get_project_brief") return projectBrief(await state(), required(args, "project_id"));
   if (name === "list_work_items") {

@@ -23,7 +23,7 @@ Open `http://localhost:3000`. The local development environment seeds a multi-ag
 
 The Streamable HTTP/JSON-RPC endpoint is `/mcp`. Localhost permits the development principal. Hosted clients use a bearer token generated from **Connect agent** in the Web UI.
 
-Core tools include project resolution/briefs, task create/update/start/block/progress/completion/reopen/search, `get_ready_work` for ranked, graph-aware "what's actionable now", `link_work_items` for declaring dependencies, session registration/heartbeat/end, and interaction start/synchronization.
+Core tools include project resolution/creation/briefs (`resolve_project`, `create_project` to bind a project to a repository directory, `get_project_brief`), task create/update/start/block/progress/completion/reopen/search, `get_ready_work` for ranked, graph-aware "what's actionable now", `link_work_items` for declaring dependencies, session registration/heartbeat/end, and interaction start/synchronization.
 
 Provider hook templates and the local bridge are under `integrations/`.
 

@@ -221,6 +221,12 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.doesNotMatch(store, /const baseKey|Math\.random\(\).*project|`\$\{baseKey\}/);
   assert.doesNotMatch(mcp, /project\.key/);
   assert.match(mcp, /any MCP client, agent, or personal-model session/);
+  // The empty-state UI tells people to "create the project from your MCP client", so the
+  // MCP surface has to actually expose project creation — it silently didn't at first,
+  // leaving a connected agent able to see the account but unable to make a project.
+  assert.match(mcp, /name: "create_project"/);
+  assert.match(mcp, /action: "create_project"/);
+  assert.match(app, /create the project from your MCP client/);
   assert.match(mcp, /Free-form client, agent, or provider name/);
   assert.match(contracts, /export type Provider = string/);
   assert.match(setup, /CREATE TABLE IF NOT EXISTS data_migrations/);
