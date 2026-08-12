@@ -35,6 +35,9 @@ export interface PgD1PreparedStatement {
   raw<T = unknown[]>(): Promise<T[]>;
 }
 
+/** "PLAN" as int32, namespacing this app's advisory locks. */
+const LOCK_NAMESPACE = 0x504c414e;
+
 function isSelectLike(sql: string) {
   return /^\s*(SELECT|WITH)/i.test(sql);
 }
@@ -108,13 +111,60 @@ export class PgD1 {
    * `pg`-compatible pool with `.connect()`, not this D1-shaped wrapper) can share the
    * same connection pool instead of opening a second one. */
   readonly pool: PgPoolClient;
+  /** True for the handle handed to transaction()'s callback: everything it issues is
+   * already inside one transaction, so batch() must not open a nested one. */
+  private readonly inTransaction: boolean;
 
-  constructor(pool: PgPoolClient) {
+  constructor(pool: PgPoolClient, inTransaction = false) {
     this.pool = pool;
+    this.inTransaction = inTransaction;
   }
 
   prepare(sql: string): PgD1PreparedStatement {
     return new PgStatement(this.pool, sql);
+  }
+
+  /**
+   * Runs reads and writes together on one connection inside one transaction, so a
+   * decision made from a read still holds when the write lands. batch() cannot express
+   * this: it takes a fixed list of statements with no room to branch in between, which
+   * is exactly what check-then-insert needs.
+   */
+  async transaction<T>(run: (tx: PgD1) => Promise<T>): Promise<T> {
+    if (this.inTransaction) return run(this);
+    const client = await this.pool.connect();
+    const scoped: PgPoolClient = {
+      query: (sql, params) => client.query(sql, params),
+      // Anything reaching for a connection inside the transaction must get *this* one,
+      // or its statements would land outside the transaction on a different connection.
+      connect: async () => Object.assign(client, { release: () => {} }),
+    };
+    try {
+      await client.query("BEGIN");
+      const result = await run(new PgD1(scoped, true));
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Serializes a section against other writers holding the same key, for the whole
+   * surrounding transaction. Postgres releases it automatically on commit or rollback,
+   * so a crash mid-way cannot strand the lock the way a manually held one could.
+   */
+  async lock(key: string) {
+    if (!this.inTransaction) throw new Error("PgD1.lock() must be called inside transaction()");
+    // pg_advisory_xact_lock(int4, int4): a fixed namespace in the first slot keeps these
+    // from colliding with any other advisory lock in the database, and two 32-bit keys
+    // avoid BigInt entirely.
+    let hash = 0;
+    for (let index = 0; index < key.length; index += 1) hash = (Math.imul(hash, 31) + key.charCodeAt(index)) | 0;
+    await this.pool.query("SELECT pg_advisory_xact_lock($1, $2)", [LOCK_NAMESPACE, hash]);
   }
 
   /** Runs every statement on one checked-out connection inside a single transaction,
@@ -123,16 +173,18 @@ export class PgD1 {
   async batch<T = Record<string, unknown>>(statements: PgD1PreparedStatement[]): Promise<PgD1Result<T>[]> {
     const client = await this.pool.connect();
     try {
-      await client.query("BEGIN");
+      if (!this.inTransaction) await client.query("BEGIN");
       const out: PgD1Result<T>[] = [];
       for (const statement of statements) {
         if (!(statement instanceof PgStatement)) throw new Error("PgD1.batch() only accepts statements created by PgD1.prepare()");
         out.push((await statement.execWith(client)) as PgD1Result<T>);
       }
-      await client.query("COMMIT");
+      if (!this.inTransaction) await client.query("COMMIT");
       return out;
     } catch (error) {
-      await client.query("ROLLBACK");
+      // Inside an outer transaction the caller owns the rollback; issuing one here
+      // would abort their whole transaction on a failure they may intend to handle.
+      if (!this.inTransaction) await client.query("ROLLBACK");
       throw error;
     } finally {
       client.release();

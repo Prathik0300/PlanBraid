@@ -274,39 +274,53 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   }
 
   if (command.action === "create_project") {
-    const projectId = id("prj");
     const cleanName = command.name.trim().slice(0, 120);
     if (!cleanName) throw domainError("VALIDATION_FAILED", "Project name is required");
-    const now = new Date().toISOString();
 
-    // Match before creating, the same contract create_work_items uses for tasks. One
-    // repository opened from the web UI and from an agent is one project; without this
-    // the two produced parallel projects that each held half the work.
-    const existing = await findMatchingProject(db, organizationId, { name: cleanName, directory: command.directory, gitRemote: command.gitRemote });
-    if (existing) {
-      // Adopt identifying details the existing project is missing, so a project created
-      // in the browser (no directory) gains the agent's checkout path on first contact
-      // and resolves directly from then on.
-      const directory = normalizeDirectory(command.directory);
-      const gitRemote = command.gitRemote?.trim().slice(0, 500);
-      const adopted = await db.prepare("UPDATE projects SET directory = CASE WHEN directory = '' THEN COALESCE(?, directory) ELSE directory END, git_remote = COALESCE(git_remote, ?), updated_at = ? WHERE id = ? AND organization_id = ? RETURNING directory, git_remote")
-        .bind(directory || null, gitRemote || null, now, existing.id, organizationId).first<Row>();
-      const matchedResponse = {
-        projectId: existing.id, status: "matched" as const, matchedOn: existing.matchedOn,
-        project: { id: existing.id, name: existing.name, directory: text(adopted ?? {}, "directory"), gitRemote: nullable(adopted ?? {}, "git_remote") },
-        warning: `Matched the existing project "${existing.name}" by ${existing.matchedOn}; use this project instead of creating another for the same work.`,
-      };
-      await db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(matchedResponse)).run();
-      return matchedResponse;
-    }
+    // The match read and the insert must be one atomic step, or two agents starting in
+    // the same repository at once both read "no match" and both insert. The advisory
+    // lock is per organization, held only for this transaction, and released by Postgres
+    // on commit or rollback, so a failure part-way cannot strand it.
+    return db.transaction(async (tx) => {
+      await tx.lock(`planbraid:create_project:${organizationId}`);
+      const projectId = id("prj");
+      const now = new Date().toISOString();
 
-    const response = { projectId, projectRevision: 1, status: "created" as const };
-    await commitMutation(db, [
-      db.prepare("INSERT INTO projects (id, organization_id, project_key, name, description, directory, git_remote, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)").bind(projectId, organizationId, projectId, cleanName, command.description?.trim().slice(0, 2000) ?? "", command.directory?.trim().slice(0, 500) ?? "", command.gitRemote?.trim().slice(0, 500) || null, now),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, 1, ?, 'project.created', ?, ?)").bind(id("evt"), organizationId, projectId, principal.displayName, `${principal.displayName} created ${cleanName}`, now),
-      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
-    ]);
-    return response;
+      // Match before creating, the same contract create_work_items uses for tasks. One
+      // repository opened from the web UI and from an agent is one project; without this
+      // the two produced parallel projects that each held half the work.
+      const existing = await findMatchingProject(tx, organizationId, { name: cleanName, directory: command.directory, gitRemote: command.gitRemote });
+      if (existing) {
+        const directory = normalizeDirectory(command.directory);
+        const gitRemote = command.gitRemote?.trim().slice(0, 500);
+        // A name is only a hint: two projects can legitimately share one. Report it as
+        // uncertain and let the caller decide, rather than silently folding them
+        // together the way a remote or directory match justifies.
+        const decisive = existing.matchedOn !== "name";
+        const adopted = decisive
+          ? await tx.prepare("UPDATE projects SET directory = CASE WHEN directory = '' THEN COALESCE(?, directory) ELSE directory END, git_remote = COALESCE(git_remote, ?), updated_at = ? WHERE id = ? AND organization_id = ? RETURNING directory, git_remote")
+            .bind(directory || null, gitRemote || null, now, existing.id, organizationId).first<Row>()
+          : await tx.prepare("SELECT directory, git_remote FROM projects WHERE id = ?").bind(existing.id).first<Row>();
+
+        const response = {
+          projectId: existing.id,
+          status: decisive ? ("matched" as const) : ("uncertain" as const),
+          matchedOn: existing.matchedOn,
+          project: { id: existing.id, name: existing.name, directory: text(adopted ?? {}, "directory"), gitRemote: nullable(adopted ?? {}, "git_remote") },
+          warning: decisive
+            ? `This is the existing project "${existing.name}", matched by ${existing.matchedOn}. Use it instead of creating another for the same work.`
+            : `A project named "${existing.name}" already exists. If it is the same work, use this project_id. If it is genuinely separate, call create_project again with a distinct name.`,
+        };
+        await tx.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)).run();
+        return response;
+      }
+
+      const response = { projectId, projectRevision: 1, status: "created" as const };
+      await tx.prepare("INSERT INTO projects (id, organization_id, project_key, name, description, directory, git_remote, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)").bind(projectId, organizationId, projectId, cleanName, command.description?.trim().slice(0, 2000) ?? "", command.directory?.trim().slice(0, 500) ?? "", command.gitRemote?.trim().slice(0, 500) || null, now).run();
+      await tx.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, 1, ?, 'project.created', ?, ?)").bind(id("evt"), organizationId, projectId, principal.displayName, `${principal.displayName} created ${cleanName}`, now).run();
+      await tx.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)).run();
+      return response;
+    });
   }
 
   const project = await ownedProject(db, organizationId, command.projectId);

@@ -87,6 +87,32 @@ test("genuinely different repositories still create separate projects", async ()
   assert.equal(await projectCount(db), 2);
 });
 
+test("a name-only match is reported as uncertain, not silently reused or duplicated", async () => {
+  const db = await createTestDb();
+  const first = await executeCommand(db, principal, { action: "create_project", name: "Ambiguous", idempotencyKey: "a" });
+  const second = await executeCommand(db, principal, { action: "create_project", name: "Ambiguous", idempotencyKey: "b" });
+
+  assert.equal(second.status, "uncertain");
+  assert.equal(second.projectId, first.projectId);
+  // Neither reused (matched) nor duplicated (created) until a person or agent decides.
+  assert.equal(await projectCount(db), 1);
+});
+
+test("8 concurrent create_project calls for the same repository produce exactly one project", async () => {
+  const db = await createTestDb();
+  const attempts = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+    executeCommand(db, principal, {
+      action: "create_project",
+      name: `Concurrent ${index}`,
+      gitRemote: index % 2 === 0 ? "https://github.com/owner/repo" : "git@github.com:owner/repo.git",
+      idempotencyKey: `concurrent-${index}`,
+    })));
+
+  assert.equal(attempts.filter((result) => result.status === "created").length, 1);
+  assert.equal(attempts.filter((result) => result.status === "matched").length, 7);
+  assert.equal(await projectCount(db), 1);
+});
+
 test("a remote mismatch is decisive even when the name is identical", async () => {
   const db = await createTestDb();
   await executeCommand(db, principal, { action: "create_project", name: "api", gitRemote: "https://github.com/acme/api", idempotencyKey: "a" });

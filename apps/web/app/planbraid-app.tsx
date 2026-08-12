@@ -21,6 +21,7 @@ import windsurfLogo from "@lobehub/icons-static-svg/icons/windsurf.svg";
 type View = "stream" | "board" | "list" | "inbox" | "agents";
 type Theme = "dark" | "light";
 type McpConnection = { id: string; name: string; scopes: string[]; lastUsedAt: string | null; createdAt: string };
+type CommandResult = { projectId?: string; status?: "created" | "matched" | "uncertain"; matchedOn?: string; project?: { id: string; name: string } };
 type GithubStatus = { connected: boolean; login: string | null; configured: boolean };
 type GithubRepo = { id: number; name: string; fullName: string; description: string; htmlUrl: string; cloneUrl: string; private: boolean; updatedAt: string };
 type BundledLogo = string | { src: string };
@@ -181,16 +182,18 @@ export function PlanbraidApp() {
   const selectedItem = data?.workItems.find((item) => item.id === selectedItemId) ?? null;
   const unread = data?.notifications.filter((notification) => !notification.readAt).length ?? 0;
 
-  async function command(command: Command, success: string) {
+  async function command(command: Command, success: string | ((result: CommandResult) => string)) {
     setMutating(true);
     try {
       const response = await fetch("/api/commands", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) });
-      const body = await response.json() as { error?: { code: string; message: string } };
+      const body = await response.json() as { data?: CommandResult; error?: { code: string; message: string } };
       if (!response.ok) throw new Error(body.error ? `${body.error.message} (${body.error.code})` : "Update failed");
-      setToast(success);
-      setTimeout(() => setToast(null), 2800);
+      const result = body.data ?? {};
+      setToast(typeof success === "function" ? success(result) : success);
+      setTimeout(() => setToast(null), 4000);
       await refresh(true);
-    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Update failed"); }
+      return result;
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Update failed"); return {}; }
     finally { setMutating(false); }
   }
 
@@ -219,7 +222,18 @@ export function PlanbraidApp() {
         {project && view !== "inbox" && view !== "agents" && <Composer project={project} sources={sources} busy={mutating} onCreate={(title, source) => void command({ action: "create_item", projectId, title, sourceId: source || undefined, status: "proposed", idempotencyKey: requestId("create") }, "Task added to the unified plan")} />}
       </section>
       {selectedItem && <TaskDrawer item={selectedItem} source={sources.find((entry) => entry.id === selectedItem.sourceId) ?? null} sources={sources} events={(data?.events ?? []).filter((event) => event.workItemId === selectedItem.id)} evidence={(data?.evidence ?? []).filter((entry) => entry.workItemId === selectedItem.id)} dependencies={(data?.dependencies ?? []).filter((entry) => entry.fromWorkItemId === selectedItem.id || entry.toWorkItemId === selectedItem.id)} aliases={(data?.aliases ?? []).filter((entry) => entry.workItemId === selectedItem.id)} allItems={projectItems} busy={mutating} close={() => setSelectedItemId(null)} transition={(status, reason) => void command({ action: "transition_item", projectId: selectedItem.projectId, itemId: selectedItem.id, expectedVersion: selectedItem.version, status, reason, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("transition") }, `${selectedItem.itemKey} is now ${statusMeta[status].label}`)} note={(summary) => void command({ action: "add_note", projectId: selectedItem.projectId, itemId: selectedItem.id, summary, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("note") }, "Progress recorded")} splitAlias={(aliasId) => void command({ action: "split_alias", projectId: selectedItem.projectId, aliasId, idempotencyKey: requestId("split") }, "Moved back into its own task")} />}
-      {commandOpen && <CommandDialog projects={data!.projects} currentProject={projectId} initialMode={commandOpen === "project" ? "project" : "search"} busy={mutating} close={() => setCommandOpen(false)} create={(input) => { void command({ action: "create_project", name: input.name, description: input.description || undefined, gitRemote: input.gitRemote || undefined, idempotencyKey: requestId("project") }, "Project created"); setCommandOpen(false); }} />}
+      {commandOpen && <CommandDialog projects={data!.projects} currentProject={projectId} initialMode={commandOpen === "project" ? "project" : "search"} busy={mutating} close={() => setCommandOpen(false)} create={async (input) => {
+        const result = await command({ action: "create_project", name: input.name, description: input.description || undefined, gitRemote: input.gitRemote || undefined, idempotencyKey: requestId("project") }, (outcome) =>
+          outcome.status === "matched" ? `Opened "${outcome.project?.name}" instead, the existing project for this ${outcome.matchedOn}`
+            : outcome.status === "uncertain" ? `"${outcome.project?.name}" already exists`
+              : "Project created");
+        // Only "uncertain" leaves a decision open; matched and created both settle here.
+        if (result.status !== "uncertain") {
+          if (result.projectId) { setProjectId(result.projectId); setSourceId(null); setView("stream"); }
+          setCommandOpen(false);
+        }
+        return result;
+      }} />}
       {setupOpen && <SetupDialog project={project} close={() => setSetupOpen(false)} toast={setToast} />}
       {profileOpen && <ProfileDialog viewer={data!.viewer} close={() => setProfileOpen(false)} />}
       {toast && <div className="toast" role="status">{toast}</div>}
@@ -422,7 +436,7 @@ function TaskDrawer({ item, source, sources, events, evidence, dependencies, ali
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><aside className="task-drawer" aria-label={`${item.itemKey} details`}><header className="drawer-header"><span className={`status-badge ${item.status}`}>{statusMeta[item.status].dot} {statusMeta[item.status].label}</span><button className="icon-button" onClick={close} aria-label="Close task">×</button></header><div className="drawer-title"><small>{item.itemKey} · v{item.version}</small><h2>{item.title}</h2><p>{item.description || "No description has been added yet."}</p>{corroboratedProviders.length > 1 && <p className="corroboration-banner">Proposed independently by {corroboratedProviders.map((provider) => providerLabel[provider] ?? provider).join(" and ")}.</p>}{anomaly && <p className="anomaly-banner">⚠ In progress, but {waitingOn.length ? `${waitingOn.map((entry) => entry.itemKey).join(", ")} is still unresolved` : "a prerequisite is still unresolved"}.</p>}</div><div className="drawer-fields"><label>Status<select value={item.status} disabled={busy} onChange={(event) => transition(event.target.value as WorkStatus, event.target.value === "blocked" ? "Blocked from task detail" : undefined)}>{Object.entries(statusMeta).map(([value, meta]) => <option value={value} key={value}>{meta.label}</option>)}</select></label><label>Priority<strong className={`priority-value ${item.priority}`}>{item.priority}</strong></label><label>Owner<strong>{item.assignee ?? "Unassigned"}</strong></label><label>Source<strong>{source ? <><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</> : "Manual"}</strong></label></div><nav className="drawer-tabs"><button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button><button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity {events.length}</button><button className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>Evidence {evidence.length}</button></nav><div className="drawer-body">{tab === "overview" && <><section><h3>Completion</h3><div className="confidence"><span>{item.completionConfidence}</span><span>{item.verificationStatus}</span></div></section>{item.blockerReason && <section className="blocker-panel"><h3>Blocker</h3><p>{item.blockerReason}</p></section>}{waitingOn.length > 0 && <section className="blocker-panel"><h3>Waiting on</h3>{waitingOn.map((entry) => <p key={entry.id}><b>{entry.itemKey}</b> {entry.title} · {statusMeta[entry.status].label}</p>)}</section>}<section><h3>Dependencies</h3>{dependencies.length ? dependencies.map((edge) => { const linkedId = edge.fromWorkItemId === item.id ? edge.toWorkItemId : edge.fromWorkItemId; const linked = allItems.find((entry) => entry.id === linkedId); return <div className="dependency-row" key={edge.id}><span>{edge.type}</span><b>{linked?.itemKey}</b><p>{linked?.title}</p></div>; }) : <p className="muted">No dependencies.</p>}</section>{aliases.length > 0 && <section><h3>Also proposed</h3>{aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return <div className="alias-row" key={alias.id}><ProviderIcon provider={(aliasSource?.provider ?? "system") as Provider} /><span><strong>{alias.title}</strong><small>{providerLabel[aliasSource?.provider ?? ""] ?? "Another agent"} · {relative(alias.createdAt)} · {alias.matchReason}</small></span><button className="alias-split" disabled={busy} onClick={() => splitAlias(alias.id)}>Not the same, make separate task</button></div>; })}</section>}</>}{tab === "activity" && events.map((event) => <div className="mini-event" key={event.id}><ProviderIcon provider={(source?.provider ?? "system") as Provider}/><span><strong>{event.summary}</strong><small>{event.actorName} · {relative(event.createdAt)}</small></span></div>)}{tab === "evidence" && (evidence.length ? evidence.map((entry) => <div className="evidence-row" key={entry.id}><span>✓</span><span><strong>{entry.label}</strong><small>{entry.type} · {entry.result ?? "recorded"}</small></span></div>) : <p className="muted">No evidence attached yet.</p>)}</div><form className="drawer-note" onSubmit={(event) => { event.preventDefault(); if (!noteText.trim()) return; note(noteText.trim()); setNoteText(""); }}><input value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="Add a progress update…"/><button disabled={!noteText.trim() || busy}>Add</button></form></aside></div>;
 }
 
-function CommandDialog({ projects, currentProject, initialMode = "search", busy, close, create }: { projects: Project[]; currentProject: string; initialMode?: "search" | "project"; busy: boolean; close: () => void; create: (input: { name: string; description: string; gitRemote: string }) => void }) {
+function CommandDialog({ projects, currentProject, initialMode = "search", busy, close, create }: { projects: Project[]; currentProject: string; initialMode?: "search" | "project"; busy: boolean; close: () => void; create: (input: { name: string; description: string; gitRemote: string }) => Promise<CommandResult> }) {
   const [mode, setMode] = useState<"search" | "project">(initialMode);
   const [search, setSearch] = useState("");
   const [name, setName] = useState("");
@@ -433,6 +447,7 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
   const [repoQuery, setRepoQuery] = useState("");
   const [linkedRepo, setLinkedRepo] = useState<GithubRepo | null>(null);
   const [repoError, setRepoError] = useState<string | null>(null);
+  const [collision, setCollision] = useState<{ id: string; name: string } | null>(null);
 
   useEffect(() => {
     if (mode !== "project") return;
@@ -458,12 +473,24 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
     if (error) setError(null);
   }
 
-  function submit(event: React.FormEvent) {
+  /** Appends -2, -3, ... so "create it anyway" produces a name that no longer collides. */
+  function distinctName(base: string) {
+    const taken = new Set(projects.map((project) => project.name.trim().toLowerCase()));
+    for (let suffix = 2; ; suffix += 1) {
+      const candidate = `${base}-${suffix}`;
+      if (!taken.has(candidate.toLowerCase())) return candidate;
+    }
+  }
+
+  async function submit(event: React.FormEvent) {
     event.preventDefault();
     // Previously this was `name.trim() && create(...)`, so an empty name silently did
     // nothing at all. Never fail silently: say what is missing.
     if (!name.trim()) { setError("Give the project a name to continue."); return; }
-    create({ name: name.trim(), description: description.trim(), gitRemote: linkedRepo?.htmlUrl ?? "" });
+    const result = await create({ name: name.trim(), description: description.trim(), gitRemote: linkedRepo?.htmlUrl ?? "" });
+    // A name collision is only a guess at sameness, so it comes back for a decision
+    // rather than quietly reusing someone else's project or making a confusing twin.
+    if (result.status === "uncertain" && result.project) setCollision({ id: result.project.id, name: result.project.name });
   }
 
   const visibleRepos = (repos ?? []).filter((repo) => !repoQuery.trim() || repo.fullName.toLowerCase().includes(repoQuery.trim().toLowerCase())).slice(0, 6);
@@ -493,8 +520,16 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
                   </>
                   : <a className="repo-connect" href="/api/github/connect"><GithubMark /> Connect GitHub to pick a repository</a>}
             </div>}
+            {collision && <div className="collision-prompt">
+              <strong>&ldquo;{collision.name}&rdquo; already exists</strong>
+              <p>Is this the same project? Reusing it keeps every agent on one plan.</p>
+              <span>
+                <a className="primary-wide" href={`/?project=${collision.id}`}>Yes, open it</a>
+                <button type="button" className="secondary-wide" disabled={busy} onClick={() => { const next = distinctName(name.trim()); setName(next); setCollision(null); void create({ name: next, description: description.trim(), gitRemote: linkedRepo?.htmlUrl ?? "" }); }}>No, create &ldquo;{distinctName(name.trim())}&rdquo;</button>
+              </span>
+            </div>}
             <span className="field-hint">Connect an agent from this project and it binds its own folder automatically, so you never have to type a path.</span>
-            <button className="primary-wide" disabled={busy}>{busy ? "Creating…" : "Create project"}</button>
+            <button className="primary-wide" disabled={busy || Boolean(collision)}>{busy ? "Creating…" : "Create project"}</button>
           </form>
         </>
         : <>
