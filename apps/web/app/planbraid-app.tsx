@@ -21,7 +21,14 @@ import windsurfLogo from "@lobehub/icons-static-svg/icons/windsurf.svg";
 type View = "stream" | "board" | "list" | "inbox" | "agents";
 type Theme = "dark" | "light";
 type McpConnection = { id: string; name: string; scopes: string[]; lastUsedAt: string | null; createdAt: string };
+type GithubStatus = { connected: boolean; login: string | null; configured: boolean };
+type GithubRepo = { id: number; name: string; fullName: string; description: string; htmlUrl: string; cloneUrl: string; private: boolean; updatedAt: string };
 type BundledLogo = string | { src: string };
+
+/** GitHub's mark, inlined so the picker needs no network request to render. */
+function GithubMark() {
+  return <svg className="github-mark" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>;
+}
 
 const statusMeta: Record<WorkStatus, { label: string; dot: string }> = {
   proposed: { label: "Proposed", dot: "○" }, planned: { label: "Planned", dot: "◌" }, ready: { label: "Ready", dot: "◇" },
@@ -265,7 +272,25 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
   const [confirmPassword, setConfirmPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [github, setGithub] = useState<GithubStatus | null>(null);
   const local = viewer.email.endsWith("@planbraid.local");
+
+  useEffect(() => {
+    void (async () => {
+      const response = await fetch("/api/github", { cache: "no-store" });
+      if (!response.ok) return;
+      const body = await response.json() as { data?: GithubStatus };
+      setGithub(body.data ?? null);
+    })();
+  }, []);
+
+  async function disconnectGithub() {
+    setBusy(true);
+    try {
+      await fetch("/api/github", { method: "DELETE" });
+      setGithub((current) => current ? { ...current, connected: false, login: null } : current);
+    } finally { setBusy(false); }
+  }
 
   useEffect(() => {
     if (local) return;
@@ -325,6 +350,12 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
     {local ? <div className="profile-local-note"><strong>Local development workspace</strong><p>Account sessions are required on the hosted Planbraid app. Localhost keeps a developer-only workspace so the product can be tested without creating an account.</p></div> : <>
       <form className="profile-form" onSubmit={saveProfile}><label><span>Display name</span><input value={name} onChange={(event) => setName(event.target.value)} minLength={2} maxLength={80} disabled={isPending || busy} /></label><label><span>Email</span><input value={session?.user.email || viewer.email} disabled /></label><button className="primary-wide" disabled={busy || isPending || name.trim() === (session?.user.name || viewer.name)}>Save profile</button></form>
       <div className="login-methods"><div><h3>Sign-in methods</h3><p>Methods with the same verified email belong to this one account and workspace.</p></div><div className={`login-method ${accountsLoaded && !providers.includes("credential") ? "unavailable" : ""}`}><span className="method-icon">@</span><span><strong>Email &amp; password</strong><small>{providers.includes("credential") ? "Connected to this account" : accountsLoaded ? "No password set" : "Checking…"}</small></span><b>{providers.includes("credential") ? "Connected" : accountsLoaded ? "Not set" : "…"}</b></div>{accountsLoaded && !providers.includes("credential") && <form className="password-setup" onSubmit={addPassword}><strong>Add password sign-in</strong><p>You signed up with Google. Set a password if you also want to sign in with this account&apos;s email address.</p><p className="field-hint">Use 10 or more characters with uppercase, lowercase, a number, and a special character.</p><label><span>New password</span><input type="password" autoComplete="new-password" minLength={10} maxLength={128} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label><label><span>Confirm password</span><input type="password" autoComplete="new-password" minLength={10} maxLength={128} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required /></label><button className="primary-wide" disabled={busy}>Add password</button></form>}{providers.includes("google") ? <div className="login-method"><ProviderIcon provider="google" /><span><strong>Google</strong><small>Connected to this account</small></span><b>Connected</b></div> : googleEnabled ? <button className="login-method connect-method" disabled={busy} onClick={() => void linkGoogle()}><ProviderIcon provider="google" /><span><strong>Google</strong><small>Add another secure sign-in method</small></span><b>Connect</b></button> : <div className="login-method unavailable"><ProviderIcon provider="google" /><span><strong>Google</strong><small>Waiting for OAuth credentials</small></span><b>Setup needed</b></div>}</div>
+      {github?.configured && <div className="login-methods">
+        <div><h3>Connected services</h3><p>Link GitHub to pick a repository when you create a project. Planbraid reads repository names only, never your code.</p></div>
+        {github.connected
+          ? <div className="login-method"><span className="method-icon"><GithubMark /></span><span><strong>GitHub</strong><small>Connected as @{github.login}</small></span><button className="link-button" disabled={busy} onClick={() => void disconnectGithub()}>Disconnect</button></div>
+          : <a className="login-method connect-method" href="/api/github/connect"><span className="method-icon"><GithubMark /></span><span><strong>GitHub</strong><small>Choose which repositories Planbraid can see</small></span><b>Connect</b></a>}
+      </div>}
       {message && <div className="auth-error" role="status">{message}</div>}
       <div className="profile-actions"><button className="signout-button" disabled={busy} onClick={() => void signOut()}>Sign out</button><small>Signing out does not disconnect your authorized MCP agents.</small></div>
     </>}
@@ -397,14 +428,45 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [github, setGithub] = useState<GithubStatus | null>(null);
+  const [repos, setRepos] = useState<GithubRepo[] | null>(null);
+  const [repoQuery, setRepoQuery] = useState("");
+  const [linkedRepo, setLinkedRepo] = useState<GithubRepo | null>(null);
+  const [repoError, setRepoError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (mode !== "project") return;
+    void (async () => {
+      const response = await fetch("/api/github", { cache: "no-store" });
+      if (!response.ok) return;
+      const body = await response.json() as { data?: GithubStatus };
+      setGithub(body.data ?? null);
+      if (!body.data?.connected) return;
+      const repoResponse = await fetch("/api/github/repos", { cache: "no-store" });
+      const repoBody = await repoResponse.json() as { data?: GithubRepo[]; error?: { message?: string } };
+      if (repoResponse.ok) setRepos(repoBody.data ?? []);
+      else setRepoError(repoBody.error?.message ?? "Could not load your repositories");
+    })();
+  }, [mode]);
+
+  function pickRepo(repo: GithubRepo) {
+    setLinkedRepo(repo);
+    setRepoQuery("");
+    // Prefill rather than overwrite: whatever the person already typed wins.
+    setName((current) => current.trim() || repo.name);
+    setDescription((current) => current.trim() || repo.description);
+    if (error) setError(null);
+  }
 
   function submit(event: React.FormEvent) {
     event.preventDefault();
     // Previously this was `name.trim() && create(...)`, so an empty name silently did
     // nothing at all. Never fail silently: say what is missing.
     if (!name.trim()) { setError("Give the project a name to continue."); return; }
-    create({ name: name.trim(), description: description.trim(), gitRemote: "" });
+    create({ name: name.trim(), description: description.trim(), gitRemote: linkedRepo?.htmlUrl ?? "" });
   }
+
+  const visibleRepos = (repos ?? []).filter((repo) => !repoQuery.trim() || repo.fullName.toLowerCase().includes(repoQuery.trim().toLowerCase())).slice(0, 6);
 
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
     <div className="command-dialog" role="dialog" aria-modal="true" aria-label={mode === "project" ? "Create a project" : "Command palette"}>
@@ -419,6 +481,18 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
             <label><span className="label-row">Description <span className="label-optional">optional</span></span>
               <input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What this project covers" />
             </label>
+            {github?.configured && <div className="repo-link">
+              {linkedRepo
+                ? <div className="repo-linked"><span><GithubMark /><strong>{linkedRepo.fullName}</strong></span><button type="button" onClick={() => setLinkedRepo(null)}>Remove</button></div>
+                : github.connected
+                  ? <>
+                    <span className="label-row">GitHub repository <span className="label-optional">optional</span></span>
+                    <input value={repoQuery} onChange={(event) => setRepoQuery(event.target.value)} placeholder={repos ? "Search your repositories" : "Loading repositories…"} disabled={!repos} />
+                    {repoError && <span className="field-error">{repoError}</span>}
+                    {repos && <div className="repo-options">{visibleRepos.length ? visibleRepos.map((repo) => <button type="button" key={repo.id} onClick={() => pickRepo(repo)}><GithubMark /><span><strong>{repo.fullName}</strong><small>{repo.private ? "Private" : "Public"}{repo.description ? ` · ${repo.description}` : ""}</small></span></button>) : <p className="oauth-help">No repositories match. Adjust which ones the app can see from GitHub.</p>}</div>}
+                  </>
+                  : <a className="repo-connect" href="/api/github/connect"><GithubMark /> Connect GitHub to pick a repository</a>}
+            </div>}
             <span className="field-hint">Connect an agent from this project and it binds its own folder automatically, so you never have to type a path.</span>
             <button className="primary-wide" disabled={busy}>{busy ? "Creating…" : "Create project"}</button>
           </form>

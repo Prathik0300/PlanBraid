@@ -55,6 +55,10 @@ export const SCHEMA_STATEMENTS = [
   // by the Postgres switch.
   `CREATE TABLE IF NOT EXISTS oauth_rate_limits (rate_key TEXT NOT NULL, window_start TEXT NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(rate_key, window_start))`,
   `CREATE TABLE IF NOT EXISTS push_subscriptions (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, endpoint TEXT NOT NULL, subscription TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'all_interactions', active INTEGER NOT NULL DEFAULT 1, last_success_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(owner_user_id, endpoint))`,
+  // access_token/refresh_token hold GitHub credentials and are stored encrypted (see
+  // lib/crypto-box.ts), never as plaintext. One connection per user, so re-connecting
+  // upserts rather than accumulating stale tokens.
+  `CREATE TABLE IF NOT EXISTS github_connections (id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL UNIQUE, github_login TEXT NOT NULL DEFAULT '', access_token TEXT NOT NULL, refresh_token TEXT, expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
   // A matched proposal is stored as an alias rather than a work item on purpose. Making
   // it a real row would give it a status and a version, so it would surface in board
   // queries, counts, list_work_items, and the dependency graph, and every one of those
