@@ -484,11 +484,24 @@ function optionsResponse() {
 
 function allowedMethods(pathname: string) { return pathname === "/authorize" ? "GET, POST" : "POST"; }
 
-function consentPage(clientName: string, redirectUri: string, scopes: string[], requestId: string, principal: Principal) {
+// CLI-based MCP clients (Codex, local bridges, etc.) run their own loopback HTTP
+// server to catch the OAuth redirect, so redirectUri.host is something like
+// "127.0.0.1:49227" — accurate, but reads like a bare technical detail to someone just
+// clicking "Allow" rather than describing what it actually means.
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0"]);
+function describeRedirectDestination(url: URL) {
+  return LOOPBACK_HOSTNAMES.has(url.hostname) ? "an app running on this device" : url.host;
+}
+
+// Exported for direct testing: consentPage is otherwise only reachable through a fully
+// authenticated GET /authorize, and the thing most worth regression-testing here — the
+// CSP header's form-action — has no dependency on the DB/session machinery around it.
+export function consentPage(clientName: string, redirectUri: string, scopes: string[], requestId: string, principal: Principal) {
   const permissions = scopes.map((scope) => scope === "work:write" ? "Create, update, block, and complete todo items" : "View your projects, todo items, sources, and activity");
   const permissionItems = permissions.map((permission) => `<li><span>✓</span>${escapeHtml(permission)}</li>`).join("");
-  const redirectOrigin = new URL(redirectUri).origin;
-  const redirectHost = new URL(redirectUri).host;
+  const redirectUrl = new URL(redirectUri);
+  const redirectOrigin = redirectUrl.origin;
+  const redirectHost = describeRedirectDestination(redirectUrl);
   const body = `<main><div class="brand"><img src="/planbraid-mark.png" alt="">Planbraid</div><section><small>CONNECT MCP CLIENT</small><h1>Allow ${escapeHtml(clientName)} to use Planbraid?</h1><p>This connection will act for <strong>${escapeHtml(principal.email)}</strong>. The authorization result returns to <strong>${escapeHtml(redirectHost)}</strong>.</p><ul>${permissionItems}</ul><div class="notice">Access tokens expire after one hour. You can disconnect the connector to revoke future access.</div><form method="post" action="/authorize"><input type="hidden" name="request_id" value="${escapeHtml(requestId)}"><button class="approve" name="decision" value="approve">Allow access</button><button class="deny" name="decision" value="deny">Cancel</button></form></section><footer>OAuth 2.1 · PKCE · scoped access · refresh rotation</footer></main>`;
   // form-action must additionally allow the client's own (already-validated, registered)
   // redirect_uri origin: submitting this form always ends by redirecting the browser

@@ -110,6 +110,18 @@ export function PlanbraidApp() {
   useEffect(() => { void refresh(); }, [refresh]);
 
   useEffect(() => {
+    // A newly-connected agent (OAuth completing in a separate tab/window, or an MCP
+    // client registering a session directly) has no way to push a signal into this tab:
+    // the SSE stream is scoped to an already-selected project's revision, so it never
+    // fires for a brand new project either. Catching up when the tab regains attention
+    // covers both cases without a manual reload.
+    const onFocus = () => { if (document.visibilityState !== "hidden") void refresh(true); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => { window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onFocus); };
+  }, [refresh]);
+
+  useEffect(() => {
     const saved = window.localStorage.getItem("planbraid-theme") ?? window.localStorage.getItem("relayboard-theme");
     setTheme(saved === "dark" || saved === "light" ? saved : window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
   }, []);
@@ -388,6 +400,16 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
   const [oauthConnections, setOauthConnections] = useState<McpConnection[]>([]);
   const [revokingOAuthId, setRevokingOAuthId] = useState<string | null>(null);
   const [pushEnabled, setPushEnabled] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function copy(key: string, text: string, message: string) {
+    void navigator.clipboard.writeText(text);
+    toast(message);
+    setCopiedKey(key);
+    if (copyTimer.current) clearTimeout(copyTimer.current);
+    copyTimer.current = setTimeout(() => setCopiedKey(null), 5000);
+  }
+  useEffect(() => () => { if (copyTimer.current) clearTimeout(copyTimer.current); }, []);
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -488,18 +510,18 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       {mode === "oauth" ? <section className="oauth-setup-card connection-panel" role="tabpanel">
         <header><span><span className="oauth-lock">✓</span><strong>Automatic OAuth access</strong></span></header>
         <ol><li>Open your client&apos;s <strong>MCP servers</strong> or <strong>Connectors</strong> settings.</li><li>Add a remote HTTP server and paste the Planbraid URL below.</li><li>Your client opens Planbraid in a browser. Sign in and approve read/write access.</li></ol>
-        <div className="endpoint-box"><small>Remote MCP server URL</small><code>{endpoint}</code><button onClick={() => { void navigator.clipboard.writeText(endpoint); toast("MCP URL copied"); }}>Copy URL</button></div>
-        <div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => { void navigator.clipboard.writeText(oauthConfig); toast("OAuth MCP config copied"); }}>Copy config</button></span><pre>{oauthConfig}</pre></div>
+        <div className="endpoint-box"><small>Remote MCP server URL</small><code>{endpoint}</code><button onClick={() => copy("endpoint", endpoint, "MCP URL copied")}>{copiedKey === "endpoint" ? "Copied" : "Copy URL"}</button></div>
+        <div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("oauthConfig", oauthConfig, "OAuth MCP config copied")}>{copiedKey === "oauthConfig" ? "Copied" : "Copy config"}</button></span><pre>{oauthConfig}</pre></div>
         <p className="oauth-help">Planbraid uses standard MCP and OAuth discovery. The connected client identifies its own provider, session, and optional model when it begins reporting work.</p>
         <div className="connection-list"><h3>Connected apps <span>{oauthConnections.length}</span></h3>{oauthConnections.length ? oauthConnections.map((entry) => <div className="connection-row" key={entry.id}><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => void revokeOAuth(entry.id)} disabled={revokingOAuthId === entry.id}>{revokingOAuthId === entry.id ? "Revoking…" : "Revoke"}</button></div>) : <p className="oauth-help">No connected apps yet.</p>}</div>
       </section> : <section className="token-setup-card connection-panel" role="tabpanel">
         <header><span><span className="token-key">⌁</span><strong>Bearer token access</strong></span></header>
         <p>For clients without OAuth, create a personal token and send it in the <code>Authorization</code> header. The secret is shown only once.</p>
-        {token ? <><div className="token-box"><small>New token - copy it now</small><code>{token}</code><button onClick={() => { void navigator.clipboard.writeText(token); toast("Token copied"); }}>Copy</button></div><div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => { void navigator.clipboard.writeText(tokenConfig); toast("Token MCP config copied"); }}>Copy config</button></span><pre>{tokenConfig}</pre></div></> : <button className="primary-wide" onClick={() => void generate()} disabled={busy}>{busy ? "Generating…" : `Generate access token for ${project?.name ?? "Planbraid"}`}</button>}
+        {token ? <><div className="token-box"><small>New token - copy it now</small><code>{token}</code><button onClick={() => copy("token", token, "Token copied")}>{copiedKey === "token" ? "Copied" : "Copy"}</button></div><div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("tokenConfig", tokenConfig, "Token MCP config copied")}>{copiedKey === "tokenConfig" ? "Copied" : "Copy config"}</button></span><pre>{tokenConfig}</pre></div></> : <button className="primary-wide" onClick={() => void generate()} disabled={busy}>{busy ? "Generating…" : `Generate access token for ${project?.name ?? "Planbraid"}`}</button>}
         <div className="connection-list"><h3>Active token connections <span>{connections.length}</span></h3>{connections.length ? connections.map((entry) => <div className="connection-row" key={entry.id}><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => void revoke(entry.id)} disabled={revokingId === entry.id}>{revokingId === entry.id ? "Revoking…" : "Revoke"}</button></div>) : <p className="oauth-help">No active bearer-token connections.</p>}</div>
       </section>}
       <div className="access-note"><strong>Network access required</strong><span>The MCP URL must be reachable by the agent without a hosting-level sign-in wall. Planbraid still protects every project request with OAuth or a bearer token.</span></div>
-      <button className="secondary-wide" onClick={() => void alerts()}>{pushEnabled ? "Disable browser alerts" : "Enable browser alerts"}</button>
+      <button className={`secondary-wide push-toggle ${pushEnabled ? "is-on" : "is-off"}`} onClick={() => void alerts()}>{pushEnabled ? "Disable browser alerts" : "Enable browser alerts"}</button>
       <div className="setup-note"><strong>Per-turn synchronization</strong><span>Connected agents can read current project state, record todo lifecycle changes, and reconcile every completed interaction.</span></div>
       </div>
     </div>
