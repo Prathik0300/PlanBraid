@@ -215,7 +215,7 @@ export function PlanbraidApp() {
           {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
           {project && view === "stream" && <Stream events={events} items={projectItems} sources={sources} onItem={setSelectedItemId} />}
           {project && view === "board" && <Board items={filteredItems} sources={sources} aliases={data?.aliases ?? []} dependencies={data?.dependencies ?? []} onItem={setSelectedItemId} onTransition={(item, status) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status, idempotencyKey: requestId("drag") }, `${item.itemKey} moved to ${statusMeta[status].label}`)} />}
-          {project && view === "list" && <ListView items={filteredItems} sources={sources} onItem={setSelectedItemId} />}
+          {project && view === "list" && <ListView items={filteredItems} sources={sources} aliases={data?.aliases ?? []} onItem={setSelectedItemId} />}
           {project && view === "inbox" && <Inbox notifications={data!.notifications.filter((entry) => entry.projectId === projectId)} onOpen={(notification) => { if (notification.workItemId) setSelectedItemId(notification.workItemId); void command({ action: "mark_notification", notificationId: notification.id, read: true, idempotencyKey: requestId("read") }, "Notification marked read"); }} onResolve={(notification) => void command({ action: "mark_notification", notificationId: notification.id, read: true, resolved: true, idempotencyKey: requestId("resolve") }, "Action resolved")} />}
           {project && view === "agents" && <Agents sources={sources} items={projectItems} />}
         </div>
@@ -402,16 +402,24 @@ function Board({ items, sources, aliases, dependencies, onItem, onTransition }: 
 }
 
 function TaskCard({ item, source, aliases, sources, dependencies, allItems, onClick, onMove }: { item: WorkItem; source?: Source; aliases: DashboardState["aliases"]; sources: Source[]; dependencies: DashboardState["dependencies"]; allItems: WorkItem[]; onClick: () => void; onMove: (status: WorkStatus) => void }) {
-  const corroborated = corroboratingProviders(item, aliases, sources).length > 1;
+  const corroboration = corroboratingProviders(item, aliases, sources);
+  const corroborated = corroboration.length > 1;
   const aliasTitle = aliases.map((alias) => `${providerLabel[sources.find((entry) => entry.id === alias.sourceId)?.provider ?? ""] ?? "Another agent"} also proposed: "${alias.title}"`).join("\n");
   const column = deriveColumn(item);
   const waitingOn = column === "blocked" && item.status !== "blocked" ? unresolvedBlockers(item, dependencies, allItems) : [];
   const anomaly = isStartedWhileBlocked(item);
-  return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="blocker-copy">Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}<footer>{source ? <span><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</span> : <span>Manual</span>}<span>{item.assignee ?? "Unassigned"}</span></footer></button><select aria-label={`Move ${item.itemKey}`} value={item.status} onChange={(event) => onMove(event.target.value as WorkStatus)}>{Object.entries(statusMeta).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></article>;
+  return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="blocker-copy">Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}{/* corroboration already includes the card's own source, so a plural stack replaces
+    the single-source label rather than sitting beside a duplicate of itself. */}
+          <footer>{corroborated ? <ProviderStack providers={corroboration} /> : source ? <span><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</span> : <span>Manual</span>}</footer></button><select aria-label={`Move ${item.itemKey}`} value={item.status} onChange={(event) => onMove(event.target.value as WorkStatus)}>{Object.entries(statusMeta).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></article>;
 }
 
-function ListView({ items, sources, onItem }: { items: WorkItem[]; sources: Source[]; onItem: (id: string) => void }) {
-  return <div className="list-view"><div className="list-head"><span>Work item</span><span>Status</span><span>Source</span><span>Owner</span><span>Updated</span></div>{items.map((item) => { const source = sources.find((entry) => entry.id === item.sourceId); const column = deriveColumn(item); return <button className="list-row" key={item.id} onClick={() => onItem(item.id)}><span className="list-title"><span className={`priority ${item.priority}`} /><b>{item.itemKey}</b><strong>{item.title}</strong></span><span className={`status-badge ${column}`}>{statusMeta[column].dot} {statusMeta[column].label}</span><span>{source ? <><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</> : "Manual"}</span><span>{item.assignee ?? "Unassigned"}</span><span>{relative(item.updatedAt)}</span></button>; })}</div>;
+function ListView({ items, sources, aliases, onItem }: { items: WorkItem[]; sources: Source[]; aliases: DashboardState["aliases"]; onItem: (id: string) => void }) {
+  return <div className="list-view"><div className="list-head"><span>Work item</span><span>Status</span><span>Source</span><span>Corroboration</span><span>Updated</span></div>{items.map((item) => {
+    const source = sources.find((entry) => entry.id === item.sourceId);
+    const column = deriveColumn(item);
+    const corroboration = corroboratingProviders(item, aliases.filter((alias) => alias.workItemId === item.id), sources);
+    return <button className="list-row" key={item.id} onClick={() => onItem(item.id)}><span className="list-title"><span className={`priority ${item.priority}`} /><b>{item.itemKey}</b><strong>{item.title}</strong></span><span className={`status-badge ${column}`}>{statusMeta[column].dot} {statusMeta[column].label}</span><span>{source ? <><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</> : "Manual"}</span><span>{corroboration.length > 1 ? <ProviderStack providers={corroboration} /> : <span className="muted">·</span>}</span><span>{relative(item.updatedAt)}</span></button>;
+  })}</div>;
 }
 
 function Inbox({ notifications, onOpen, onResolve }: { notifications: Notification[]; onOpen: (notification: Notification) => void; onResolve: (notification: Notification) => void }) {
@@ -687,6 +695,12 @@ function ProviderIcon({ provider }: { provider: Provider | string }) {
   const label = providerLabel[key] ?? provider;
   // These are tiny bundled SVG marks; an image optimizer would add overhead without reducing payload.
   return <span className={`provider-icon ${key}`} role="img" aria-label={`${label} logo`} title={label}>{key === "google" ? <GoogleIcon /> : logo ? <img src={logo} alt="" aria-hidden="true" /> : <span className="provider-fallback" aria-hidden="true">◇</span>}</span>; // eslint-disable-line @next/next/no-img-element
+}
+/** Overlapping logos for "more than one AI model independently proposed this": the
+ * corroboration signal is only interesting when it's plural; a single provider is
+ * already shown by the card's own source icon, so callers only reach for this at 2+. */
+function ProviderStack({ providers }: { providers: string[] }) {
+  return <span className="provider-stack" title={`Also suggested by ${providers.map((provider) => providerLabel[provider] ?? provider).join(", ")}`}>{providers.map((provider) => <ProviderIcon key={provider} provider={provider} />)}</span>;
 }
 function Assurance({ value }: { value: Source["assurance"] }) { return <span className={`assurance ${value}`} title={`Capture assurance: ${value}`}>{value === "enforced" ? "✓" : value === "observed" ? "◉" : value === "instructed" ? "↗" : "○"}</span>; }
 function Empty({ title, body, action, onAction, secondaryAction, onSecondaryAction }: { title: string; body: string; action?: string; onAction?: () => void; secondaryAction?: string; onSecondaryAction?: () => void }) { return <div className="empty-state"><span>☷</span><h3>{title}</h3><p>{body}</p><div className="empty-actions">{action && onAction && <button onClick={onAction}>{action}</button>}{secondaryAction && onSecondaryAction && <button className="secondary" onClick={onSecondaryAction}>{secondaryAction}</button>}</div></div>; }
