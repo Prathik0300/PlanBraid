@@ -3,6 +3,7 @@ import { ensureSchema } from "@/db/setup";
 import { principalFromRequest } from "@/lib/app-principal";
 import type { AuthEnvironment } from "@/lib/auth";
 import { organizationFor, type Principal } from "@/lib/store";
+import { normalizeAccountLabel } from "@/lib/providers.ts";
 
 const SUPPORTED_SCOPES = ["work:read", "work:write"] as const;
 const ACCESS_TOKEN_SECONDS = 60 * 60;
@@ -306,13 +307,13 @@ export type OAuthConnection = { id: string; name: string; scopes: string[]; last
  * client reconnects, that's a second family and a second row, which is accurate. */
 export async function listOAuthConnections(db: PgD1, principal: Principal, organizationId: string): Promise<OAuthConnection[]> {
   const rows = await db.prepare(
-    `SELECT f.id AS family_id, c.client_name AS client_name, f.created_at AS connected_at, MAX(t.scopes) AS scopes, MAX(a.last_used_at) AS last_used_at
+    `SELECT f.id AS family_id, COALESCE(f.label, c.client_name) AS client_name, f.created_at AS connected_at, MAX(t.scopes) AS scopes, MAX(a.last_used_at) AS last_used_at
        FROM oauth_token_families f
        JOIN oauth_refresh_tokens t ON t.family_id = f.id
        JOIN oauth_clients c ON c.id = t.client_id
        LEFT JOIN oauth_access_tokens a ON a.family_id = f.id
       WHERE f.revoked_at IS NULL AND t.owner_user_id = ? AND t.organization_id = ?
-      GROUP BY f.id, c.client_name, f.created_at
+      GROUP BY f.id, f.label, c.client_name, f.created_at
       ORDER BY f.created_at DESC
       LIMIT 100`,
   ).bind(principal.userId, organizationId).all<{ family_id: string; client_name: string; connected_at: string; scopes: string | null; last_used_at: string | null }>();
@@ -325,6 +326,22 @@ export async function revokeOAuthConnection(db: PgD1, principal: Principal, orga
   if (!owned) throw Object.assign(new Error("OAuth connection not found"), { code: "NOT_FOUND", status: 404 });
   await revokeFamily(db, familyId);
   return { id: familyId, revoked: true };
+}
+
+/**
+ * Names one connection. Every install of a given client self-registers under the same
+ * client_name ("Claude Code"), so the name alone cannot tell two of the user's logins
+ * apart; the label lives on the family rather than the client so renaming one connection
+ * does not rename every connection made from that client.
+ */
+export async function renameOAuthConnection(db: PgD1, principal: Principal, organizationId: string, familyId: string, label: string): Promise<{ id: string; name: string }> {
+  const owned = await db.prepare("SELECT id FROM oauth_refresh_tokens WHERE family_id = ? AND owner_user_id = ? AND organization_id = ? LIMIT 1")
+    .bind(familyId, principal.userId, organizationId).first<{ id: string }>();
+  if (!owned) throw Object.assign(new Error("OAuth connection not found"), { code: "NOT_FOUND", status: 404 });
+  const clean = normalizeAccountLabel(label);
+  if (!clean) throw Object.assign(new Error("A connection name is required"), { code: "VALIDATION_FAILED", status: 422 });
+  await db.prepare("UPDATE oauth_token_families SET label = ? WHERE id = ?").bind(clean, familyId).run();
+  return { id: familyId, name: clean };
 }
 
 async function applyRateLimit(db: PgD1, request: Request, bucket: string, maximum: number): Promise<Response | null> {

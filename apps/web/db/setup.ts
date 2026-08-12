@@ -80,6 +80,16 @@ export const MIGRATION_STATEMENTS = [
   // own instead of the status just going stale once its blocker finishes.
   `ALTER TABLE work_items ADD COLUMN IF NOT EXISTS blocking_count INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE work_items ADD COLUMN IF NOT EXISTS unblocked_at TIMESTAMPTZ`,
+  // Which of the owner's agent logins wrote this, resolved server-side from the
+  // credential and the optional ?agent= marker rather than from the free-form provider
+  // string an agent types. Two CLI aliases for the same model (claude-personal,
+  // claude-work) are otherwise indistinguishable. See lib/providers.ts's agentAccountKey.
+  `ALTER TABLE sources ADD COLUMN IF NOT EXISTS agent_account_id TEXT`,
+  `ALTER TABLE sources ADD COLUMN IF NOT EXISTS agent_account_label TEXT`,
+  // Per-connection rename. Kept off oauth_clients because every Claude Code install
+  // self-registers under the same client_name, so renaming the client would rename
+  // every connection made from that client at once.
+  `ALTER TABLE oauth_token_families ADD COLUMN IF NOT EXISTS label TEXT`,
 ] as const;
 
 let initialized = false;

@@ -38,6 +38,11 @@ export type Source = {
   assurance: "enforced" | "observed" | "instructed" | "manual";
   currentTaskIds: string[];
   lastSeenAt: string;
+  /** Which of the owner's agent logins this session belongs to. Two CLI aliases for one
+   * model share a provider but not an account, so this is what separates them. Null for
+   * sessions registered before agent accounts existed. */
+  agentAccountId: string | null;
+  agentAccountLabel: string | null;
 };
 
 export type WorkItem = {

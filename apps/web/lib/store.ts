@@ -4,8 +4,21 @@ import type { Command, DashboardState, Notification, Project, Source, WorkEvent,
 import type { Proposal } from "@/lib/dedup/match.ts";
 import { aliasStatement, resolveProposals } from "@/lib/dedup/resolve.ts";
 import { DAG_EDGE_TYPES, DAG_EDGE_TYPE_SQL_LIST, isDagEdgeType } from "@/lib/graph/edges.ts";
+import { accountDisplayName, agentAccountKey, normalizeAccountLabel, providerFamily } from "@/lib/providers.ts";
 
-export type Principal = { userId: string; email: string; displayName: string; scopes?: string[]; authentication?: "browser" | "personal_token" | "oauth" | "local" };
+export type Principal = {
+  userId: string;
+  email: string;
+  displayName: string;
+  scopes?: string[];
+  authentication?: "browser" | "personal_token" | "oauth" | "local";
+  /** The credential the request authenticated with, and the agent login it stands for.
+   * Set for token/OAuth connections; absent for browser sessions, which are the person
+   * themselves rather than one of their agents. */
+  credentialId?: string;
+  agentAccountId?: string;
+  agentAccountLabel?: string;
+};
 
 type Row = Record<string, unknown>;
 
@@ -131,7 +144,7 @@ function mapProject(row: Row): Project {
   return { id: text(row, "id"), name: text(row, "name"), description: text(row, "description"), directory: text(row, "directory"), gitRemote: nullable(row, "git_remote"), defaultBranch: text(row, "default_branch"), revision: number(row, "revision"), status: text(row, "status"), updatedAt: text(row, "updated_at") };
 }
 function mapSource(row: Row): Source {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), codingSpaceId: nullable(row, "coding_space_id"), provider: text(row, "provider") as Source["provider"], externalId: text(row, "external_id"), title: text(row, "title"), model: nullable(row, "model"), status: text(row, "status"), assurance: text(row, "assurance") as Source["assurance"], currentTaskIds: parseJson(text(row, "current_task_ids"), []), lastSeenAt: text(row, "last_seen_at") };
+  return { id: text(row, "id"), projectId: text(row, "project_id"), codingSpaceId: nullable(row, "coding_space_id"), provider: text(row, "provider") as Source["provider"], externalId: text(row, "external_id"), title: text(row, "title"), model: nullable(row, "model"), status: text(row, "status"), assurance: text(row, "assurance") as Source["assurance"], currentTaskIds: parseJson(text(row, "current_task_ids"), []), lastSeenAt: text(row, "last_seen_at"), agentAccountId: nullable(row, "agent_account_id"), agentAccountLabel: nullable(row, "agent_account_label") };
 }
 function mapItem(row: Row): WorkItem {
   return { id: text(row, "id"), projectId: text(row, "project_id"), sequence: number(row, "sequence"), itemKey: text(row, "item_key"), parentId: nullable(row, "parent_id"), type: text(row, "type"), title: text(row, "title"), description: text(row, "description"), status: text(row, "status") as WorkStatus, priority: text(row, "priority") as WorkItem["priority"], assignee: nullable(row, "assignee"), sourceId: nullable(row, "source_id"), codingSpaceId: nullable(row, "coding_space_id"), completionConfidence: text(row, "completion_confidence"), verificationStatus: text(row, "verification_status"), blockerReason: nullable(row, "blocker_reason"), blockingCount: number(row, "blocking_count"), unblockedAt: nullable(row, "unblocked_at"), version: number(row, "version"), startedAt: nullable(row, "started_at"), completedAt: nullable(row, "completed_at"), createdAt: text(row, "created_at"), updatedAt: text(row, "updated_at") };
@@ -587,22 +600,38 @@ export async function recomputeBlockingCounts(db: PgD1, organizationId: string, 
   ).bind(...DAG_EDGE_TYPES, projectId, organizationId).run();
 }
 
+/**
+ * The name an event is recorded under. Events are a permanent log read long after the
+ * fact, so this names the *account*, not just the model: with two logins for one model
+ * connected, "Claude" on every row would be exactly as useless as the "Connected agent"
+ * it replaced.
+ */
+export function actorNameFor(provider: string, accountLabel?: string | null) {
+  return accountDisplayName(provider, accountLabel);
+}
+
 async function sourceActor(db: PgD1, organizationId: string, sourceId: string) {
-  const row = await db.prepare("SELECT provider FROM sources WHERE id = ? AND organization_id = ?").bind(sourceId, organizationId).first<{ provider: string }>();
+  const row = await db.prepare("SELECT provider, agent_account_label FROM sources WHERE id = ? AND organization_id = ?").bind(sourceId, organizationId).first<{ provider: string; agent_account_label: string | null }>();
   if (!row) throw domainError("NOT_FOUND", "Source not found", 404);
-  return row.provider.charAt(0).toUpperCase() + row.provider.slice(1);
+  return actorNameFor(row.provider, row.agent_account_label);
 }
 
 /**
- * Not every per-item tool call on a given turn repeats source_id (report_completion's
- * evidence array in particular often omits it), which used to fall straight to
- * principal.displayName - the generic "Connected agent" for any MCP token connection.
- * The work item itself already knows which agent is behind it, so fall back to that
- * before giving up and admitting we don't know who's acting.
+ * Who to record an event under, most specific first.
+ *
+ * Not every per-item tool call repeats source_id (report_completion's evidence array in
+ * particular often omits it), so there has to be a fallback. It cannot be the work
+ * item's own source, though, except as a last resort: that names whoever *created* the
+ * item, which with two logins for one model connected is regularly not whoever is
+ * acting now. The authenticated connection is, and it carries a real name.
  */
 async function resolveActor(db: PgD1, organizationId: string, principal: Principal, sourceId: string | null | undefined, itemSourceId: string | null | undefined) {
-  const effective = sourceId ?? itemSourceId;
-  return effective ? sourceActor(db, organizationId, effective) : principal.displayName;
+  if (sourceId) return sourceActor(db, organizationId, sourceId);
+  if (principal.agentAccountId) return principal.displayName;
+  // Only for connections with no identity of their own to offer; a signed-in person is
+  // already named by displayName and must not be relabelled as one of their agents.
+  if (itemSourceId && principal.authentication !== "browser") return sourceActor(db, organizationId, itemSourceId);
+  return principal.displayName;
 }
 
 function transitionEvent(status: WorkStatus) {
@@ -672,21 +701,40 @@ export async function revokeMcpToken(db: PgD1, principal: Principal, tokenId: st
   return { id: revoked.id, revoked: true };
 }
 
-export async function principalFromBearer(db: PgD1, authorization: string | null, resource?: string): Promise<Principal | null> {
+/**
+ * `agentMarker` is the optional `?agent=` value from the MCP URL, which is how two CLI
+ * aliases sharing one credential tell themselves apart. It is caller-supplied, so it
+ * only ever labels work within an already-authenticated account — it grants nothing.
+ *
+ * Both branches name the connection after its credential rather than the old fixed
+ * "Connected agent" / "OAuth-connected agent" strings: that name is the one thing about
+ * an agent connection the owner actually chose, and every write falls back to
+ * principal.displayName when a command carries no source of its own.
+ */
+export async function principalFromBearer(db: PgD1, authorization: string | null, resource?: string, agentMarker?: string | null): Promise<Principal | null> {
   if (!authorization?.startsWith("Bearer ")) return null;
   const token = authorization.slice(7);
   const tokenHash = await digest(token);
-  const personal = await db.prepare("SELECT owner_user_id, scopes FROM mcp_tokens WHERE token_hash = ? AND revoked_at IS NULL").bind(tokenHash).first<{ owner_user_id: string; scopes: string }>();
+  const marker = normalizeAccountLabel(agentMarker);
+  const identify = (credentialId: string, credentialName: string) => ({
+    credentialId,
+    agentAccountId: agentAccountKey(credentialId, marker) ?? undefined,
+    agentAccountLabel: marker ?? credentialName,
+    displayName: marker ? `${credentialName} (${marker})` : credentialName,
+  });
+  const personal = await db.prepare("SELECT id, name, owner_user_id, scopes FROM mcp_tokens WHERE token_hash = ? AND revoked_at IS NULL").bind(tokenHash).first<{ id: string; name: string; owner_user_id: string; scopes: string }>();
   if (personal) {
     await db.prepare("UPDATE mcp_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_hash = ?").bind(tokenHash).run();
-    return { userId: personal.owner_user_id, email: `${personal.owner_user_id}@planbraid.agent`, displayName: "Connected agent", scopes: personal.scopes.split(/[ ,]+/).filter(Boolean), authentication: "personal_token" };
+    return { userId: personal.owner_user_id, email: `${personal.owner_user_id}@planbraid.agent`, scopes: personal.scopes.split(/[ ,]+/).filter(Boolean), authentication: "personal_token", ...identify(personal.id, personal.name || "Connected agent") };
   }
   if (!resource) return null;
-  const oauth = await db.prepare("SELECT access.owner_user_id, access.scopes FROM oauth_access_tokens access JOIN oauth_token_families family ON family.id = access.family_id WHERE access.token_hash = ? AND access.resource = ? AND access.revoked_at IS NULL AND family.revoked_at IS NULL AND access.expires_at > ?")
-    .bind(tokenHash, resource, new Date().toISOString()).first<{ owner_user_id: string; scopes: string }>();
+  // COALESCE so a renamed connection wins over the name the client registered itself
+  // under — every Claude Code install self-registers as the same client_name.
+  const oauth = await db.prepare("SELECT access.owner_user_id, access.scopes, family.id AS family_id, COALESCE(family.label, client.client_name) AS connection_name FROM oauth_access_tokens access JOIN oauth_token_families family ON family.id = access.family_id JOIN oauth_clients client ON client.id = access.client_id WHERE access.token_hash = ? AND access.resource = ? AND access.revoked_at IS NULL AND family.revoked_at IS NULL AND access.expires_at > ?")
+    .bind(tokenHash, resource, new Date().toISOString()).first<{ owner_user_id: string; scopes: string; family_id: string; connection_name: string }>();
   if (!oauth) return null;
   await db.prepare("UPDATE oauth_access_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_hash = ?").bind(tokenHash).run();
-  return { userId: oauth.owner_user_id, email: `${oauth.owner_user_id}@planbraid.agent`, displayName: "OAuth-connected agent", scopes: oauth.scopes.split(/\s+/).filter(Boolean), authentication: "oauth" };
+  return { userId: oauth.owner_user_id, email: `${oauth.owner_user_id}@planbraid.agent`, scopes: oauth.scopes.split(/\s+/).filter(Boolean), authentication: "oauth", ...identify(oauth.family_id, oauth.connection_name || "OAuth-connected agent") };
 }
 
 export async function recordInteraction(db: PgD1, principal: Principal, input: { projectId: string; sourceId: string; externalId: string; outcome?: string; summary?: string; event?: "started" | "completed"; sequence?: number }) {
@@ -724,22 +772,43 @@ export async function recordInteraction(db: PgD1, principal: Principal, input: {
       ? db.prepare("UPDATE interactions SET status = 'completed', outcome = ?, summary = ?, reconciliation = ?, completed_at = ?, updated_at = ? WHERE id = ?").bind(input.outcome ?? "success", summary, reconciliation, now, now, interactionId)
       : db.prepare("INSERT INTO interactions (id, organization_id, project_id, source_id, external_id, sequence, status, outcome, summary, reconciliation, started_at, completed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?)").bind(interactionId, organizationId, input.projectId, input.sourceId, input.externalId, input.sequence ?? null, input.outcome ?? "success", summary, reconciliation, now, now, now),
     db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, input.projectId, currentRevision),
-    db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, source_id, interaction_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'interaction.completed', ?, ?, ?)").bind(id("evt"), organizationId, input.projectId, nextRevision, input.sourceId, interactionId, text(source, "provider").replace(/^./, (c) => c.toUpperCase()), summary, JSON.stringify({ reconciliation, outcome: input.outcome ?? "success" }), now),
+    db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, source_id, interaction_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'interaction.completed', ?, ?, ?)").bind(id("evt"), organizationId, input.projectId, nextRevision, input.sourceId, interactionId, actorNameFor(text(source, "provider"), nullable(source, "agent_account_label")), summary, JSON.stringify({ reconciliation, outcome: input.outcome ?? "success" }), now),
     db.prepare("INSERT INTO notifications (id, organization_id, recipient_user_id, project_id, source_id, interaction_id, event_type, priority, title, body, deep_link, dedupe_key, requires_action, created_at) VALUES (?, ?, ?, ?, ?, ?, 'interaction.completed', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (recipient_user_id, dedupe_key) DO NOTHING").bind(notificationId, organizationId, principal.userId, input.projectId, input.sourceId, interactionId, input.outcome === "failed" || input.outcome === "blocked" ? "high" : "normal", `${text(source, "provider")} interaction ${input.outcome ?? "completed"}`, summary, `/?project=${input.projectId}&source=${input.sourceId}`, `interaction:${interactionId}`, input.outcome === "blocked" ? 1 : 0, now),
   ]);
   return { interactionId, notificationId, reconciliation, projectRevision: nextRevision };
 }
 
-export async function registerSourceSession(db: PgD1, principal: Principal, input: { projectId: string; provider: string; externalId: string; title?: string; model?: string; codingSpaceId?: string; assurance?: string }) {
+export async function registerSourceSession(db: PgD1, principal: Principal, input: { projectId: string; provider: string; externalId: string; title?: string; model?: string; codingSpaceId?: string; assurance?: string; accountLabel?: string }) {
   const organizationId = await organizationFor(db, principal);
   await ownedProject(db, organizationId, input.projectId);
   const provider = input.provider.trim().slice(0, 80);
-  const externalId = input.externalId.trim().slice(0, 240);
-  if (!provider || !externalId) throw domainError("VALIDATION_FAILED", "Provider and external session ID are required");
-  const existing = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
+  const requestedExternalId = input.externalId.trim().slice(0, 240);
+  if (!provider || !requestedExternalId) throw domainError("VALIDATION_FAILED", "Provider and external session ID are required");
+  // Precedence: the credential (and any ?agent= marker) the request authenticated with
+  // outranks anything the model declares, since only the former is something the owner
+  // configured. An agent-declared label is the last resort, for connections that carry
+  // no distinguishing credential at all.
+  const accountId = principal.agentAccountId ?? null;
+  const accountLabel = principal.agentAccountLabel ?? normalizeAccountLabel(input.accountLabel);
+  let externalId = requestedExternalId;
+  const existing = await db.prepare("SELECT id, agent_account_id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string; agent_account_id: string | null }>();
   if (existing) {
-    await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model) WHERE id = ?").bind(input.title ?? null, input.model ?? null, existing.id).run();
-    return { sourceId: existing.id, idempotentReplay: true };
+    // Same conversation id, different agent login. sources' UNIQUE key predates agent
+    // accounts and cannot separate them, so rather than let one account silently adopt
+    // another's session, fork onto a deterministic id derived from the account. Only
+    // reachable when a client reuses a fixed session id across accounts; per-conversation
+    // UUIDs never collide here.
+    if (accountId && existing.agent_account_id && existing.agent_account_id !== accountId) {
+      externalId = `${requestedExternalId}::${accountId}`.slice(0, 240);
+    } else {
+      await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountId, accountLabel, existing.id).run();
+      return { sourceId: existing.id, idempotentReplay: true };
+    }
+  }
+  const forked = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
+  if (forked) {
+    await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountLabel, forked.id).run();
+    return { sourceId: forked.id, idempotentReplay: true };
   }
   const sourceId = id("src");
   // Two concurrent register_agent_session calls for the same (project, provider,
@@ -747,8 +816,8 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
   // them in true parallel, unlike D1 which serialized every query). The losing insert
   // hits sources' UNIQUE(project_id, provider, external_id), not the id primary key, so
   // re-select on conflict rather than assume this insert is the row that landed.
-  const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
-    .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed").first<{ id: string }>();
+  const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance, agent_account_id, agent_account_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
+    .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed", accountId, accountLabel).first<{ id: string }>();
   if (inserted) return { sourceId: inserted.id, idempotentReplay: false };
   const winner = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
   return { sourceId: winner!.id, idempotentReplay: true };
@@ -927,13 +996,18 @@ export async function getReadyWork(
     if (claimed.has(item.id)) { excludedByCollision += 1; continue; }
     const downstream = await downstreamOf(db, organizationId, input.projectId, item.id);
     const unlockCount = downstream.filter((entry) => entry.blockingCount === 1).length;
+    // Keyed by model family, not by the raw provider string or the agent account: two
+    // accounts of one model reason near-identically, so counting them as two would
+    // outrank a task Claude and Codex genuinely arrived at separately. The UI still
+    // shows every distinct account — provenance and evidence strength are different
+    // questions, and conflating them is what made this number dishonest before.
     const providers = new Set<string>();
     const ownSource = sources.find((source) => source.id === item.sourceId);
-    if (ownSource) providers.add(ownSource.provider);
+    if (ownSource) providers.add(providerFamily(ownSource.provider));
     for (const alias of aliases) {
       if (alias.workItemId !== item.id) continue;
       const aliasSource = sources.find((source) => source.id === alias.sourceId);
-      if (aliasSource) providers.add(aliasSource.provider);
+      if (aliasSource) providers.add(providerFamily(aliasSource.provider));
     }
     ranked.push({ item, unlockCount, corroboration: providers.size, priorityRank: PRIORITY_RANK[item.priority] });
   }

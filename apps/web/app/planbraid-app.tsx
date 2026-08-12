@@ -10,6 +10,7 @@ import { GoogleIcon } from "@/app/google-icon";
 import type { Command, DashboardState, Notification, Project, Provider, Source, WorkEvent, WorkItem, WorkStatus } from "@/lib/contracts";
 import { deriveColumn, isStartedWhileBlocked } from "@/lib/graph/column.ts";
 import { DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
+import { accountDisplayName, labelFor, providerFamily } from "@/lib/providers.ts";
 import claudeLogo from "@lobehub/icons-static-svg/icons/claude-color.svg";
 import codexLogo from "@lobehub/icons-static-svg/icons/codex-color.svg";
 import copilotLogo from "@lobehub/icons-static-svg/icons/copilot-color.svg";
@@ -43,49 +44,69 @@ const statusMeta: Record<WorkStatus, { label: string; dot: string }> = {
   in_progress: { label: "In progress", dot: "●" }, blocked: { label: "Blocked", dot: "◆" }, in_review: { label: "Review", dot: "◈" },
   done: { label: "Done", dot: "✓" }, cancelled: { label: "Cancelled", dot: "×" },
 };
-const providerLabel: Record<string, string> = {
-  codex: "Codex", openai: "OpenAI", chatgpt: "ChatGPT", claude: "Claude", anthropic: "Anthropic",
-  gemini: "Gemini", google: "Google", copilot: "GitHub Copilot", github_copilot: "GitHub Copilot", cursor: "Cursor",
-  windsurf: "Windsurf", human: "You", system: "Planbraid",
-};
+// Logos stay here rather than in lib/providers.ts: they are bundler-resolved asset
+// imports, and that module is imported by server code that must not pull in SVG assets.
 const providerLogo: Record<string, BundledLogo> = {
   codex: codexLogo, openai: openAILogo, chatgpt: openAILogo, claude: claudeLogo, anthropic: claudeLogo,
   gemini: geminiLogo, copilot: copilotLogo, github_copilot: copilotLogo, cursor: cursorLogo, windsurf: windsurfLogo,
 };
-// Agents register with free-form provider strings ("codex-desktop", "claude-code",
-// "gemini-cli"), not the bare keys above, so an exact match against providerLogo/
-// providerLabel almost never hits in practice. Matched by family instead of equality.
-const providerFamilies: Array<[RegExp, string]> = [
-  [/codex/, "codex"], [/claude|anthropic/, "claude"], [/gemini/, "gemini"], [/google/, "google"],
-  [/copilot/, "copilot"], [/cursor/, "cursor"], [/windsurf/, "windsurf"], [/openai|chatgpt|gpt/, "openai"],
-  [/^human$|^you$/, "human"], [/^system$|^planbraid$/, "system"],
-];
-function providerFamily(provider: string) {
-  const normalized = provider.toLowerCase();
-  return providerFamilies.find(([pattern]) => pattern.test(normalized))?.[1] ?? normalized.replace(/[^a-z0-9_-]/g, "_");
-}
-/** Title-cases a raw, unrecognized provider string ("codex-desktop" -> "Codex desktop")
- * so an agent nobody has special-cased yet still gets a real name instead of blank text. */
-function prettifyProvider(provider: string) {
-  const spaced = provider.replace(/[-_]+/g, " ").trim();
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
-}
-function labelFor(provider: string) {
-  return providerLabel[providerFamily(provider)] ?? prettifyProvider(provider);
-}
 
 function requestId(prefix = "ui") { return `${prefix}-${crypto.randomUUID()}`; }
 
-/** Distinct providers that proposed a work item: its own source plus every alias's source. */
-function corroboratingProviders(item: WorkItem, aliases: DashboardState["aliases"], sources: Source[]) {
-  const providers = new Set<string>();
-  const ownSource = sources.find((source) => source.id === item.sourceId);
-  if (ownSource) providers.add(ownSource.provider);
-  for (const alias of aliases) {
-    const source = sources.find((entry) => entry.id === alias.sourceId);
-    if (source) providers.add(source.provider);
+type ProposingAccount = { provider: string; family: string; accountId: string | null; accountLabel: string | null };
+
+/**
+ * How the UI decides two sessions are "the same proposer". Keyed on the account's name
+ * rather than its id: two credentials the owner gave the same name are one account as
+ * far as a reader is concerned, and rendering the same label twice in a row reads as a
+ * bug. Sessions predating agent accounts have no label and fall back to the model, which
+ * is how they always deduped.
+ */
+function accountKeyOf(source: Source) {
+  return `${providerFamily(source.provider)}:${source.agentAccountLabel ?? ""}`;
+}
+
+/**
+ * Distinct agent accounts that proposed a work item: its own source plus every alias's.
+ *
+ * Deduped by account rather than by provider string, so the user's two logins for one
+ * model stay visible as two proposers instead of collapsing into one (or, when the model
+ * happened to register under two different names, silently becoming two *models*).
+ * getReadyWork deliberately counts this differently (see its comment in lib/store.ts):
+ * evidence strength is a per-model question, provenance is a per-account one.
+ */
+function corroboratingProviders(item: WorkItem, aliases: DashboardState["aliases"], sources: Source[]): ProposingAccount[] {
+  const accounts = new Map<string, ProposingAccount>();
+  const add = (source: Source | undefined) => {
+    if (!source) return;
+    accounts.set(accountKeyOf(source), { provider: source.provider, family: providerFamily(source.provider), accountId: source.agentAccountId, accountLabel: source.agentAccountLabel });
+  };
+  add(sources.find((source) => source.id === item.sourceId));
+  for (const alias of aliases) add(sources.find((entry) => entry.id === alias.sourceId));
+  return [...accounts.values()];
+}
+
+/** "Claude", or "Claude · work" when more than one account of that model is connected.
+ * The qualifier is noise for the overwhelmingly common single-account case. */
+function accountName(account: ProposingAccount, ambiguousFamilies: Set<string>) {
+  return ambiguousFamilies.has(account.family) ? accountDisplayName(account.provider, account.accountLabel) : labelFor(account.provider);
+}
+
+/** The same rule for a plain Source, which is what most of the UI actually holds. */
+function sourceName(source: Source, ambiguousFamilies: Set<string>) {
+  return accountName({ provider: source.provider, family: providerFamily(source.provider), accountId: source.agentAccountId, accountLabel: source.agentAccountLabel }, ambiguousFamilies);
+}
+
+/** Model families the org has connected under more than one account. Computed from all
+ * sources, not just one card's, so the same task reads the same way across the board. */
+function ambiguousFamiliesOf(sources: Source[]) {
+  const seen = new Map<string, Set<string>>();
+  for (const source of sources) {
+    const family = providerFamily(source.provider);
+    if (!seen.has(family)) seen.set(family, new Set());
+    seen.get(family)!.add(accountKeyOf(source));
   }
-  return [...providers];
+  return new Set([...seen.entries()].filter(([, accounts]) => accounts.size > 1).map(([family]) => family));
 }
 
 /**
@@ -276,6 +297,7 @@ function LoadingShell() { return <div className="loading-screen"><div className=
 function ErrorState({ message, retry }: { message: string; retry: () => void }) { return <div className="error-screen"><div className="brand-mark graphic" aria-hidden="true" /><h1>Couldn’t open Planbraid</h1><p>{message}</p><button onClick={retry}>Try again</button></div>; }
 
 function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSelect, onSource, open, toggle, onNew, onProfile }: { data: DashboardState; avatarUrl: string | null; selected: string; selectedSource: string | null; sources: Source[]; onSelect: (id: string) => void; onSource: (id: string | null) => void; open: boolean; toggle: () => void; onNew: () => void; onProfile: () => void }) {
+  const railAmbiguousFamilies = ambiguousFamiliesOf(sources);
   return <aside className={`project-rail ${open ? "open" : "collapsed"}`} aria-label="Projects and agent conversations">
     <div className="rail-brand">
       <span className="planbraid-logo" aria-hidden="true" />
@@ -292,7 +314,7 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
     })}</div>
     <div className="rail-divider" />
     <div className="rail-label">Chats & agents</div>
-    <div className="agent-list"><button className={`source-row all-sources ${selectedSource === null ? "active" : ""}`} onClick={() => onSource(null)}><span className="all-agent-icon">◎</span><span><strong>All activity</strong><small>Every connected conversation</small></span></button>{sources.map((source) => <button key={source.id} className={`source-row ${selectedSource === source.id ? "active" : ""}`} onClick={() => onSource(source.id)}><ProviderIcon provider={source.provider} /><span><strong>{labelFor(source.provider)}</strong><small>{source.title}</small></span><span className={`presence ${source.status}`} title={source.status} /></button>)}</div>
+    <div className="agent-list"><button className={`source-row all-sources ${selectedSource === null ? "active" : ""}`} onClick={() => onSource(null)}><span className="all-agent-icon">◎</span><span><strong>All activity</strong><small>Every connected conversation</small></span></button>{sources.map((source) => <button key={source.id} className={`source-row ${selectedSource === source.id ? "active" : ""}`} onClick={() => onSource(source.id)}><ProviderIcon provider={source.provider} /><span><strong>{sourceName(source, railAmbiguousFamilies)}</strong><small>{source.title}</small></span><span className={`presence ${source.status}`} title={source.status} /></button>)}</div>
     <button className="rail-footer" onClick={onProfile}><span className="avatar">{avatarUrl ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(avatarUrl)})` }} aria-hidden="true" /> : data.viewer.name.slice(0, 1).toUpperCase()}</span><span><strong>{data.viewer.name}</strong><small>Account &amp; profile</small></span><b aria-hidden="true">›</b></button></>}
   </aside>;
 }
@@ -426,27 +448,29 @@ function Board({ items, sources, aliases, dependencies, onItem, onTransition }: 
   // Grouped by the derived column, not raw status: a card here moves on its own once
   // its last blocker resolves, with no write to the card's own row. See lib/graph/column.ts.
   const byColumn = new Map(columns.map((status) => [status, items.filter((item) => deriveColumn(item) === status)]));
-  return <div className="board">{columns.map((status) => <section className="board-column" key={status}><header><span className={`status-dot ${status}`}>{statusMeta[status].dot}</span><strong>{statusMeta[status].label}</strong><b>{byColumn.get(status)?.length ?? 0}</b></header><div className="board-stack">{byColumn.get(status)?.map((item) => <TaskCard key={item.id} item={item} source={sources.find((source) => source.id === item.sourceId)} aliases={aliases.filter((alias) => alias.workItemId === item.id)} sources={sources} dependencies={dependencies} allItems={items} onClick={() => onItem(item.id)} onMove={(next) => onTransition(item, next)} />)}</div></section>)}</div>;
+  const ambiguousFamilies = ambiguousFamiliesOf(sources);
+  return <div className="board">{columns.map((status) => <section className="board-column" key={status}><header><span className={`status-dot ${status}`}>{statusMeta[status].dot}</span><strong>{statusMeta[status].label}</strong><b>{byColumn.get(status)?.length ?? 0}</b></header><div className="board-stack">{byColumn.get(status)?.map((item) => <TaskCard key={item.id} item={item} source={sources.find((source) => source.id === item.sourceId)} aliases={aliases.filter((alias) => alias.workItemId === item.id)} sources={sources} ambiguousFamilies={ambiguousFamilies} dependencies={dependencies} allItems={items} onClick={() => onItem(item.id)} onMove={(next) => onTransition(item, next)} />)}</div></section>)}</div>;
 }
 
-function TaskCard({ item, source, aliases, sources, dependencies, allItems, onClick, onMove }: { item: WorkItem; source?: Source; aliases: DashboardState["aliases"]; sources: Source[]; dependencies: DashboardState["dependencies"]; allItems: WorkItem[]; onClick: () => void; onMove: (status: WorkStatus) => void }) {
+function TaskCard({ item, source, aliases, sources, ambiguousFamilies, dependencies, allItems, onClick, onMove }: { item: WorkItem; source?: Source; aliases: DashboardState["aliases"]; sources: Source[]; ambiguousFamilies: Set<string>; dependencies: DashboardState["dependencies"]; allItems: WorkItem[]; onClick: () => void; onMove: (status: WorkStatus) => void }) {
   const corroboration = corroboratingProviders(item, aliases, sources);
   const corroborated = corroboration.length > 1;
-  const aliasTitle = aliases.map((alias) => { const aliasProvider = sources.find((entry) => entry.id === alias.sourceId)?.provider; return `${aliasProvider ? labelFor(aliasProvider) : "Another agent"} also proposed: "${alias.title}"`; }).join("\n");
+  const aliasTitle = aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return `${aliasSource ? sourceName(aliasSource, ambiguousFamilies) : "Another agent"} also proposed: "${alias.title}"`; }).join("\n");
   const column = deriveColumn(item);
   const waitingOn = column === "blocked" && item.status !== "blocked" ? unresolvedBlockers(item, dependencies, allItems) : [];
   const anomaly = isStartedWhileBlocked(item);
   return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="blocker-copy">Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}{/* corroboration already includes the card's own source, so a plural stack replaces
     the single-source label rather than sitting beside a duplicate of itself. */}
-          <footer>{corroborated ? <ProviderStack providers={corroboration} /> : source ? <span><ProviderIcon provider={source.provider} /> {labelFor(source.provider)}</span> : <span>Manual</span>}</footer></button><select aria-label={`Move ${item.itemKey}`} value={item.status} onChange={(event) => onMove(event.target.value as WorkStatus)}>{Object.entries(statusMeta).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></article>;
+          <footer>{corroborated ? <ProviderStack accounts={corroboration} ambiguousFamilies={ambiguousFamilies} /> : source ? <span><ProviderIcon provider={source.provider} /> {sourceName(source, ambiguousFamilies)}</span> : <span>Manual</span>}</footer></button><select aria-label={`Move ${item.itemKey}`} value={item.status} onChange={(event) => onMove(event.target.value as WorkStatus)}>{Object.entries(statusMeta).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></article>;
 }
 
 function ListView({ items, sources, aliases, onItem }: { items: WorkItem[]; sources: Source[]; aliases: DashboardState["aliases"]; onItem: (id: string) => void }) {
+  const ambiguousFamilies = ambiguousFamiliesOf(sources);
   return <div className="list-view"><div className="list-head"><span>Work item</span><span>Status</span><span>Source</span><span>Corroboration</span><span>Updated</span></div>{items.map((item) => {
     const source = sources.find((entry) => entry.id === item.sourceId);
     const column = deriveColumn(item);
     const corroboration = corroboratingProviders(item, aliases.filter((alias) => alias.workItemId === item.id), sources);
-    return <button className="list-row" key={item.id} onClick={() => onItem(item.id)}><span className="list-title"><span className={`priority ${item.priority}`} /><b>{item.itemKey}</b><strong>{item.title}</strong></span><span className={`status-badge ${column}`}>{statusMeta[column].dot} {statusMeta[column].label}</span><span>{source ? <><ProviderIcon provider={source.provider} /> {labelFor(source.provider)}</> : "Manual"}</span><span>{corroboration.length > 0 ? <ProviderStack providers={corroboration} /> : <span className="muted">·</span>}</span><span>{relative(item.updatedAt)}</span></button>;
+    return <button className="list-row" key={item.id} onClick={() => onItem(item.id)}><span className="list-title"><span className={`priority ${item.priority}`} /><b>{item.itemKey}</b><strong>{item.title}</strong></span><span className={`status-badge ${column}`}>{statusMeta[column].dot} {statusMeta[column].label}</span><span>{source ? <><ProviderIcon provider={source.provider} /> {sourceName(source, ambiguousFamilies)}</> : "Manual"}</span><span>{corroboration.length > 0 ? <ProviderStack accounts={corroboration} ambiguousFamilies={ambiguousFamilies} /> : <span className="muted">·</span>}</span><span>{relative(item.updatedAt)}</span></button>;
   })}</div>;
 }
 
@@ -456,20 +480,22 @@ function Inbox({ notifications, onOpen, onResolve }: { notifications: Notificati
   return <div className="inbox"><div className="inbox-heading"><span><h2>Inbox</h2><p>Decisions, completed turns, blockers, and agent health.</p></span><div className="segment"><button className={tab === "action" ? "active" : ""} onClick={() => setTab("action")}>Needs action</button><button className={tab === "updates" ? "active" : ""} onClick={() => setTab("updates")}>Updates</button><button className={tab === "all" ? "active" : ""} onClick={() => setTab("all")}>All</button></div></div>{visible.length ? <div className="inbox-list">{visible.map((notification) => <article className={`notification-card ${notification.readAt ? "read" : ""}`} key={notification.id}><span className={`notification-priority ${notification.priority}`}>!</span><button className="notification-main" onClick={() => onOpen(notification)}><div><strong>{notification.title}</strong><time>{relative(notification.createdAt)}</time></div><p>{notification.body}</p><small>{notification.eventType.replaceAll("_", " ").replaceAll(".", " · ")}</small></button>{notification.requiresAction && !notification.resolvedAt && <button className="resolve-button" onClick={() => onResolve(notification)}>Resolve</button>}</article>)}</div> : <Empty title="You’re caught up" body="Nothing in this notification view needs your attention." />}</div>;
 }
 
-function Agents({ sources, items }: { sources: Source[]; items: WorkItem[] }) { return <div className="agents-view"><div className="inbox-heading"><span><h2>Connected agents</h2><p>Sessions, coding spaces, capture assurance, and current work.</p></span></div><div className="agent-grid">{sources.map((source) => <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{labelFor(source.provider)}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{items.filter((item) => item.sourceId === source.id && !["done", "cancelled"].includes(item.status)).map((item) => <span key={item.id}><b>{item.itemKey}</b> {item.title}</span>)}</div></article>)}</div></div>; }
+function Agents({ sources, items }: { sources: Source[]; items: WorkItem[] }) { const agentAmbiguousFamilies = ambiguousFamiliesOf(sources); return <div className="agents-view"><div className="inbox-heading"><span><h2>Connected agents</h2><p>Sessions, coding spaces, capture assurance, and current work.</p></span></div><div className="agent-grid">{sources.map((source) => <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{sourceName(source, agentAmbiguousFamilies)}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{items.filter((item) => item.sourceId === source.id && !["done", "cancelled"].includes(item.status)).map((item) => <span key={item.id}><b>{item.itemKey}</b> {item.title}</span>)}</div></article>)}</div></div>; }
 
 function Composer({ project, sources, busy, onCreate }: { project: Project | null; sources: Source[]; busy: boolean; onCreate: (title: string, source: string) => void }) {
   const [title, setTitle] = useState(""); const [source, setSource] = useState("");
+  const composerAmbiguousFamilies = ambiguousFamiliesOf(sources);
   function submit(event: FormEvent) { event.preventDefault(); if (!title.trim()) return; onCreate(title.trim(), source); setTitle(""); }
-  return <form className="composer" onSubmit={submit}><span className="composer-plus">＋</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={`Add work to ${project?.name ?? "this project"}…`} aria-label="New task title"/><select value={source} onChange={(event) => setSource(event.target.value)} aria-label="Task source"><option value="">Manual</option>{sources.map((entry) => <option value={entry.id} key={entry.id}>{labelFor(entry.provider)} · {entry.title}</option>)}</select><button disabled={busy || !title.trim()}>{busy ? "Saving…" : "Add task"}</button></form>;
+  return <form className="composer" onSubmit={submit}><span className="composer-plus">＋</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={`Add work to ${project?.name ?? "this project"}…`} aria-label="New task title"/><select value={source} onChange={(event) => setSource(event.target.value)} aria-label="Task source"><option value="">Manual</option>{sources.map((entry) => <option value={entry.id} key={entry.id}>{sourceName(entry, composerAmbiguousFamilies)} · {entry.title}</option>)}</select><button disabled={busy || !title.trim()}>{busy ? "Saving…" : "Add task"}</button></form>;
 }
 
 function TaskDrawer({ item, source, sources, events, evidence, dependencies, aliases, allItems, busy, close, transition, note, splitAlias }: { item: WorkItem; source: Source | null; sources: Source[]; events: WorkEvent[]; evidence: DashboardState["evidence"]; dependencies: DashboardState["dependencies"]; aliases: DashboardState["aliases"]; allItems: WorkItem[]; busy: boolean; close: () => void; transition: (status: WorkStatus, reason?: string) => void; note: (summary: string) => void; splitAlias: (aliasId: string) => void }) {
   const [tab, setTab] = useState<"overview" | "activity" | "evidence">("overview"); const [noteText, setNoteText] = useState("");
   const corroboratedProviders = corroboratingProviders(item, aliases, sources);
+  const drawerAmbiguousFamilies = ambiguousFamiliesOf(sources);
   const waitingOn = unresolvedBlockers(item, dependencies, allItems);
   const anomaly = isStartedWhileBlocked(item);
-  return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><aside className="task-drawer" aria-label={`${item.itemKey} details`}><header className="drawer-header"><span className={`status-badge ${item.status}`}>{statusMeta[item.status].dot} {statusMeta[item.status].label}</span><button className="icon-button" onClick={close} aria-label="Close task">×</button></header><div className="drawer-title"><small>{item.itemKey} · v{item.version}</small><h2>{item.title}</h2><p>{item.description || "No description has been added yet."}</p>{corroboratedProviders.length > 1 && <p className="corroboration-banner">Proposed independently by {corroboratedProviders.map((provider) => labelFor(provider)).join(" and ")}.</p>}{anomaly && <p className="anomaly-banner">⚠ In progress, but {waitingOn.length ? `${waitingOn.map((entry) => entry.itemKey).join(", ")} is still unresolved` : "a prerequisite is still unresolved"}.</p>}</div><div className="drawer-fields"><label>Status<select value={item.status} disabled={busy} onChange={(event) => transition(event.target.value as WorkStatus, event.target.value === "blocked" ? "Blocked from task detail" : undefined)}>{Object.entries(statusMeta).map(([value, meta]) => <option value={value} key={value}>{meta.label}</option>)}</select></label><label>Priority<strong className={`priority-value ${item.priority}`}>{item.priority}</strong></label><label>Owner<strong>{item.assignee ?? "Unassigned"}</strong></label><label>Source<strong>{source ? <><ProviderIcon provider={source.provider} /> {labelFor(source.provider)}</> : "Manual"}</strong></label></div><nav className="drawer-tabs"><button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button><button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity {events.length}</button><button className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>Evidence {evidence.length}</button></nav><div className="drawer-body">{tab === "overview" && <><section><h3>Completion</h3><div className="confidence"><span>{item.completionConfidence}</span><span>{item.verificationStatus}</span></div></section>{item.blockerReason && <section className="blocker-panel"><h3>Blocker</h3><p>{item.blockerReason}</p></section>}{waitingOn.length > 0 && <section className="blocker-panel"><h3>Waiting on</h3>{waitingOn.map((entry) => <p key={entry.id}><b>{entry.itemKey}</b> {entry.title} · {statusMeta[entry.status].label}</p>)}</section>}<section><h3>Dependencies</h3>{dependencies.length ? dependencies.map((edge) => { const linkedId = edge.fromWorkItemId === item.id ? edge.toWorkItemId : edge.fromWorkItemId; const linked = allItems.find((entry) => entry.id === linkedId); return <div className="dependency-row" key={edge.id}><span>{edge.type}</span><b>{linked?.itemKey}</b><p>{linked?.title}</p></div>; }) : <p className="muted">No dependencies.</p>}</section>{aliases.length > 0 && <section><h3>Also proposed</h3>{aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return <div className="alias-row" key={alias.id}><ProviderIcon provider={(aliasSource?.provider ?? "system") as Provider} /><span><strong>{alias.title}</strong><small>{aliasSource ? labelFor(aliasSource.provider) : "Another agent"} · {relative(alias.createdAt)} · {alias.matchReason}</small></span><button className="alias-split" disabled={busy} onClick={() => splitAlias(alias.id)}>Not the same, make separate task</button></div>; })}</section>}</>}{tab === "activity" && events.map((event) => { const eventSource = sources.find((entry) => entry.id === event.sourceId); return <div className="mini-event" key={event.id}><ProviderIcon provider={(eventSource?.provider ?? "system") as Provider}/><span><strong>{event.summary}</strong><small>{event.actorName} · {relative(event.createdAt)}</small></span></div>; })}{tab === "evidence" && (evidence.length ? evidence.map((entry) => { const evidenceSource = sources.find((entry2) => entry2.id === entry.sourceId); return <div className="evidence-row" key={entry.id}>{evidenceSource ? <ProviderIcon provider={evidenceSource.provider} /> : <span className="evidence-check">✓</span>}<span><strong>{entry.label}</strong><small>{entry.type} · {entry.result ?? "recorded"} · {evidenceSource ? `by ${labelFor(evidenceSource.provider)}` : "Manual"} · {relative(entry.createdAt)}</small></span></div>; }) : <p className="muted">No evidence attached yet.</p>)}</div><form className="drawer-note" onSubmit={(event) => { event.preventDefault(); if (!noteText.trim()) return; note(noteText.trim()); setNoteText(""); }}><input value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="Add a progress update…"/><button disabled={!noteText.trim() || busy}>Add</button></form></aside></div>;
+  return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><aside className="task-drawer" aria-label={`${item.itemKey} details`}><header className="drawer-header"><span className={`status-badge ${item.status}`}>{statusMeta[item.status].dot} {statusMeta[item.status].label}</span><button className="icon-button" onClick={close} aria-label="Close task">×</button></header><div className="drawer-title"><small>{item.itemKey} · v{item.version}</small><h2>{item.title}</h2><p>{item.description || "No description has been added yet."}</p>{corroboratedProviders.length > 1 && <p className="corroboration-banner">Proposed independently by {corroboratedProviders.map((account) => accountName(account, drawerAmbiguousFamilies)).join(" and ")}.</p>}{anomaly && <p className="anomaly-banner">⚠ In progress, but {waitingOn.length ? `${waitingOn.map((entry) => entry.itemKey).join(", ")} is still unresolved` : "a prerequisite is still unresolved"}.</p>}</div><div className="drawer-fields"><label>Status<select value={item.status} disabled={busy} onChange={(event) => transition(event.target.value as WorkStatus, event.target.value === "blocked" ? "Blocked from task detail" : undefined)}>{Object.entries(statusMeta).map(([value, meta]) => <option value={value} key={value}>{meta.label}</option>)}</select></label><label>Priority<strong className={`priority-value ${item.priority}`}>{item.priority}</strong></label><label>Owner<strong>{item.assignee ?? "Unassigned"}</strong></label><label>Source<strong>{source ? <><ProviderIcon provider={source.provider} /> {sourceName(source, drawerAmbiguousFamilies)}</> : "Manual"}</strong></label></div><nav className="drawer-tabs"><button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button><button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity {events.length}</button><button className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>Evidence {evidence.length}</button></nav><div className="drawer-body">{tab === "overview" && <><section><h3>Completion</h3><div className="confidence"><span>{item.completionConfidence}</span><span>{item.verificationStatus}</span></div></section>{item.blockerReason && <section className="blocker-panel"><h3>Blocker</h3><p>{item.blockerReason}</p></section>}{waitingOn.length > 0 && <section className="blocker-panel"><h3>Waiting on</h3>{waitingOn.map((entry) => <p key={entry.id}><b>{entry.itemKey}</b> {entry.title} · {statusMeta[entry.status].label}</p>)}</section>}<section><h3>Dependencies</h3>{dependencies.length ? dependencies.map((edge) => { const linkedId = edge.fromWorkItemId === item.id ? edge.toWorkItemId : edge.fromWorkItemId; const linked = allItems.find((entry) => entry.id === linkedId); return <div className="dependency-row" key={edge.id}><span>{edge.type}</span><b>{linked?.itemKey}</b><p>{linked?.title}</p></div>; }) : <p className="muted">No dependencies.</p>}</section>{aliases.length > 0 && <section><h3>Also proposed</h3>{aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return <div className="alias-row" key={alias.id}><ProviderIcon provider={(aliasSource?.provider ?? "system") as Provider} /><span><strong>{alias.title}</strong><small>{aliasSource ? sourceName(aliasSource, drawerAmbiguousFamilies) : "Another agent"} · {relative(alias.createdAt)} · {alias.matchReason}</small></span><button className="alias-split" disabled={busy} onClick={() => splitAlias(alias.id)}>Not the same, make separate task</button></div>; })}</section>}</>}{tab === "activity" && events.map((event) => { const eventSource = sources.find((entry) => entry.id === event.sourceId); return <div className="mini-event" key={event.id}><ProviderIcon provider={(eventSource?.provider ?? "system") as Provider}/><span><strong>{event.summary}</strong><small>{event.actorName} · {relative(event.createdAt)}</small></span></div>; })}{tab === "evidence" && (evidence.length ? evidence.map((entry) => { const evidenceSource = sources.find((entry2) => entry2.id === entry.sourceId); return <div className="evidence-row" key={entry.id}>{evidenceSource ? <ProviderIcon provider={evidenceSource.provider} /> : <span className="evidence-check">✓</span>}<span><strong>{entry.label}</strong><small>{entry.type} · {entry.result ?? "recorded"} · {evidenceSource ? `by ${sourceName(evidenceSource, drawerAmbiguousFamilies)}` : "Manual"} · {relative(entry.createdAt)}</small></span></div>; }) : <p className="muted">No evidence attached yet.</p>)}</div><form className="drawer-note" onSubmit={(event) => { event.preventDefault(); if (!noteText.trim()) return; note(noteText.trim()); setNoteText(""); }}><input value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="Add a progress update…"/><button disabled={!noteText.trim() || busy}>Add</button></form></aside></div>;
 }
 
 function CommandDialog({ projects, currentProject, initialMode = "search", busy, close, create }: { projects: Project[]; currentProject: string; initialMode?: "search" | "project"; busy: boolean; close: () => void; create: (input: { name: string; description: string; gitRemote: string }) => Promise<CommandResult> }) {
@@ -589,6 +615,12 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
   const [revokingOAuthId, setRevokingOAuthId] = useState<string | null>(null);
   const [pushEnabled, setPushEnabled] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [tokenName, setTokenName] = useState("");
+  // The label this connection stamps on its work. Two CLI aliases for one model share a
+  // credential unless you give them separate ones, so this is what tells them apart.
+  const [agentMarker, setAgentMarker] = useState("");
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   function copy(key: string, text: string, message: string) {
     void navigator.clipboard.writeText(text);
@@ -625,7 +657,10 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
   async function generate() {
     setBusy(true);
     try {
-      const response = await fetch("/api/tokens", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: `${project?.name ?? "Project"} coding agents` }) });
+      // The name is how the connection identifies itself in every event it later
+      // records, so it is worth letting people write one instead of stamping them all
+      // with the same generated string and leaving two logins indistinguishable.
+      const response = await fetch("/api/tokens", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: tokenName.trim() || `${project?.name ?? "Project"} coding agents` }) });
       const body = await response.json() as { data?: { token: string }; error?: { message?: string } };
       if (!response.ok) throw new Error(body.error?.message ?? "Could not generate an agent token");
       setToken(body.data?.token ?? "");
@@ -643,6 +678,17 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       toast("MCP connection revoked");
     } catch (error) { toast(error instanceof Error ? error.message : "Could not revoke this connection"); }
     finally { setRevokingId(null); }
+  }
+  async function renameOAuth(id: string, name: string) {
+    if (!name.trim()) return;
+    try {
+      const response = await fetch("/api/oauth-connections", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, name: name.trim() }) });
+      const body = await response.json() as { data?: { name: string }; error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not rename this connection");
+      setOauthConnections((current) => current.map((entry) => entry.id === id ? { ...entry, name: body.data?.name ?? name.trim() } : entry));
+      setRenamingId(null);
+      toast("Connection renamed");
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not rename this connection"); }
   }
   async function revokeOAuth(id: string) {
     setRevokingOAuthId(id);
@@ -685,9 +731,14 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       toast("Push alerts enabled - even when Planbraid is closed");
     } catch (error) { toast(error instanceof Error ? error.message : "Could not enable push alerts"); }
   }
-  const endpoint = typeof location !== "undefined" ? `${location.origin}/mcp` : "/mcp";
+  const baseEndpoint = typeof location !== "undefined" ? `${location.origin}/mcp` : "/mcp";
+  // A per-alias marker rides on the URL rather than in a header, because the URL is the
+  // one part of an MCP server entry every client lets you edit by hand.
+  const marker = agentMarker.trim();
+  const endpoint = marker ? `${baseEndpoint}?agent=${encodeURIComponent(marker)}` : baseEndpoint;
   const oauthConfig = JSON.stringify({ mcpServers: { planbraid: { type: "http", url: endpoint } } }, null, 2);
   const tokenConfig = JSON.stringify({ mcpServers: { planbraid: { type: "http", url: endpoint, headers: { Authorization: `Bearer ${token || "<PLANBRAID_TOKEN>"}` } } } }, null, 2);
+  const markerField = <label className="agent-marker"><span>Label this connection <span className="label-optional">optional</span></span><input value={agentMarker} onChange={(event) => setAgentMarker(event.target.value)} placeholder="work" maxLength={60} /><small>Running the same model under two logins? Give each its own label and Planbraid will tell their work apart instead of showing both as one agent.</small></label>;
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
     <div className="setup-dialog" role="dialog" aria-modal="true" aria-label="Connect coding agents">
       <header><span><small>REMOTE MCP ACCESS</small><h2>Connect Planbraid to an agent</h2></span><button className="icon-button" onClick={close} aria-label="Close connection setup">×</button></header>
@@ -699,13 +750,15 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
         <header><span><span className="oauth-lock">✓</span><strong>Automatic OAuth access</strong></span></header>
         <ol><li>Open your client&apos;s <strong>MCP servers</strong> or <strong>Connectors</strong> settings.</li><li>Add a remote HTTP server and paste the Planbraid URL below.</li><li>Your client opens Planbraid in a browser. Sign in and approve read/write access.</li></ol>
         <div className="endpoint-box"><small>Remote MCP server URL</small><code>{endpoint}</code><button onClick={() => copy("endpoint", endpoint, "MCP URL copied")}>{copiedKey === "endpoint" ? "Copied" : "Copy URL"}</button></div>
-        <div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("oauthConfig", oauthConfig, "OAuth MCP config copied")}>{copiedKey === "oauthConfig" ? "Copied" : "Copy config"}</button></span><pre>{oauthConfig}</pre></div>
+        {markerField}<div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("oauthConfig", oauthConfig, "OAuth MCP config copied")}>{copiedKey === "oauthConfig" ? "Copied" : "Copy config"}</button></span><pre>{oauthConfig}</pre></div>
         <p className="oauth-help">Planbraid uses standard MCP and OAuth discovery. The connected client identifies its own provider, session, and optional model when it begins reporting work.</p>
-        <div className="connection-list"><h3>Connected apps <span>{oauthConnections.length}</span></h3>{oauthConnections.length ? oauthConnections.map((entry) => <div className="connection-row" key={entry.id}><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => void revokeOAuth(entry.id)} disabled={revokingOAuthId === entry.id}>{revokingOAuthId === entry.id ? "Revoking…" : "Revoke"}</button></div>) : <p className="oauth-help">No connected apps yet.</p>}</div>
+        <div className="connection-list"><h3>Connected apps <span>{oauthConnections.length}</span></h3>{oauthConnections.length ? oauthConnections.map((entry) => <div className="connection-row" key={entry.id}>{renamingId === entry.id
+          ? <form className="connection-rename" onSubmit={(event) => { event.preventDefault(); void renameOAuth(entry.id, renameDraft); }}><input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} maxLength={60} aria-label={`Rename ${entry.name}`} /><button type="submit">Save</button><button type="button" onClick={() => setRenamingId(null)}>Cancel</button></form>
+          : <><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => { setRenamingId(entry.id); setRenameDraft(entry.name); }}>Rename</button><button onClick={() => void revokeOAuth(entry.id)} disabled={revokingOAuthId === entry.id}>{revokingOAuthId === entry.id ? "Revoking…" : "Revoke"}</button></>}</div>) : <p className="oauth-help">No connected apps yet.</p>}</div>
       </section> : <section className="token-setup-card connection-panel" role="tabpanel">
         <header><span><span className="token-key">⌁</span><strong>Bearer token access</strong></span></header>
         <p>For clients without OAuth, create a personal token and send it in the <code>Authorization</code> header. The secret is shown only once.</p>
-        {token ? <><div className="token-box"><small>New token - copy it now</small><code>{token}</code><button onClick={() => copy("token", token, "Token copied")}>{copiedKey === "token" ? "Copied" : "Copy"}</button></div><div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("tokenConfig", tokenConfig, "Token MCP config copied")}>{copiedKey === "tokenConfig" ? "Copied" : "Copy config"}</button></span><pre>{tokenConfig}</pre></div></> : <button className="primary-wide" onClick={() => void generate()} disabled={busy}>{busy ? "Generating…" : `Generate access token for ${project?.name ?? "Planbraid"}`}</button>}
+        {token ? <><div className="token-box"><small>New token - copy it now</small><code>{token}</code><button onClick={() => copy("token", token, "Token copied")}>{copiedKey === "token" ? "Copied" : "Copy"}</button></div><div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("tokenConfig", tokenConfig, "Token MCP config copied")}>{copiedKey === "tokenConfig" ? "Copied" : "Copy config"}</button></span><pre>{tokenConfig}</pre></div></> : <><label className="agent-marker"><span>Name this connection <span className="label-optional">optional</span></span><input value={tokenName} onChange={(event) => setTokenName(event.target.value)} placeholder={`${project?.name ?? "Project"} coding agents`} maxLength={60} /><small>This name is what Planbraid shows against everything the connection records.</small></label>{markerField}<button className="primary-wide" onClick={() => void generate()} disabled={busy}>{busy ? "Generating…" : `Generate access token for ${project?.name ?? "Planbraid"}`}</button></>}
         <div className="connection-list"><h3>Active token connections <span>{connections.length}</span></h3>{connections.length ? connections.map((entry) => <div className="connection-row" key={entry.id}><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => void revoke(entry.id)} disabled={revokingId === entry.id}>{revokingId === entry.id ? "Revoking…" : "Revoke"}</button></div>) : <p className="oauth-help">No active bearer-token connections.</p>}</div>
       </section>}
       <div className="access-note"><strong>Network access required</strong><span>The MCP URL must be reachable by the agent without a hosting-level sign-in wall. Planbraid still protects every project request with OAuth or a bearer token.</span></div>
@@ -727,12 +780,13 @@ function ProviderIcon({ provider }: { provider: Provider | string }) {
   // the tight sizing built for an actual logo image.
   return <span className={`provider-icon ${key === "google" || logo ? key : "unknown"}`} role="img" aria-label={`${label} logo`} title={label}>{key === "google" ? <GoogleIcon /> : logo ? <img src={logo} alt="" aria-hidden="true" /> : <span className="provider-fallback" aria-hidden="true">◇</span>}</span>; // eslint-disable-line @next/next/no-img-element
 }
-/** Which model(s) proposed a task: one logo for a single provider, overlapping logos
- * when more than one independently proposed the same work. */
-function ProviderStack({ providers }: { providers: string[] }) {
-  const names = providers.map((provider) => labelFor(provider)).join(", ");
-  const title = providers.length > 1 ? `Also suggested by ${names}` : `Suggested by ${names}`;
-  return <span className="provider-stack" title={title}>{providers.map((provider) => <ProviderIcon key={provider} provider={provider} />)}</span>;
+/** Which agent account(s) proposed a task: one logo for a single proposer, overlapping
+ * logos when more than one did. Two logos can be the same model under two accounts, so
+ * the tooltip is what disambiguates, hence the account name rather than just the model. */
+function ProviderStack({ accounts, ambiguousFamilies }: { accounts: ProposingAccount[]; ambiguousFamilies: Set<string> }) {
+  const names = accounts.map((account) => accountName(account, ambiguousFamilies)).join(", ");
+  const title = accounts.length > 1 ? `Proposed by ${names}` : `Suggested by ${names}`;
+  return <span className="provider-stack" title={title}>{accounts.map((account) => <ProviderIcon key={account.accountId ?? account.family} provider={account.provider} />)}</span>;
 }
 function Assurance({ value }: { value: Source["assurance"] }) { return <span className={`assurance ${value}`} title={`Capture assurance: ${value}`}>{value === "enforced" ? "✓" : value === "observed" ? "◉" : value === "instructed" ? "↗" : "○"}</span>; }
 function Empty({ title, body, action, onAction, secondaryAction, onSecondaryAction }: { title: string; body: string; action?: string; onAction?: () => void; secondaryAction?: string; onSecondaryAction?: () => void }) { return <div className="empty-state"><span>☷</span><h3>{title}</h3><p>{body}</p><div className="empty-actions">{action && onAction && <button onClick={onAction}>{action}</button>}{secondaryAction && onSecondaryAction && <button className="secondary" onClick={onSecondaryAction}>{secondaryAction}</button>}</div></div>; }
