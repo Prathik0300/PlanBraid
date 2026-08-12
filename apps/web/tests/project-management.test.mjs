@@ -1,0 +1,86 @@
+/**
+ * Project creation and binding. These cover the gap that made a connected agent
+ * useless: a project created from the web UI has no directory, so nothing can match
+ * it to a repository until an agent binds its own absolute path with update_project.
+ */
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { executeCommand, loadDashboard } from "@/lib/store.ts";
+import { createTestDb } from "./support/local-pg.mjs";
+import { principal } from "./support/fixtures.mjs";
+
+/** Mirrors resolve_project's matcher in app/mcp/route.ts, which is what agents hit. */
+function resolve(projects, query) {
+  const needle = query.toLowerCase();
+  return projects.filter((project) => [project.name, project.directory, project.gitRemote ?? ""].some((value) => value.toLowerCase().includes(needle)));
+}
+
+async function projects(db) {
+  return (await loadDashboard(db, principal)).projects;
+}
+
+test("create_project persists a git remote so a repo-aware agent can match on it", async () => {
+  const db = await createTestDb();
+  await executeCommand(db, principal, { action: "create_project", name: "Remote Bound", gitRemote: "https://github.com/owner/repo", idempotencyKey: "p1" });
+
+  const [project] = await projects(db);
+  assert.equal(project.gitRemote, "https://github.com/owner/repo");
+  assert.equal(resolve(await projects(db), "github.com/owner/repo").length, 1);
+});
+
+test("a project created from the web UI has no directory and cannot be resolved by path", async () => {
+  const db = await createTestDb();
+  await executeCommand(db, principal, { action: "create_project", name: "Web Created", idempotencyKey: "p2" });
+
+  const [project] = await projects(db);
+  assert.equal(project.directory, "");
+  assert.equal(project.gitRemote, null);
+  assert.equal(resolve(await projects(db), "/Users/me/Projects/web-created").length, 0);
+});
+
+test("update_project binds an absolute working directory, making the project resolvable by path", async () => {
+  const db = await createTestDb();
+  const { projectId } = await executeCommand(db, principal, { action: "create_project", name: "Web Created", idempotencyKey: "p3" });
+
+  await executeCommand(db, principal, { action: "update_project", projectId, directory: "/Users/me/Projects/web-created", idempotencyKey: "u1" });
+
+  const matched = resolve(await projects(db), "/Users/me/Projects/web-created");
+  assert.equal(matched.length, 1);
+  assert.equal(matched[0].id, projectId);
+});
+
+test("update_project leaves fields it was not given alone", async () => {
+  const db = await createTestDb();
+  const { projectId } = await executeCommand(db, principal, { action: "create_project", name: "Keep My Name", description: "Set in the UI", idempotencyKey: "p4" });
+
+  // An agent binding only its directory must not blank out what a person typed.
+  await executeCommand(db, principal, { action: "update_project", projectId, directory: "/srv/keep", idempotencyKey: "u2" });
+
+  const [project] = await projects(db);
+  assert.equal(project.name, "Keep My Name");
+  assert.equal(project.description, "Set in the UI");
+  assert.equal(project.directory, "/srv/keep");
+});
+
+test("update_project rejects an explicitly empty name instead of silently clearing it", async () => {
+  const db = await createTestDb();
+  const { projectId } = await executeCommand(db, principal, { action: "create_project", name: "Named", idempotencyKey: "p5" });
+
+  await assert.rejects(
+    executeCommand(db, principal, { action: "update_project", projectId, name: "   ", idempotencyKey: "u3" }),
+    (error) => error.code === "VALIDATION_FAILED",
+  );
+  assert.equal((await projects(db))[0].name, "Named");
+});
+
+test("replaying the same update_project key returns the first result rather than bumping the revision again", async () => {
+  const db = await createTestDb();
+  const { projectId } = await executeCommand(db, principal, { action: "create_project", name: "Idempotent", idempotencyKey: "p6" });
+
+  const first = await executeCommand(db, principal, { action: "update_project", projectId, directory: "/srv/once", idempotencyKey: "u4" });
+  const replay = await executeCommand(db, principal, { action: "update_project", projectId, directory: "/srv/once", idempotencyKey: "u4" });
+
+  assert.equal(replay.projectRevision, first.projectRevision);
+  assert.equal(replay.idempotentReplay, true);
+});

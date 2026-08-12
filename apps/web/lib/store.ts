@@ -231,7 +231,7 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const now = new Date().toISOString();
     const response = { projectId, projectRevision: 1 };
     await commitMutation(db, [
-      db.prepare("INSERT INTO projects (id, organization_id, project_key, name, description, directory, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)").bind(projectId, organizationId, projectId, cleanName, command.description?.trim().slice(0, 2000) ?? "", command.directory?.trim().slice(0, 500) ?? "", now),
+      db.prepare("INSERT INTO projects (id, organization_id, project_key, name, description, directory, git_remote, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)").bind(projectId, organizationId, projectId, cleanName, command.description?.trim().slice(0, 2000) ?? "", command.directory?.trim().slice(0, 500) ?? "", command.gitRemote?.trim().slice(0, 500) || null, now),
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, 1, ?, 'project.created', ?, ?)").bind(id("evt"), organizationId, projectId, principal.displayName, `${principal.displayName} created ${cleanName}`, now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
@@ -242,6 +242,26 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   const currentRevision = number(project, "revision");
   const nextRevision = currentRevision + 1;
   const now = new Date().toISOString();
+
+  if (command.action === "update_project") {
+    // Every field is optional and COALESCE keeps the current value when one is omitted,
+    // so an agent binding only its working directory cannot blank out the name or
+    // description a person set in the UI.
+    const cleanName = command.name?.trim().slice(0, 120);
+    if (command.name !== undefined && !cleanName) throw domainError("VALIDATION_FAILED", "Project name cannot be empty");
+    const directory = command.directory?.trim().slice(0, 500);
+    const gitRemote = command.gitRemote?.trim().slice(0, 500);
+    const changed = [cleanName && "name", command.description !== undefined && "description", directory && "directory", gitRemote && "remote"].filter(Boolean).join(", ") || "details";
+    const response = { projectId: command.projectId, projectRevision: nextRevision };
+    await commitMutation(db, [
+      db.prepare("UPDATE projects SET name = COALESCE(?, name), description = COALESCE(?, description), directory = COALESCE(?, directory), git_remote = COALESCE(?, git_remote), revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?")
+        .bind(cleanName ?? null, command.description?.trim().slice(0, 2000) ?? null, directory ?? null, gitRemote ?? null, nextRevision, now, command.projectId, organizationId, currentRevision),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'project.updated', ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, nextRevision, principal.displayName, `${principal.displayName} updated ${changed}`, now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    return response;
+  }
 
   if (command.action === "create_item") {
     const cleanTitle = command.title.trim().slice(0, 240);

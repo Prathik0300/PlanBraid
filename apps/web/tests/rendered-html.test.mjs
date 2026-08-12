@@ -227,6 +227,16 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(mcp, /name: "create_project"/);
   assert.match(mcp, /action: "create_project"/);
   assert.match(app, /create the project from your MCP client/);
+  // Agents bind their own absolute path, since a browser can never report one.
+  assert.match(mcp, /name: "update_project"/);
+  // The create-project dialog silently did nothing when the name was empty, because the
+  // name lived in the unlabeled header search box and submit was `name.trim() && ...`.
+  // Keep it a real form with a labeled field and a visible error.
+  const projectForm = app.slice(app.indexOf("function CommandDialog"), app.indexOf("function SetupDialog"));
+  assert.match(projectForm, /<form className="project-form" onSubmit=/);
+  assert.match(projectForm, /<label>Project name/);
+  assert.match(projectForm, /className="field-error"/);
+  assert.doesNotMatch(projectForm, /Directory or repository/);
   assert.match(mcp, /Free-form client, agent, or provider name/);
   assert.match(contracts, /export type Provider = string/);
   assert.match(setup, /CREATE TABLE IF NOT EXISTS data_migrations/);

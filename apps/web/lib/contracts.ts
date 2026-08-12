@@ -116,7 +116,8 @@ export type DashboardState = {
 };
 
 export type Command =
-  | { action: "create_project"; name: string; directory?: string; description?: string; idempotencyKey: string }
+  | { action: "create_project"; name: string; directory?: string; description?: string; gitRemote?: string; idempotencyKey: string }
+  | { action: "update_project"; projectId: string; name?: string; description?: string; directory?: string; gitRemote?: string; idempotencyKey: string }
   | { action: "create_item"; projectId: string; title: string; description?: string; status?: WorkStatus; priority?: WorkItem["priority"]; sourceId?: string; contentFingerprint?: string; idempotencyKey: string }
   | { action: "update_item"; projectId: string; itemId: string; expectedVersion: number; title?: string; description?: string; priority?: WorkItem["priority"]; assignee?: string | null; idempotencyKey: string }
   | { action: "transition_item"; projectId: string; itemId: string; expectedVersion: number; status: WorkStatus; reason?: string; sourceId?: string; idempotencyKey: string }

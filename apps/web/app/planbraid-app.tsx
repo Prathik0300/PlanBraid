@@ -83,7 +83,9 @@ export function PlanbraidApp() {
   const [newUpdates, setNewUpdates] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<Theme>("dark");
-  const [commandOpen, setCommandOpen] = useState(false);
+  // Which pane the palette opens on: "New project" and the empty state go straight to
+  // the form rather than making people find "Create a new project" in a list first.
+  const [commandOpen, setCommandOpen] = useState<false | "search" | "project">(false);
   const [setupOpen, setSetupOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -152,7 +154,7 @@ export function PlanbraidApp() {
 
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setCommandOpen(true); }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setCommandOpen("search"); }
       if (event.key === "Escape") { setSelectedItemId(null); setCommandOpen(false); setSetupOpen(false); setProfileOpen(false); setSidebarOpen(false); }
     };
     window.addEventListener("keydown", onKey);
@@ -194,13 +196,13 @@ export function PlanbraidApp() {
 
   return (
     <main className={`app-shell ${sidebarOpen ? "sidebar-open" : ""}`}>
-      <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen(true)} onProfile={() => setProfileOpen(true)} />
+      <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} />
       <section className="workspace" aria-label="Unified project workspace">
         <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} sidebarOpen={sidebarOpen} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
         {project && view !== "inbox" && view !== "agents" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} />}
         {newUpdates > 0 && <button className="new-updates" onClick={() => { setNewUpdates(0); window.scrollTo({ top: 0, behavior: "smooth" }); }}>↑ {newUpdates} new {newUpdates === 1 ? "update" : "updates"}</button>}
         <div className="workspace-body">
-          {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen(true)} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
+          {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
           {project && view === "stream" && <Stream events={events} items={projectItems} sources={sources} onItem={setSelectedItemId} />}
           {project && view === "board" && <Board items={filteredItems} sources={sources} aliases={data?.aliases ?? []} dependencies={data?.dependencies ?? []} onItem={setSelectedItemId} onTransition={(item, status) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status, idempotencyKey: requestId("drag") }, `${item.itemKey} moved to ${statusMeta[status].label}`)} />}
           {project && view === "list" && <ListView items={filteredItems} sources={sources} onItem={setSelectedItemId} />}
@@ -210,7 +212,7 @@ export function PlanbraidApp() {
         {project && view !== "inbox" && view !== "agents" && <Composer project={project} sources={sources} busy={mutating} onCreate={(title, source) => void command({ action: "create_item", projectId, title, sourceId: source || undefined, status: "proposed", idempotencyKey: requestId("create") }, "Task added to the unified plan")} />}
       </section>
       {selectedItem && <TaskDrawer item={selectedItem} source={sources.find((entry) => entry.id === selectedItem.sourceId) ?? null} sources={sources} events={(data?.events ?? []).filter((event) => event.workItemId === selectedItem.id)} evidence={(data?.evidence ?? []).filter((entry) => entry.workItemId === selectedItem.id)} dependencies={(data?.dependencies ?? []).filter((entry) => entry.fromWorkItemId === selectedItem.id || entry.toWorkItemId === selectedItem.id)} aliases={(data?.aliases ?? []).filter((entry) => entry.workItemId === selectedItem.id)} allItems={projectItems} busy={mutating} close={() => setSelectedItemId(null)} transition={(status, reason) => void command({ action: "transition_item", projectId: selectedItem.projectId, itemId: selectedItem.id, expectedVersion: selectedItem.version, status, reason, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("transition") }, `${selectedItem.itemKey} is now ${statusMeta[status].label}`)} note={(summary) => void command({ action: "add_note", projectId: selectedItem.projectId, itemId: selectedItem.id, summary, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("note") }, "Progress recorded")} splitAlias={(aliasId) => void command({ action: "split_alias", projectId: selectedItem.projectId, aliasId, idempotencyKey: requestId("split") }, "Moved back into its own task")} />}
-      {commandOpen && <CommandDialog projects={data!.projects} currentProject={projectId} close={() => setCommandOpen(false)} create={(name, directory) => { void command({ action: "create_project", name, directory, idempotencyKey: requestId("project") }, "Project created"); setCommandOpen(false); }} />}
+      {commandOpen && <CommandDialog projects={data!.projects} currentProject={projectId} initialMode={commandOpen === "project" ? "project" : "search"} busy={mutating} close={() => setCommandOpen(false)} create={(input) => { void command({ action: "create_project", name: input.name, description: input.description || undefined, gitRemote: input.gitRemote || undefined, idempotencyKey: requestId("project") }, "Project created"); setCommandOpen(false); }} />}
       {setupOpen && <SetupDialog project={project} close={() => setSetupOpen(false)} toast={setToast} />}
       {profileOpen && <ProfileDialog viewer={data!.viewer} close={() => setProfileOpen(false)} />}
       {toast && <div className="toast" role="status">{toast}</div>}
@@ -389,7 +391,48 @@ function TaskDrawer({ item, source, sources, events, evidence, dependencies, ali
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><aside className="task-drawer" aria-label={`${item.itemKey} details`}><header className="drawer-header"><span className={`status-badge ${item.status}`}>{statusMeta[item.status].dot} {statusMeta[item.status].label}</span><button className="icon-button" onClick={close} aria-label="Close task">×</button></header><div className="drawer-title"><small>{item.itemKey} · v{item.version}</small><h2>{item.title}</h2><p>{item.description || "No description has been added yet."}</p>{corroboratedProviders.length > 1 && <p className="corroboration-banner">Proposed independently by {corroboratedProviders.map((provider) => providerLabel[provider] ?? provider).join(" and ")}.</p>}{anomaly && <p className="anomaly-banner">⚠ In progress, but {waitingOn.length ? `${waitingOn.map((entry) => entry.itemKey).join(", ")} is still unresolved` : "a prerequisite is still unresolved"}.</p>}</div><div className="drawer-fields"><label>Status<select value={item.status} disabled={busy} onChange={(event) => transition(event.target.value as WorkStatus, event.target.value === "blocked" ? "Blocked from task detail" : undefined)}>{Object.entries(statusMeta).map(([value, meta]) => <option value={value} key={value}>{meta.label}</option>)}</select></label><label>Priority<strong className={`priority-value ${item.priority}`}>{item.priority}</strong></label><label>Owner<strong>{item.assignee ?? "Unassigned"}</strong></label><label>Source<strong>{source ? <><ProviderIcon provider={source.provider} /> {providerLabel[source.provider]}</> : "Manual"}</strong></label></div><nav className="drawer-tabs"><button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button><button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity {events.length}</button><button className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>Evidence {evidence.length}</button></nav><div className="drawer-body">{tab === "overview" && <><section><h3>Completion</h3><div className="confidence"><span>{item.completionConfidence}</span><span>{item.verificationStatus}</span></div></section>{item.blockerReason && <section className="blocker-panel"><h3>Blocker</h3><p>{item.blockerReason}</p></section>}{waitingOn.length > 0 && <section className="blocker-panel"><h3>Waiting on</h3>{waitingOn.map((entry) => <p key={entry.id}><b>{entry.itemKey}</b> {entry.title} · {statusMeta[entry.status].label}</p>)}</section>}<section><h3>Dependencies</h3>{dependencies.length ? dependencies.map((edge) => { const linkedId = edge.fromWorkItemId === item.id ? edge.toWorkItemId : edge.fromWorkItemId; const linked = allItems.find((entry) => entry.id === linkedId); return <div className="dependency-row" key={edge.id}><span>{edge.type}</span><b>{linked?.itemKey}</b><p>{linked?.title}</p></div>; }) : <p className="muted">No dependencies.</p>}</section>{aliases.length > 0 && <section><h3>Also proposed</h3>{aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return <div className="alias-row" key={alias.id}><ProviderIcon provider={(aliasSource?.provider ?? "system") as Provider} /><span><strong>{alias.title}</strong><small>{providerLabel[aliasSource?.provider ?? ""] ?? "Another agent"} · {relative(alias.createdAt)} · {alias.matchReason}</small></span><button className="alias-split" disabled={busy} onClick={() => splitAlias(alias.id)}>Not the same, make separate task</button></div>; })}</section>}</>}{tab === "activity" && events.map((event) => <div className="mini-event" key={event.id}><ProviderIcon provider={(source?.provider ?? "system") as Provider}/><span><strong>{event.summary}</strong><small>{event.actorName} · {relative(event.createdAt)}</small></span></div>)}{tab === "evidence" && (evidence.length ? evidence.map((entry) => <div className="evidence-row" key={entry.id}><span>✓</span><span><strong>{entry.label}</strong><small>{entry.type} · {entry.result ?? "recorded"}</small></span></div>) : <p className="muted">No evidence attached yet.</p>)}</div><form className="drawer-note" onSubmit={(event) => { event.preventDefault(); if (!noteText.trim()) return; note(noteText.trim()); setNoteText(""); }}><input value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="Add a progress update…"/><button disabled={!noteText.trim() || busy}>Add</button></form></aside></div>;
 }
 
-function CommandDialog({ projects, currentProject, close, create }: { projects: Project[]; currentProject: string; close: () => void; create: (name: string, directory: string) => void }) { const [mode, setMode] = useState<"search" | "project">("search"); const [value, setValue] = useState(""); const [directory, setDirectory] = useState(""); return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><div className="command-dialog" role="dialog" aria-modal="true" aria-label="Command palette"><header><span>⌕</span><input autoFocus value={value} onChange={(event) => setValue(event.target.value)} placeholder={mode === "project" ? "Project name" : "Type a command or project…"}/><kbd>esc</kbd></header>{mode === "project" ? <div className="project-form"><label>Directory or repository<input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="/Projects/new-app"/></label><button onClick={() => value.trim() && create(value.trim(), directory.trim())}>Create project</button></div> : <div className="command-results"><button onClick={() => setMode("project")}><span>＋</span><b>Create a new project</b><small>Register a directory or initiative</small></button>{projects.map((project) => <a href={`/?project=${project.id}`} key={project.id} className={project.id === currentProject ? "current" : ""}><span className="project-glyph">{project.name[0]}</span><b>Open {project.name}</b><small>{project.directory || project.description}</small></a>)}</div>}</div></div>; }
+function CommandDialog({ projects, currentProject, initialMode = "search", busy, close, create }: { projects: Project[]; currentProject: string; initialMode?: "search" | "project"; busy: boolean; close: () => void; create: (input: { name: string; description: string; gitRemote: string }) => void }) {
+  const [mode, setMode] = useState<"search" | "project">(initialMode);
+  const [search, setSearch] = useState("");
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  function submit(event: React.FormEvent) {
+    event.preventDefault();
+    // Previously this was `name.trim() && create(...)`, so an empty name silently did
+    // nothing at all. Never fail silently: say what is missing.
+    if (!name.trim()) { setError("Give the project a name to continue."); return; }
+    create({ name: name.trim(), description: description.trim(), gitRemote: "" });
+  }
+
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <div className="command-dialog" role="dialog" aria-modal="true" aria-label={mode === "project" ? "Create a project" : "Command palette"}>
+      {mode === "project"
+        ? <>
+          <header className="dialog-heading"><strong>Create a project</strong><button type="button" className="icon-button" onClick={close} aria-label="Close">×</button></header>
+          <form className="project-form" onSubmit={submit}>
+            <label>Project name
+              <input autoFocus value={name} onChange={(event) => { setName(event.target.value); if (error) setError(null); }} placeholder="Planbraid" aria-invalid={error ? true : undefined} />
+            </label>
+            {error && <span className="field-error">{error}</span>}
+            <label><span className="label-row">Description <span className="label-optional">optional</span></span>
+              <input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What this project covers" />
+            </label>
+            <span className="field-hint">Connect an agent from this project and it binds its own folder automatically, so you never have to type a path.</span>
+            <button className="primary-wide" disabled={busy}>{busy ? "Creating…" : "Create project"}</button>
+          </form>
+        </>
+        : <>
+          <header><span>⌕</span><input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Type a command or project…" /><kbd>esc</kbd></header>
+          <div className="command-results">
+            <button onClick={() => setMode("project")}><span>＋</span><b>Create a new project</b><small>Track work across every connected agent</small></button>
+            {projects.filter((project) => !search.trim() || `${project.name} ${project.description} ${project.directory}`.toLowerCase().includes(search.trim().toLowerCase())).map((project) => <a href={`/?project=${project.id}`} key={project.id} className={project.id === currentProject ? "current" : ""}><span className="project-glyph">{project.name[0]}</span><b>Open {project.name}</b><small>{project.directory || project.description}</small></a>)}
+          </div>
+        </>}
+    </div>
+  </div>;
+}
 
 function SetupDialog({ project, close, toast }: { project: Project | null; close: () => void; toast: (message: string) => void }) {
   const [token, setToken] = useState("");
