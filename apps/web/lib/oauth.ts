@@ -487,18 +487,26 @@ function allowedMethods(pathname: string) { return pathname === "/authorize" ? "
 function consentPage(clientName: string, redirectUri: string, scopes: string[], requestId: string, principal: Principal) {
   const permissions = scopes.map((scope) => scope === "work:write" ? "Create, update, block, and complete todo items" : "View your projects, todo items, sources, and activity");
   const permissionItems = permissions.map((permission) => `<li><span>✓</span>${escapeHtml(permission)}</li>`).join("");
+  const redirectOrigin = new URL(redirectUri).origin;
   const redirectHost = new URL(redirectUri).host;
   const body = `<main><div class="brand"><img src="/planbraid-mark.png" alt="">Planbraid</div><section><small>CONNECT MCP CLIENT</small><h1>Allow ${escapeHtml(clientName)} to use Planbraid?</h1><p>This connection will act for <strong>${escapeHtml(principal.email)}</strong>. The authorization result returns to <strong>${escapeHtml(redirectHost)}</strong>.</p><ul>${permissionItems}</ul><div class="notice">Access tokens expire after one hour. You can disconnect the connector to revoke future access.</div><form method="post" action="/authorize"><input type="hidden" name="request_id" value="${escapeHtml(requestId)}"><button class="approve" name="decision" value="approve">Allow access</button><button class="deny" name="decision" value="deny">Cancel</button></form></section><footer>OAuth 2.1 · PKCE · scoped access · refresh rotation</footer></main>`;
-  return htmlDocument("Authorize Planbraid", body, 200);
+  // form-action must additionally allow the client's own (already-validated, registered)
+  // redirect_uri origin: submitting this form always ends by redirecting the browser
+  // there (approve or deny), and Chrome's form-action enforcement checks the entire
+  // navigation chain a form submission produces, not just the initial same-origin POST
+  // target — 'self' alone silently blocks the submission outright the moment the
+  // response is a redirect elsewhere, which is every real submission of this form.
+  return htmlDocument("Authorize Planbraid", body, 200, redirectOrigin);
 }
 
 function oauthHtml(title: string, message: string, status: number) {
   return htmlDocument(title, `<main><div class="brand"><img src="/planbraid-mark.png" alt="">Planbraid</div><section><small>OAUTH CONNECTION</small><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></section></main>`, status);
 }
 
-function htmlDocument(title: string, body: string, status: number) {
+function htmlDocument(title: string, body: string, status: number, extraFormActionOrigin?: string) {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>:root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#0d0f13;color:#eef1f5}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 0,#202634 0,transparent 42%),#0d0f13}main{width:min(520px,100%)}.brand{display:flex;align-items:center;gap:9px;margin:0 0 18px;color:#c9ced7;font-size:14px;font-weight:650}.brand img{width:32px;height:32px;object-fit:contain}section{padding:28px;border:1px solid #303641;border-radius:14px;background:#16191f;box-shadow:0 24px 70px #0008}small{color:#8eb1ff;font-size:10px;letter-spacing:.12em}h1{margin:10px 0 12px;font-size:24px;line-height:1.25}p{color:#aab0ba;font-size:14px;line-height:1.55}p strong{color:#e4e7ec}ul{list-style:none;margin:22px 0;padding:0;display:grid;gap:11px}li{display:flex;gap:10px;color:#cbd0d8;font-size:13px}li span{color:#69cb91}.notice{padding:11px;border-left:2px solid #657da9;background:#1b2029;color:#929aa7;font-size:12px;line-height:1.5}form{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:22px}button{height:42px;border-radius:8px;font-weight:650;cursor:pointer}.approve{border:1px solid #5578b5;background:#2e466e;color:#f2f6ff}.deny{border:1px solid #373d47;background:transparent;color:#b5bbc5}footer{text-align:center;margin-top:14px;color:#646c78;font-size:10px}@media(max-width:480px){section{padding:20px}form{grid-template-columns:1fr}}</style></head><body>${body}</body></html>`;
-  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8", ...noStoreHeaders(), "content-security-policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" } });
+  const formAction = extraFormActionOrigin ? `form-action 'self' ${extraFormActionOrigin}` : "form-action 'self'";
+  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8", ...noStoreHeaders(), "content-security-policy": `default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; ${formAction}; base-uri 'none'; frame-ancestors 'none'`, "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" } });
 }
 
 function escapeHtml(value: string) {
