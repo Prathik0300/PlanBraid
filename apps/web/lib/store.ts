@@ -168,7 +168,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     events: (events.results as Row[]).map(mapEvent),
     notifications: (notifications.results as Row[]).map(mapNotification),
     dependencies: (dependencies.results as Row[]).map((row) => ({ id: text(row, "id"), fromWorkItemId: text(row, "from_work_item_id"), toWorkItemId: text(row, "to_work_item_id"), type: text(row, "type"), reason: text(row, "reason") })),
-    evidence: (evidenceRows.results as Row[]).map((row) => ({ id: text(row, "id"), workItemId: text(row, "work_item_id"), type: text(row, "type"), label: text(row, "label"), uri: nullable(row, "uri"), result: nullable(row, "result"), createdAt: text(row, "created_at") })),
+    evidence: (evidenceRows.results as Row[]).map((row) => ({ id: text(row, "id"), workItemId: text(row, "work_item_id"), sourceId: nullable(row, "source_id"), type: text(row, "type"), label: text(row, "label"), uri: nullable(row, "uri"), result: nullable(row, "result"), createdAt: text(row, "created_at") })),
     aliases: (aliasRows.results as Row[]).map(mapAlias),
     serverTime: new Date().toISOString(),
   };
@@ -449,11 +449,17 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   if (command.action === "add_evidence") {
     const evidenceId = id("evd");
     const response = { evidenceId, itemId: command.itemId, projectRevision: nextRevision };
+    // Every other per-item command resolves the actor to the connected agent's provider
+    // name when a sourceId is given (see the `actor` pattern above); this one used to
+    // fall straight to principal.displayName, which for an MCP token connection is the
+    // generic "Connected agent" — so the event and evidence row carried no indication of
+    // which agent actually attached the evidence.
+    const actor = command.sourceId ? await sourceActor(db, organizationId, command.sourceId) : principal.displayName;
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("INSERT INTO evidence (id, organization_id, project_id, work_item_id, type, label, uri, result, source_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(evidenceId, organizationId, command.projectId, command.itemId, command.type.slice(0, 40), command.label.slice(0, 300), command.uri?.slice(0, 2000) ?? null, command.result?.slice(0, 500) ?? null, command.sourceId ?? null, now),
       db.prepare("UPDATE work_items SET completion_confidence = 'supported', version = version + 1, updated_at = ? WHERE id = ?").bind(now, command.itemId),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'evidence.attached', ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? null, principal.displayName, `${command.type}: ${command.label}`, JSON.stringify({ evidenceId }), now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'evidence.attached', ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? null, actor, `${actor} attached ${command.type} evidence: ${command.label}`, JSON.stringify({ evidenceId }), now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
     return response;

@@ -146,13 +146,23 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(app, /window\.matchMedia\("\(max-width: 900px\)"\)\.matches/);
   assert.match(app, /settleSidebarAfterSelection\(\)/);
   assert.match(app, /open \? "open" : "collapsed"/);
-  assert.match(app, /open && <><span className="planbraid-logo"/);
-  assert.match(app, /sidebarOpen=\{sidebarOpen\}/);
+  // The logo is always visible in the rail, collapsed or open; only the wordmark and the
+  // rest of the rail's content hide behind `open`, per the collapsed-rail redesign.
+  assert.match(sidebar, /<span className="planbraid-logo" aria-hidden="true" \/>/);
+  assert.match(sidebar, /\{open && <strong>Planbraid<\/strong>\}/);
+  assert.match(app, /open=\{sidebarOpen\}/);
   const header = app.slice(app.indexOf("function Header"), app.indexOf("function ProfileDialog"));
-  assert.match(header, /!sidebarOpen && <span className="workspace-brand"/);
-  assert.match(header, /className="planbraid-logo"/);
+  // The header used to duplicate the rail's logo/wordmark when the sidebar was collapsed;
+  // that duplication is gone, so the header carries no brand mark of its own at all.
+  assert.doesNotMatch(header, /workspace-brand/);
+  assert.doesNotMatch(header, /className="planbraid-logo"/);
   assert.doesNotMatch(header, /project-glyph large|\?\? "P"/);
-  assert.match(app, /className="hamburger-icon"/);
+  // Collapsed: an arrow below the logo (points right, to expand). Open: an arrow beside
+  // the wordmark (points left, to collapse) — replacing the old hamburger glyph.
+  assert.match(app, /className="icon-button sidebar-toggle collapsed-toggle"/);
+  assert.match(app, /<ArrowIcon direction="right" \/>/);
+  assert.match(app, /<ArrowIcon direction="left" \/>/);
+  assert.doesNotMatch(app, /hamburger-icon/);
   assert.match(css, /\.app-shell\s*\{[^}]*grid-template-columns:\s*var\(--rail-closed\)\s+minmax\(0,\s*1fr\)/);
   assert.match(css, /\.app-shell\.sidebar-open/);
   assert.match(css, /\.project-rail\.collapsed \.rail-brand/);
@@ -170,7 +180,12 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(css, /:root\[data-theme="light"\] \.status-badge\.in_progress/);
   assert.match(css, /:root\[data-theme="light"\] \.status-badge\.blocked/);
   assert.match(css, /:root\[data-theme="light"\] \.status-badge\.done/);
-  assert.match(css, /:root\[data-theme="light"\] \.filter-scroll span/);
+  // Count-badge pill styling (filter-bar and board-column counts) uses the theme
+  // variables directly rather than a separate light-theme-only override, so both
+  // themes get the same centered pill instead of dark mode rendering bare digits.
+  assert.match(css, /\.filter-scroll span \{[^}]*background: var\(--panel-3\)/);
+  assert.match(css, /\.board-column > header b \{[^}]*background: var\(--panel-3\)/);
+  assert.doesNotMatch(css, /:root\[data-theme="light"\] \.filter-scroll span/);
   assert.match(css, /:root\[data-theme="light"\] \.notification-priority/);
   assert.match(css, /:root\[data-theme="light"\] \.confidence span/);
   assert.match(css, /:root\[data-theme="light"\] \.setup-button/);

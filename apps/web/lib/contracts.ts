@@ -109,7 +109,7 @@ export type DashboardState = {
   events: WorkEvent[];
   notifications: Notification[];
   dependencies: Array<{ id: string; fromWorkItemId: string; toWorkItemId: string; type: string; reason: string }>;
-  evidence: Array<{ id: string; workItemId: string; type: string; label: string; uri: string | null; result: string | null; createdAt: string }>;
+  evidence: Array<{ id: string; workItemId: string; sourceId: string | null; type: string; label: string; uri: string | null; result: string | null; createdAt: string }>;
   /** Restatements from other proposals that were matched into a work item instead of creating a duplicate. */
   aliases: Array<{ id: string; workItemId: string; title: string; description: string; sourceId: string | null; matchMethod: string; matchReason: string; createdAt: string }>;
   serverTime: string;
