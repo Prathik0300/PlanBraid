@@ -23,6 +23,16 @@ export function AuthScreen() {
   const [message, setMessage] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [googleEnabled, setGoogleEnabled] = useState(false);
+  // Starts "dark" to match server-rendered markup exactly (hydration would otherwise
+  // mismatch on this toggle's own className/aria-checked, which do render during the
+  // very first paint, unlike PlanbraidApp's - see planbraid-app.tsx's initialTheme).
+  // The real <html data-theme> attribute is never touched here: the blocking script in
+  // layout.tsx already set it correctly before this component even mounted. Deferring
+  // this correction to requestAnimationFrame and never re-writing the DOM attribute
+  // from it is deliberate - an earlier version wrote `document.documentElement.dataset
+  // .theme = theme` on every mount, which fired with this still-default "dark" value
+  // before the correction below landed, overwriting a correct light theme with dark
+  // for one visible frame on every sign-in page load.
   const [theme, setTheme] = useState<"dark" | "light">("dark");
 
   useEffect(() => {
@@ -32,8 +42,6 @@ export function AuthScreen() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, []);
-
-  useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);

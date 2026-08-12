@@ -37,6 +37,16 @@ export async function generateMetadata(): Promise<Metadata> {
   };
 }
 
+/**
+ * Sets data-theme before the browser paints anything, using the exact same rule
+ * PlanbraidApp's effect uses (planbraid-app.tsx). Without this, <html> has no
+ * data-theme attribute until React mounts and that effect runs, so :root's dark
+ * defaults render first regardless of the saved preference - a light-theme user
+ * sees a dark loading screen flash before it corrects itself. A blocking inline
+ * script in <head> is the only point early enough to prevent that first paint.
+ */
+const THEME_INIT_SCRIPT = `(function(){try{var s=localStorage.getItem("planbraid-theme")||localStorage.getItem("relayboard-theme");var t=(s==="dark"||s==="light")?s:(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");document.documentElement.dataset.theme=t;}catch(e){}})();`;
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -44,6 +54,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body
         suppressHydrationWarning
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}

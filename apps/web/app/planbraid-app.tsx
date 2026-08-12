@@ -56,6 +56,17 @@ const providerLogo: Record<string, BundledLogo> = {
 
 function requestId(prefix = "ui") { return `${prefix}-${crypto.randomUUID()}`; }
 
+/** Reads the theme the blocking script in layout.tsx already stamped on <html> before
+ * hydration, so this component's first render agrees with what actually painted
+ * instead of assuming "dark" and correcting itself a moment later. Server-rendered
+ * HTML has no document, so it falls back to "dark" there - <html> already carries
+ * suppressHydrationWarning for exactly this client/server difference. */
+function initialTheme(): Theme {
+  if (typeof document === "undefined") return "dark";
+  const attr = document.documentElement.dataset.theme;
+  return attr === "light" || attr === "dark" ? attr : "dark";
+}
+
 type ProposingAccount = { provider: string; family: string; accountId: string | null; accountLabel: string | null };
 
 /**
@@ -142,7 +153,7 @@ export function PlanbraidApp() {
   const [statusFilter, setStatusFilter] = useState<WorkStatus | "all">("all");
   const [newUpdates, setNewUpdates] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [theme, setTheme] = useState<Theme>("dark");
+  const [theme, setTheme] = useState<Theme>(initialTheme);
   // Which pane the palette opens on: "New project" and the empty state go straight to
   // the form rather than making people find "Create a new project" in a list first.
   const [commandOpen, setCommandOpen] = useState<false | "search" | "project">(false);
@@ -186,11 +197,17 @@ export function PlanbraidApp() {
     return () => { window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onFocus); };
   }, [refresh]);
 
-  useEffect(() => {
-    const saved = window.localStorage.getItem("planbraid-theme") ?? window.localStorage.getItem("relayboard-theme");
-    setTheme(saved === "dark" || saved === "light" ? saved : window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
-  }, []);
-
+  // theme's own useState initializer (below) already reads the value the blocking
+  // script in layout.tsx set on <html> before hydration, so there is nothing left to
+  // correct here on mount. There used to be: a two-effect "read saved value, then
+  // write it back" dance where the write effect's first run fired with the hardcoded
+  // "dark" default (effects run with the render's own state, not a later setState's
+  // result), overwriting a saved "light" preference in localStorage with "dark" before
+  // the read effect's correction landed. Usually invisible because the very next
+  // commit wrote the correct value straight back - except under React's development
+  // Strict Mode double-invoke, where the second mount's read effect read back the
+  // already-corrupted "dark" and locked it in. This effect still exists to persist
+  // theme when the user actually toggles it.
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("planbraid-theme", theme);
