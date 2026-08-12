@@ -8,5 +8,5 @@ export async function GET() {
 }
 
 export async function POST() {
-  return new Response("form submitted ok via POST", { headers: { "content-type": "text/plain", "content-security-policy": csp } });
+  return Response.redirect("https://example.com/callback?code=test123", 302);
 }
