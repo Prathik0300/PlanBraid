@@ -100,6 +100,11 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .provider-icon { width: 20px; height: 20px; border-radius: 5px; display: inline-grid; place-items: center; flex: 0 0 auto; overflow: hidden; padding: 2px; font-size: 12px; font-weight: 760; border: 1px solid #ffffff16; background: #f3f4f6; color: #252a32; }
 .provider-icon img { width: 100%; height: 100%; display: block; object-fit: contain; }
 .provider-icon.codex { padding: 0; border-color: #7a9dff55; background: #151827; }.provider-icon.claude, .provider-icon.anthropic { background: #fff8f2; }.provider-icon.gemini { background: #fff; }.provider-icon.copilot, .provider-icon.github_copilot { background: #0f1726; }.provider-icon.openai, .provider-icon.chatgpt, .provider-icon.cursor, .provider-icon.windsurf { background: #fff; }.provider-icon.human { background: #416a58; color: #fff; }.provider-icon.system { background: #404650; color: #fff; }.provider-fallback { font-size: .8em; line-height: 1; }
+/* An agent whose provider string matched no known logo family still gets a deliberate
+   badge rather than a shrunken copy of a "found a logo" icon: no padding eating into the
+   glyph, and the diamond itself scaled up since it's the only content the badge has. */
+.provider-icon.unknown { padding: 0; background: var(--panel-3); border-color: var(--line); color: var(--muted); }
+.provider-icon.unknown .provider-fallback { font-size: 1.4em; line-height: 1; }
 .assurance { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; color: var(--faint); font-size: 12px; }.assurance.enforced { color: var(--green); background: #65c38d12; }.assurance.observed { color: var(--blue); }.assurance.instructed { color: var(--orange); }
 .capture-summary { border-top: 1px solid var(--line-soft); min-height: 58px; padding: 9px 12px; display: flex; gap: 9px; align-items: center; }.capture-summary > span:last-child { display: flex; flex-direction: column; gap: 2px; }.capture-summary strong { font-size: 12px; }.capture-summary small { font-size: 12px; }.capture-icon { width: 27px; height: 27px; border-radius: 7px; background: #1d2930; color: var(--green); display: grid; place-items: center; }
 

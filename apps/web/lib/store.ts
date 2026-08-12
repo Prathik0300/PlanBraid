@@ -435,7 +435,7 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   if (command.action === "add_note") {
     const summary = command.summary.trim().slice(0, 2000);
     if (!summary) throw domainError("VALIDATION_FAILED", "Progress update is required");
-    const actor = command.sourceId ? await sourceActor(db, organizationId, command.sourceId) : principal.displayName;
+    const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
     const response = { itemId: command.itemId, version: number(item, "version") + 1, projectRevision: nextRevision };
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
@@ -449,12 +449,11 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   if (command.action === "add_evidence") {
     const evidenceId = id("evd");
     const response = { evidenceId, itemId: command.itemId, projectRevision: nextRevision };
-    // Every other per-item command resolves the actor to the connected agent's provider
-    // name when a sourceId is given (see the `actor` pattern above); this one used to
-    // fall straight to principal.displayName, which for an MCP token connection is the
-    // generic "Connected agent" — so the event and evidence row carried no indication of
-    // which agent actually attached the evidence.
-    const actor = command.sourceId ? await sourceActor(db, organizationId, command.sourceId) : principal.displayName;
+    // report_completion's evidence array frequently omits source_id even when the same
+    // call's summary note includes it, so falling back to the work item's own bound
+    // source (rather than jumping straight to the generic principal display name) is
+    // what actually resolves "Connected agent attached evidence" to the real agent.
+    const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("INSERT INTO evidence (id, organization_id, project_id, work_item_id, type, label, uri, result, source_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(evidenceId, organizationId, command.projectId, command.itemId, command.type.slice(0, 40), command.label.slice(0, 300), command.uri?.slice(0, 2000) ?? null, command.result?.slice(0, 500) ?? null, command.sourceId ?? null, now),
@@ -485,7 +484,7 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
 
   const currentStatus = text(item, "status") as WorkStatus;
   if (!ALLOWED_TRANSITIONS[currentStatus].includes(command.status) && currentStatus !== command.status) throw domainError("INVALID_TRANSITION", `Cannot move ${itemKey} from ${currentStatus} to ${command.status}`, 422, { allowed: ALLOWED_TRANSITIONS[currentStatus] });
-  const actor = command.sourceId ? await sourceActor(db, organizationId, command.sourceId) : principal.displayName;
+  const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
   const blockerReason = command.status === "blocked" ? command.reason?.trim().slice(0, 2000) || "Blocked without a reason" : null;
   const startedAt = command.status === "in_progress" && !item.started_at ? now : nullable(item, "started_at");
   const completedAt = command.status === "done" ? now : command.status === "in_progress" || command.status === "ready" ? null : nullable(item, "completed_at");
@@ -590,6 +589,18 @@ async function sourceActor(db: PgD1, organizationId: string, sourceId: string) {
   const row = await db.prepare("SELECT provider FROM sources WHERE id = ? AND organization_id = ?").bind(sourceId, organizationId).first<{ provider: string }>();
   if (!row) throw domainError("NOT_FOUND", "Source not found", 404);
   return row.provider.charAt(0).toUpperCase() + row.provider.slice(1);
+}
+
+/**
+ * Not every per-item tool call on a given turn repeats source_id (report_completion's
+ * evidence array in particular often omits it), which used to fall straight to
+ * principal.displayName - the generic "Connected agent" for any MCP token connection.
+ * The work item itself already knows which agent is behind it, so fall back to that
+ * before giving up and admitting we don't know who's acting.
+ */
+async function resolveActor(db: PgD1, organizationId: string, principal: Principal, sourceId: string | null | undefined, itemSourceId: string | null | undefined) {
+  const effective = sourceId ?? itemSourceId;
+  return effective ? sourceActor(db, organizationId, effective) : principal.displayName;
 }
 
 function transitionEvent(status: WorkStatus) {
