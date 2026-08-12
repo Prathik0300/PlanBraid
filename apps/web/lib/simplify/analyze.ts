@@ -1,0 +1,303 @@
+/**
+ * The structural half of "Simplify the plan".
+ *
+ * Pure functions over a project's items and dependency edges: no database, no clock
+ * passed implicitly, no network, so every rule here is directly testable — the same
+ * reason lib/dedup/match.ts is written this way, and for the same stakes, since these
+ * findings propose archiving work somebody typed.
+ *
+ * Nothing here decides anything on its own. Each finding carries the exact Command that
+ * would apply it, and a person (or a corroborating agent) decides whether it runs.
+ */
+
+import type { Command, WorkItem, DashboardState } from "@/lib/contracts";
+import { adjudicate, explain, type Candidate } from "@/lib/dedup/match.ts";
+import { buildSignature, type TaskSignature } from "@/lib/dedup/signature.ts";
+import { DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
+import { isStartedWhileBlocked } from "@/lib/graph/column.ts";
+
+export type FindingKind =
+  | "duplicate" | "possible_duplicate" | "redundant_done"
+  | "blocked_chain" | "cycle" | "started_while_blocked" | "stale" | "do_first";
+
+export type Finding = {
+  kind: FindingKind;
+  /** Stable within a run, so the same finding reported twice is one row with two
+   * agreeing authors rather than two rows. */
+  dedupeKey: string;
+  workItemId: string;
+  relatedWorkItemId?: string;
+  verdict: "certain" | "possible" | "informational";
+  /** One line naming what was found. */
+  reason: string;
+  /** Supporting text: the chain, the other title, the age. */
+  detail: string;
+  /** Present only when there is something to apply; informational findings have none. */
+  proposedCommand?: Command;
+};
+
+type Dependencies = DashboardState["dependencies"];
+
+/** Items a merge may target: still open, and not already archived. */
+const OPEN_STATUSES = new Set(["proposed", "planned", "ready", "blocked"]);
+const RESOLVED_STATUSES = new Set(["done", "cancelled"]);
+
+/** Days after which an untouched proposal is worth a second look. */
+const STALE_DAYS = 21;
+
+function signatureOf(item: WorkItem): TaskSignature {
+  return buildSignature(item.title, item.description);
+}
+
+function toCandidate(item: WorkItem, signature: TaskSignature): Candidate {
+  // fingerprintValue is null on purpose: fingerprint() is async (WebCrypto) and the
+  // identical-signature case is already covered by comparing `normalized` directly
+  // below, which keeps this whole module synchronous and trivially testable.
+  return { id: item.id, itemKey: item.itemKey, title: item.title, status: item.status, updatedAt: item.updatedAt, signature, fingerprintValue: null };
+}
+
+/** Deterministic ordering so the same project always yields the same winner. Older
+ * items win: they are the ones history, dependencies, and agents already reference. */
+function mergeOrder(a: WorkItem, b: WorkItem) {
+  return a.sequence - b.sequence;
+}
+
+function pairKey(kind: string, a: string, b: string) {
+  return [kind, ...[a, b].sort()].join(":");
+}
+
+/** "#1, #2 and #3" rather than "#1 and #2 and #3". */
+function listOf(values: string[]) {
+  if (values.length <= 1) return values.join("");
+  return `${values.slice(0, -1).join(", ")} and ${values[values.length - 1]}`;
+}
+
+/**
+ * Pairwise duplicate detection across open work, reusing the adjudication cascade the
+ * write path already trusts — including its vetoes, which is the point: "rate limit
+ * /api/login" and "rate limit /api/signup" must keep coming back distinct here too.
+ */
+export function findDuplicates(items: WorkItem[]): Finding[] {
+  const open = items.filter((item) => !RESOLVED_STATUSES.has(item.status)).sort(mergeOrder);
+  const signatures = new Map(items.map((item) => [item.id, signatureOf(item)]));
+  const findings: Finding[] = [];
+  const merged = new Set<string>();
+
+  for (let i = 0; i < open.length; i += 1) {
+    for (let j = i + 1; j < open.length; j += 1) {
+      const winner = open[i];
+      const loser = open[j];
+      // A task already slated to merge away must not also anchor another merge, or
+      // applying both would target an archived item.
+      if (merged.has(loser.id) || merged.has(winner.id)) continue;
+      const left = signatures.get(loser.id)!;
+      const right = signatures.get(winner.id)!;
+      const identical = left.normalized === right.normalized;
+      const decision = identical
+        ? { verdict: "duplicate" as const, score: 1, method: "fingerprint" as const, reason: "Identical normalized task signature" }
+        : adjudicate({ signature: left, fingerprintValue: "" }, toCandidate(winner, right));
+      if (decision.verdict === "distinct") continue;
+
+      const certain = decision.verdict === "duplicate";
+      if (certain) merged.add(loser.id);
+      findings.push({
+        kind: certain ? "duplicate" : "possible_duplicate",
+        dedupeKey: pairKey(certain ? "duplicate" : "possible_duplicate", winner.id, loser.id),
+        workItemId: loser.id,
+        relatedWorkItemId: winner.id,
+        verdict: certain ? "certain" : "possible",
+        reason: certain
+          ? `${loser.itemKey} restates ${winner.itemKey}`
+          : `${loser.itemKey} may restate ${winner.itemKey}`,
+        detail: explain({ ...decision, candidate: toCandidate(winner, right) }),
+        proposedCommand: {
+          action: "merge_items", projectId: loser.projectId, winnerItemId: winner.id, loserItemId: loser.id,
+          reason: `${decision.reason} as ${winner.itemKey}`, idempotencyKey: `simplify-merge-${loser.id}`,
+        },
+      });
+    }
+  }
+  return findings;
+}
+
+/**
+ * Open work that restates something already finished. Never proposed as a merge: the
+ * finished item is not where new work belongs, and reopening it is a different decision
+ * than collapsing a duplicate, so this reports and lets a person choose.
+ */
+export function findRedundantAgainstDone(items: WorkItem[]): Finding[] {
+  const open = items.filter((item) => OPEN_STATUSES.has(item.status));
+  const resolved = items.filter((item) => RESOLVED_STATUSES.has(item.status));
+  const signatures = new Map(items.map((item) => [item.id, signatureOf(item)]));
+  const findings: Finding[] = [];
+
+  for (const item of open) {
+    for (const finished of resolved) {
+      const left = signatures.get(item.id)!;
+      const right = signatures.get(finished.id)!;
+      const decision = left.normalized === right.normalized
+        ? { verdict: "duplicate" as const, score: 1, method: "fingerprint" as const, reason: "Identical normalized task signature" }
+        : adjudicate({ signature: left, fingerprintValue: "" }, toCandidate(finished, right));
+      if (decision.verdict !== "duplicate") continue;
+      findings.push({
+        kind: "redundant_done",
+        dedupeKey: pairKey("redundant_done", item.id, finished.id),
+        workItemId: item.id,
+        relatedWorkItemId: finished.id,
+        verdict: "possible",
+        reason: `${item.itemKey} repeats ${finished.itemKey}, which is already ${finished.status}`,
+        detail: explain({ ...decision, candidate: toCandidate(finished, right) }),
+        proposedCommand: {
+          action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version,
+          status: "cancelled", reason: `Already covered by ${finished.itemKey}`, idempotencyKey: `simplify-cancel-${item.id}`,
+        },
+      });
+      break;
+    }
+  }
+  return findings;
+}
+
+/** Prerequisite edges only, as an adjacency map. Annotation edges never imply order. */
+function prerequisiteMap(dependencies: Dependencies) {
+  const dagTypes: readonly string[] = DAG_EDGE_TYPES;
+  const map = new Map<string, string[]>();
+  for (const edge of dependencies) {
+    if (!dagTypes.includes(edge.type)) continue;
+    map.set(edge.toWorkItemId, [...(map.get(edge.toWorkItemId) ?? []), edge.fromWorkItemId]);
+  }
+  return map;
+}
+
+/**
+ * Names every hop a blocked item is waiting on, not just the count the board already
+ * shows. "#20 waits on #19, which waits on #18" is what tells you where to actually
+ * start; "blocked by 1" does not.
+ */
+export function findBlockedChains(items: WorkItem[], dependencies: Dependencies): Finding[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const prerequisites = prerequisiteMap(dependencies);
+  const findings: Finding[] = [];
+
+  for (const item of items) {
+    if (RESOLVED_STATUSES.has(item.status) || item.blockingCount === 0) continue;
+    const chain: string[] = [];
+    const seen = new Set<string>([item.id]);
+    let cursor = item.id;
+    // Follow the first unresolved prerequisite down to the root. Cycles are reported
+    // separately; `seen` only stops this walk from running forever.
+    for (let depth = 0; depth < 20; depth += 1) {
+      const next = (prerequisites.get(cursor) ?? [])
+        .map((id) => byId.get(id))
+        .find((entry) => entry && !RESOLVED_STATUSES.has(entry.status) && !seen.has(entry.id));
+      if (!next) break;
+      chain.push(next.itemKey);
+      seen.add(next.id);
+      cursor = next.id;
+    }
+    if (!chain.length) continue;
+    const root = chain[chain.length - 1];
+    findings.push({
+      kind: "blocked_chain",
+      dedupeKey: `blocked_chain:${item.id}`,
+      workItemId: item.id,
+      verdict: "informational",
+      reason: `${item.itemKey} is waiting on ${chain.join(", then ")}`,
+      detail: chain.length > 1
+        ? `Start with ${root}: nothing above it can move until it does.`
+        : `${root} is the only thing in the way.`,
+    });
+  }
+  return findings;
+}
+
+/**
+ * Ordering cycles among stored edges. add_dependency refuses to create one, but edges
+ * predating that check, or created either side of a merge, can still form one - and a
+ * cycle means every item in it is permanently blocked with no root to start from.
+ */
+export function findCycles(items: WorkItem[], dependencies: Dependencies): Finding[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const prerequisites = prerequisiteMap(dependencies);
+  const findings: Finding[] = [];
+  const reported = new Set<string>();
+
+  for (const item of items) {
+    const path: string[] = [];
+    const onPath = new Set<string>();
+    const walk = (id: string): string[] | null => {
+      if (onPath.has(id)) return [...path.slice(path.indexOf(id)), id];
+      if (path.length > 40) return null;
+      onPath.add(id);
+      path.push(id);
+      for (const prerequisite of prerequisites.get(id) ?? []) {
+        const found = walk(prerequisite);
+        if (found) return found;
+      }
+      path.pop();
+      onPath.delete(id);
+      return null;
+    };
+    const cycle = walk(item.id);
+    if (!cycle) continue;
+    const key = [...new Set(cycle)].sort().join("|");
+    if (reported.has(key)) continue;
+    reported.add(key);
+    const keys = cycle.map((id) => byId.get(id)?.itemKey ?? id);
+    findings.push({
+      kind: "cycle",
+      dedupeKey: `cycle:${key}`,
+      workItemId: item.id,
+      verdict: "certain",
+      reason: `${listOf(keys.slice(0, -1))} block each other`,
+      detail: `${keys.join(" needs ")}. Remove one of these dependencies or none of them can start.`,
+    });
+  }
+  return findings;
+}
+
+/** In progress while the graph still says a prerequisite is unresolved. */
+export function findAnomalies(items: WorkItem[]): Finding[] {
+  return items.filter((item) => isStartedWhileBlocked(item)).map((item) => ({
+    kind: "started_while_blocked" as const,
+    dedupeKey: `started_while_blocked:${item.id}`,
+    workItemId: item.id,
+    verdict: "informational" as const,
+    reason: `${item.itemKey} is in progress with an unresolved prerequisite`,
+    detail: "Either a dependency was added after work started, or a prerequisite was reopened.",
+  }));
+}
+
+/** Proposals nobody has touched in weeks. `now` is a parameter so this stays pure. */
+export function findStale(items: WorkItem[], now: number): Finding[] {
+  const cutoff = now - STALE_DAYS * 24 * 60 * 60 * 1000;
+  return items
+    .filter((item) => item.status === "proposed" && new Date(item.updatedAt).getTime() < cutoff)
+    .map((item) => ({
+      kind: "stale" as const,
+      dedupeKey: `stale:${item.id}`,
+      workItemId: item.id,
+      verdict: "informational" as const,
+      reason: `${item.itemKey} has sat untriaged for over ${STALE_DAYS} days`,
+      detail: `Last updated ${new Date(item.updatedAt).toLocaleDateString()}. Plan it, or cancel it so it stops counting as work.`,
+    }));
+}
+
+/**
+ * The whole structural pass. "Do first" is deliberately absent: getReadyWork already
+ * ranks actionable work and needs the database, so lib/store.ts folds its result in
+ * rather than this module growing a second, drifting ranking.
+ */
+export function analyzeProject(input: { items: WorkItem[]; dependencies: Dependencies; now?: number }): Finding[] {
+  // Finished work is passed through rather than filtered out: findRedundantAgainstDone
+  // exists precisely to compare open work against it.
+  const items = input.items;
+  return [
+    ...findDuplicates(items),
+    ...findRedundantAgainstDone(items),
+    ...findCycles(items, input.dependencies),
+    ...findBlockedChains(items, input.dependencies),
+    ...findAnomalies(items),
+    ...findStale(items, input.now ?? Date.now()),
+  ];
+}

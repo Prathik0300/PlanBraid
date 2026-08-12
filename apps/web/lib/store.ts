@@ -425,6 +425,26 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     ).bind(command.aliasId, organizationId, command.projectId).first<Row>();
     if (!alias) throw domainError("NOT_FOUND", "Alias not found", 404);
     const cleanTitle = text(alias, "title").trim().slice(0, 240) || "Untitled task";
+    // An alias created by a merge still points at the item it archived, so undoing that
+    // merge restores the original task and its key rather than leaving a renumbered
+    // copy next to the history that references the old one.
+    const archivedItemId = nullable(alias, "archived_work_item_id");
+    if (archivedItemId) {
+      const archived = await db.prepare("SELECT id, item_key FROM work_items WHERE id = ? AND project_id = ? AND organization_id = ? AND archived_at IS NOT NULL").bind(archivedItemId, command.projectId, organizationId).first<{ id: string; item_key: string }>();
+      if (archived) {
+        const restored = { itemId: archived.id, itemKey: archived.item_key, version: 1, projectRevision: nextRevision, splitFromWorkItemId: text(alias, "work_item_id"), restored: true };
+        await commitMutation(db, [
+          db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?").bind(nextRevision, now, command.projectId, organizationId, currentRevision),
+          db.prepare("UPDATE work_items SET archived_at = NULL, version = version + 1, updated_at = ? WHERE id = ? AND organization_id = ?").bind(now, archived.id, organizationId),
+          db.prepare("DELETE FROM work_item_aliases WHERE id = ? AND organization_id = ?").bind(command.aliasId, organizationId),
+          db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.split_from_alias', ?, ?, ?)")
+            .bind(id("evt"), organizationId, command.projectId, nextRevision, archived.id, nullable(alias, "source_id"), principal.displayName, `${principal.displayName} restored ${archived.item_key} out of ${text(alias, "target_item_key")}`, JSON.stringify({ splitFromWorkItemId: text(alias, "work_item_id"), splitFromItemKey: text(alias, "target_item_key"), restored: true }), now),
+          db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(restored)),
+        ]);
+        await recomputeBlockingCounts(db, organizationId, command.projectId);
+        return restored;
+      }
+    }
     const max = await db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM work_items WHERE project_id = ?").bind(command.projectId).first<{ sequence: number }>();
     const sequence = Number(max?.sequence ?? 0) + 1;
     const itemId = id("wi");
@@ -439,6 +459,52 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.split_from_alias', ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, itemId, aliasSourceId, principal.displayName, `${principal.displayName} split "${cleanTitle}" out from ${targetItemKey} as ${itemKey}`, JSON.stringify({ splitFromWorkItemId: text(alias, "work_item_id"), splitFromItemKey: targetItemKey }), now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
+    return response;
+  }
+
+  if (command.action === "merge_items") {
+    if (command.winnerItemId === command.loserItemId) throw domainError("VALIDATION_FAILED", "A task cannot be merged into itself");
+    const [winnerRow, loserRow] = await db.batch([
+      db.prepare("SELECT * FROM work_items WHERE id = ? AND project_id = ? AND organization_id = ? AND archived_at IS NULL").bind(command.winnerItemId, command.projectId, organizationId),
+      db.prepare("SELECT * FROM work_items WHERE id = ? AND project_id = ? AND organization_id = ? AND archived_at IS NULL").bind(command.loserItemId, command.projectId, organizationId),
+    ]);
+    const winner = winnerRow.results[0] as Row | undefined;
+    const loser = loserRow.results[0] as Row | undefined;
+    if (!winner || !loser) throw domainError("NOT_FOUND", "Task not found", 404);
+    // Collapsing work somebody actually started would hide real history behind another
+    // task's status. Those stay separate and get cancelled deliberately instead.
+    if (["in_progress", "in_review", "done"].includes(text(loser, "status"))) {
+      throw domainError("VALIDATION_FAILED", `${text(loser, "item_key")} has already been worked on and cannot be merged away`, 422, { status: text(loser, "status") });
+    }
+    const winnerKey = text(winner, "item_key");
+    const loserKey = text(loser, "item_key");
+    const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(loser, "source_id"));
+    const reason = command.reason?.trim().slice(0, 500) || `Merged ${loserKey} into ${winnerKey}`;
+    const response = { winnerItemId: command.winnerItemId, loserItemId: command.loserItemId, itemKey: winnerKey, projectRevision: nextRevision };
+    await commitMutation(db, [
+      db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?").bind(nextRevision, now, command.projectId, organizationId, currentRevision),
+      // Edges between the two would become self-edges, and edges the winner already has
+      // would trip dependencies' UNIQUE(from, to, type). Both are dropped before the
+      // move rather than after, so the UPDATE below can never fail.
+      db.prepare("DELETE FROM dependencies WHERE project_id = ? AND ((from_work_item_id = ? AND to_work_item_id = ?) OR (from_work_item_id = ? AND to_work_item_id = ?))").bind(command.projectId, command.loserItemId, command.winnerItemId, command.winnerItemId, command.loserItemId),
+      db.prepare("DELETE FROM dependencies d WHERE d.project_id = ? AND d.from_work_item_id = ? AND EXISTS (SELECT 1 FROM dependencies e WHERE e.from_work_item_id = ? AND e.to_work_item_id = d.to_work_item_id AND e.type = d.type)").bind(command.projectId, command.loserItemId, command.winnerItemId),
+      db.prepare("DELETE FROM dependencies d WHERE d.project_id = ? AND d.to_work_item_id = ? AND EXISTS (SELECT 1 FROM dependencies e WHERE e.to_work_item_id = ? AND e.from_work_item_id = d.from_work_item_id AND e.type = d.type)").bind(command.projectId, command.loserItemId, command.winnerItemId),
+      db.prepare("UPDATE dependencies SET from_work_item_id = ? WHERE from_work_item_id = ? AND project_id = ?").bind(command.winnerItemId, command.loserItemId, command.projectId),
+      db.prepare("UPDATE dependencies SET to_work_item_id = ? WHERE to_work_item_id = ? AND project_id = ?").bind(command.winnerItemId, command.loserItemId, command.projectId),
+      // The loser's own corroboration history moves with it, so merging does not discard
+      // the agents that had independently proposed it.
+      db.prepare("UPDATE work_item_aliases SET work_item_id = ? WHERE work_item_id = ? AND organization_id = ?").bind(command.winnerItemId, command.loserItemId, organizationId),
+      db.prepare(
+        "INSERT INTO work_item_aliases (id, organization_id, project_id, work_item_id, title, description, source_id, match_score, match_method, match_reason, archived_work_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'merge', ?, ?)",
+      ).bind(id("als"), organizationId, command.projectId, command.winnerItemId, text(loser, "title"), text(loser, "description"), nullable(loser, "source_id"), reason, command.loserItemId),
+      db.prepare("UPDATE work_items SET archived_at = ?, updated_at = ? WHERE id = ? AND organization_id = ?").bind(now, now, command.loserItemId, organizationId),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.merged', ?, ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, nextRevision, command.winnerItemId, command.sourceId ?? nullable(loser, "source_id"), actor, `${actor} merged ${loserKey} into ${winnerKey}: ${text(loser, "title")}`, JSON.stringify({ loserItemId: command.loserItemId, loserItemKey: loserKey, reason }), now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    // Moving edges changes who blocks whom; recompute rather than trying to track the
+    // delta through three conditional deletes and two moves.
+    await recomputeBlockingCounts(db, organizationId, command.projectId);
     return response;
   }
 
@@ -594,7 +660,7 @@ export async function recomputeBlockingCounts(db: PgD1, organizationId: string, 
     `UPDATE work_items SET blocking_count = (
        SELECT COUNT(*) FROM dependencies d
          JOIN work_items u ON u.id = d.from_work_item_id
-        WHERE d.to_work_item_id = work_items.id AND d.type IN (${DAG_EDGE_TYPE_SQL_LIST}) AND u.status NOT IN ('done', 'cancelled')
+        WHERE d.to_work_item_id = work_items.id AND d.type IN (${DAG_EDGE_TYPE_SQL_LIST}) AND u.status NOT IN ('done', 'cancelled') AND u.archived_at IS NULL
      )
      WHERE project_id = ? AND organization_id = ?`,
   ).bind(...DAG_EDGE_TYPES, projectId, organizationId).run();

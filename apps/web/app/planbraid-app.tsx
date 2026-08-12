@@ -26,6 +26,9 @@ type CommandResult = { projectId?: string; status?: "created" | "matched" | "unc
 type GithubStatus = { connected: boolean; login: string | null; configured: boolean };
 type GithubRepo = { id: number; name: string; fullName: string; description: string; htmlUrl: string; cloneUrl: string; private: boolean; updatedAt: string };
 type BundledLogo = string | { src: string };
+type FindingKind = "duplicate" | "possible_duplicate" | "redundant_done" | "blocked_chain" | "cycle" | "started_while_blocked" | "stale" | "do_first";
+type SimplifyFinding = { id: string; kind: FindingKind; workItemId: string; relatedWorkItemId?: string; verdict: "certain" | "possible" | "informational"; reason: string; detail: string; proposedCommand?: unknown; origin: string; agreedBy: string[]; status: "open" | "applied" | "dismissed" };
+type SimplifyRun = { id: string; projectId: string; status: string; requestedBy: string; createdAt: string; findings: SimplifyFinding[] };
 
 /** GitHub's mark, inlined so the picker needs no network request to render. */
 function GithubMark() {
@@ -145,6 +148,9 @@ export function PlanbraidApp() {
   const [commandOpen, setCommandOpen] = useState<false | "search" | "project">(false);
   const [setupOpen, setSetupOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [simplifyRun, setSimplifyRun] = useState<SimplifyRun | null>(null);
+  const [simplifying, setSimplifying] = useState(false);
+  const [applyingFinding, setApplyingFinding] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [mutating, setMutating] = useState(false);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -246,6 +252,31 @@ export function PlanbraidApp() {
     finally { setMutating(false); }
   }
 
+  async function runSimplify() {
+    setSimplifying(true);
+    try {
+      const response = await fetch("/api/simplify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId }) });
+      const body = await response.json() as { data?: SimplifyRun; error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not review this plan");
+      setSimplifyRun(body.data ?? null);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not review this plan"); setTimeout(() => setToast(null), 4000); }
+    finally { setSimplifying(false); }
+  }
+
+  async function resolveFinding(findingId: string, action: "apply" | "dismiss") {
+    setApplyingFinding(findingId);
+    try {
+      const response = await fetch("/api/simplify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ findingId, action }) });
+      const body = await response.json() as { error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not apply this");
+      // Drop it from the open list locally so the panel reacts immediately, then refresh
+      // the board underneath it.
+      setSimplifyRun((current) => current ? { ...current, findings: current.findings.map((finding) => finding.id === findingId ? { ...finding, status: action === "apply" ? "applied" : "dismissed" } : finding) } : current);
+      if (action === "apply") await refresh(true);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not apply this"); setTimeout(() => setToast(null), 4000); }
+    finally { setApplyingFinding(null); }
+  }
+
   function settleSidebarAfterSelection() {
     if (window.matchMedia("(max-width: 900px)").matches) setSidebarOpen(false);
   }
@@ -258,7 +289,7 @@ export function PlanbraidApp() {
       <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} />
       <section className="workspace" aria-label="Unified project workspace">
         <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
-        {project && view !== "inbox" && view !== "agents" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} />}
+        {project && view !== "inbox" && view !== "agents" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} />}
         {newUpdates > 0 && <button className="new-updates" onClick={() => { setNewUpdates(0); window.scrollTo({ top: 0, behavior: "smooth" }); }}>↑ {newUpdates} new {newUpdates === 1 ? "update" : "updates"}</button>}
         <div className="workspace-body">
           {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
@@ -285,6 +316,7 @@ export function PlanbraidApp() {
       }} />}
       {setupOpen && <SetupDialog project={project} close={() => setSetupOpen(false)} toast={setToast} />}
       {profileOpen && <ProfileDialog viewer={data!.viewer} close={() => setProfileOpen(false)} />}
+      {simplifyRun && <SimplifyPanel run={simplifyRun} busy={applyingFinding} close={() => setSimplifyRun(null)} onApply={(findingId) => void resolveFinding(findingId, "apply")} onDismiss={(findingId) => void resolveFinding(findingId, "dismiss")} />}
       {toast && <div className="toast" role="status">{toast}</div>}
       {project && <nav className="mobile-nav" aria-label="Mobile navigation">
         <button className={view === "stream" ? "active" : ""} onClick={() => setView("stream")}>Activity</button><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>Board</button><button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>Inbox{unread ? ` · ${unread}` : ""}</button><button className={view === "agents" ? "active" : ""} onClick={() => setView("agents")}>Agents</button>
@@ -426,9 +458,11 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
   </section></div>;
 }
 
-function FilterBar({ items, filter, setFilter, source, clearSource }: { items: WorkItem[]; filter: WorkStatus | "all"; setFilter: (status: WorkStatus | "all") => void; source: Source | null; clearSource: () => void }) {
+function FilterBar({ items, filter, setFilter, source, clearSource, onSimplify, simplifying }: { items: WorkItem[]; filter: WorkStatus | "all"; setFilter: (status: WorkStatus | "all") => void; source: Source | null; clearSource: () => void; onSimplify: () => void; simplifying: boolean }) {
   const statuses: Array<WorkStatus | "all"> = ["all", "in_progress", "ready", "blocked", "in_review", "done"];
-  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}</div>;
+  // Simplify is the rightmost control, so it owns the margin-left:auto that used to sit
+  // on .source-filter; the source chip now just trails the status filters.
+  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}<button className="simplify-button" onClick={onSimplify} disabled={simplifying || !items.length} title="Find duplicates, blocked chains, and what to do first">{simplifying ? "Reviewing…" : "Simplify"}</button></div>;
 }
 
 function Stream({ events, items, sources, onItem }: { events: WorkEvent[]; items: WorkItem[]; sources: Source[]; onItem: (id: string) => void }) {
@@ -472,6 +506,47 @@ function ListView({ items, sources, aliases, onItem }: { items: WorkItem[]; sour
     const corroboration = corroboratingProviders(item, aliases.filter((alias) => alias.workItemId === item.id), sources);
     return <button className="list-row" key={item.id} onClick={() => onItem(item.id)}><span className="list-title"><span className={`priority ${item.priority}`} /><b>{item.itemKey}</b><strong>{item.title}</strong></span><span className={`status-badge ${column}`}>{statusMeta[column].dot} {statusMeta[column].label}</span><span>{source ? <><ProviderIcon provider={source.provider} /> {sourceName(source, ambiguousFamilies)}</> : "Manual"}</span><span>{corroboration.length > 0 ? <ProviderStack accounts={corroboration} ambiguousFamilies={ambiguousFamilies} /> : <span className="muted">·</span>}</span><span>{relative(item.updatedAt)}</span></button>;
   })}</div>;
+}
+
+/** Grouped in the order a person would act on them: things to collapse, then things
+ * blocking progress, then what to start. Informational kinds carry no Apply button
+ * because there is nothing safe to do automatically about them. */
+const findingGroups: Array<{ kinds: FindingKind[]; title: string; blurb: string }> = [
+  { kinds: ["duplicate", "possible_duplicate"], title: "Duplicates", blurb: "The same work written twice. Merging keeps the older task and files the other under it." },
+  { kinds: ["redundant_done"], title: "Already covered", blurb: "Open work that repeats something finished." },
+  { kinds: ["cycle"], title: "Circular dependencies", blurb: "These wait on each other, so none of them can start." },
+  { kinds: ["blocked_chain"], title: "Blocked chains", blurb: "What each blocked task is actually waiting on." },
+  { kinds: ["do_first"], title: "Start here", blurb: "Unblocked work that frees the most once it lands." },
+  { kinds: ["started_while_blocked", "stale"], title: "Worth a look", blurb: "Not wrong, but not right either." },
+];
+
+function SimplifyPanel({ run, busy, close, onApply, onDismiss }: { run: SimplifyRun; busy: string | null; close: () => void; onApply: (findingId: string) => void; onDismiss: (findingId: string) => void }) {
+  const open = run.findings.filter((finding) => finding.status === "open");
+  const actionable = open.filter((finding) => finding.proposedCommand);
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <section className="simplify-dialog" role="dialog" aria-modal="true" aria-labelledby="simplify-title">
+      <header><div><span className="eyebrow">PLAN REVIEW</span><h2 id="simplify-title">Simplify the plan</h2><p>{open.length ? `${open.length} thing${open.length === 1 ? "" : "s"} worth looking at. Nothing changes until you apply it.` : "Nothing to collapse or reorder - this plan already reads cleanly."}</p></div><button className="icon-button" onClick={close} aria-label="Close plan review">×</button></header>
+      <div className="simplify-body">
+        {findingGroups.map((group) => {
+          const found = open.filter((finding) => group.kinds.includes(finding.kind));
+          if (!found.length) return null;
+          return <section className="simplify-group" key={group.title}>
+            <h3>{group.title} <span>{found.length}</span></h3>
+            <p className="simplify-blurb">{group.blurb}</p>
+            {found.map((finding) => <article className={`simplify-finding ${finding.verdict}`} key={finding.id}>
+              <div><strong>{finding.reason}</strong><small>{finding.detail}</small></div>
+              {finding.proposedCommand ? <span className="simplify-actions">
+                <button className="simplify-apply" disabled={busy === finding.id} onClick={() => onApply(finding.id)}>{busy === finding.id ? "Applying…" : finding.kind === "redundant_done" ? "Cancel it" : "Merge"}</button>
+                <button className="simplify-dismiss" disabled={busy === finding.id} onClick={() => onDismiss(finding.id)}>Keep both</button>
+              </span> : null}
+            </article>)}
+          </section>;
+        })}
+        {!open.length && <Empty title="Nothing to simplify" body="No duplicates, cycles, or stalled work were found in this project." />}
+      </div>
+      {actionable.length > 0 && <footer className="simplify-footer"><small>{actionable.length} of these can be applied. Every merge is reversible from the task it was filed under.</small></footer>}
+    </section>
+  </div>;
 }
 
 function Inbox({ notifications, onOpen, onResolve }: { notifications: Notification[]; onOpen: (notification: Notification) => void; onResolve: (notification: Notification) => void }) {

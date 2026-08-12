@@ -122,7 +122,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .notification-button { position: relative; font-size: 17px; }.notification-button b { position: absolute; right: -2px; top: -3px; min-width: 15px; height: 15px; padding: 0 3px; border-radius: 8px; background: var(--red); color: #1a0d0f; display: grid; place-items: center; font-size: 12px; }
 .setup-button { height: 30px; border: 1px solid #4d608a; background: #28344d; color: #dbe5ff; border-radius: 6px; padding: 0 10px; font-size: 12px; }.setup-button:hover { background: #334160; }
 .view-tabs { height: 40px; flex: 0 0 40px; border-bottom: 1px solid var(--line-soft); padding: 0 16px; display: flex; align-items: center; gap: 5px; background: var(--panel); }.view-tabs button { border: 0; background: transparent; color: var(--muted); height: 30px; padding: 0 10px; border-radius: 6px; font-size: 12px; display: flex; align-items: center; gap: 6px; }.view-tabs button:hover { color: var(--text); background: var(--hover); }.view-tabs button.active { color: var(--text); background: var(--panel-3); }.view-tabs button b { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; display: grid; place-items: center; background: #54343a; color: #f5b3b6; font-size: 12px; }
-.filter-bar { min-height: 43px; flex: 0 0 43px; border-bottom: 1px solid var(--line-soft); padding: 6px 15px; display: flex; align-items: center; gap: 10px; background: #101318; }.filter-scroll { display: flex; gap: 4px; min-width: 0; overflow-x: auto; }.filter-scroll button, .source-filter { white-space: nowrap; height: 27px; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; padding: 0 8px; font-size: 12px; display: flex; align-items: center; gap: 6px; }.filter-scroll button:hover, .filter-scroll button.active { background: var(--panel-3); color: var(--text); border-color: var(--line); }.filter-scroll span { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel-3); color: var(--faint); font-weight: 500; }.source-filter { margin-left: auto; border-color: var(--line); background: var(--panel-2); max-width: 220px; overflow: hidden; text-overflow: ellipsis; }.source-filter .provider-icon { width: 16px; height: 16px; font-size: 7px; }
+.filter-bar { min-height: 43px; flex: 0 0 43px; border-bottom: 1px solid var(--line-soft); padding: 6px 15px; display: flex; align-items: center; gap: 10px; background: #101318; }.filter-scroll { display: flex; gap: 4px; min-width: 0; overflow-x: auto; }.filter-scroll button, .source-filter { white-space: nowrap; height: 27px; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; padding: 0 8px; font-size: 12px; display: flex; align-items: center; gap: 6px; }.filter-scroll button:hover, .filter-scroll button.active { background: var(--panel-3); color: var(--text); border-color: var(--line); }.filter-scroll span { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel-3); color: var(--faint); font-weight: 500; }.source-filter { margin-left: auto; border-color: var(--line); background: var(--panel-2); max-width: 220px; overflow: hidden; text-overflow: ellipsis; }.filter-bar .simplify-button { margin-left: auto; flex: 0 0 auto; height: 27px; padding: 0 11px; border-radius: 6px; border: 1px solid #4d608a; background: #28344d; color: var(--text); font-size: 12px; white-space: nowrap; }.filter-bar .source-filter + .simplify-button { margin-left: 8px; }.filter-bar .simplify-button:hover:not(:disabled) { background: #32405e; }.filter-bar .simplify-button:disabled { opacity: .5; }.source-filter .provider-icon { width: 16px; height: 16px; font-size: 7px; }
 .workspace-body { min-height: 0; flex: 1; overflow: auto; position: relative; }.new-updates { z-index: 5; position: absolute; top: 148px; left: 50%; transform: translateX(-50%); border: 1px solid #4d608a; background: #28344d; border-radius: 15px; padding: 6px 12px; font-size: 12px; box-shadow: 0 6px 20px #0007; }
 
 .stream { max-width: 1100px; margin: 0 auto; padding: 14px 28px 90px; display: flex; flex-direction: column; gap: 8px; }.day-separator { height: 38px; display: flex; align-items: center; gap: 10px; color: var(--faint); font-size: 12px; }.day-separator::before, .day-separator::after { content: ""; height: 1px; background: var(--line-soft); flex: 1; }.day-separator span { padding: 0 5px; }
@@ -479,3 +479,31 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
   .profile-actions { align-items:flex-start; flex-direction:column; }.profile-actions small { max-width:270px; }
   .password-setup { grid-template-columns:1fr; }.password-setup > strong,.password-setup > p,.password-setup > button { grid-column:auto; }
 }
+
+/* Plan review. A dialog rather than a drawer because findings are read top to bottom
+   and grouped, which needs the width the task drawer deliberately does not have. */
+.simplify-dialog { position: relative; z-index: 31; margin: auto; width: min(680px, 94vw); max-height: 86vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 24px 70px #0009; overflow: hidden; }
+.simplify-dialog > header { display: flex; align-items: start; gap: 10px; padding: 18px 18px 14px; border-bottom: 1px solid var(--line); }
+.simplify-dialog > header > div { flex: 1; }
+.simplify-dialog h2 { margin: 4px 0 6px; font-size: 18px; }
+.simplify-dialog > header p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.simplify-body { padding: 4px 18px 18px; overflow-y: auto; }
+.simplify-group { margin-top: 18px; }
+.simplify-group h3 { display: flex; align-items: center; gap: 7px; margin: 0 0 3px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); }
+.simplify-group h3 span { min-width: 18px; height: 18px; display: inline-grid; place-items: center; padding: 0 5px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel-3); color: var(--muted); font-size: 12px; letter-spacing: 0; }
+.simplify-blurb { margin: 0 0 9px; color: var(--faint); font-size: 12px; line-height: 1.45; }
+.simplify-finding { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); margin-bottom: 6px; }
+.simplify-finding > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.simplify-finding strong { font-size: 12px; font-weight: 560; }
+.simplify-finding small { color: var(--muted); font-size: 12px; line-height: 1.45; }
+/* A certain duplicate is the only kind safe to collapse without reading twice, so it is
+   the only one the border calls out. */
+.simplify-finding.certain { border-color: #38563f; background: #17231b; }
+.simplify-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.simplify-actions button { height: 27px; padding: 0 9px; border-radius: 6px; font-size: 12px; white-space: nowrap; }
+.simplify-apply { border: 1px solid #4d608a; background: #28344d; color: var(--text); }
+.simplify-dismiss { border: 1px solid var(--line); background: transparent; color: var(--muted); }
+.simplify-actions button:disabled { opacity: .55; }
+.simplify-footer { padding: 12px 18px; border-top: 1px solid var(--line); background: var(--panel-2); }
+.simplify-footer small { color: var(--faint); font-size: 12px; }
+:root[data-theme="light"] .simplify-finding.certain { border-color:#bfe0c8; background:#f1faf3; }

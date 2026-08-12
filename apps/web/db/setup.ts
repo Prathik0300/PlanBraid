@@ -65,6 +65,17 @@ export const SCHEMA_STATEMENTS = [
   // call sites would need a filter forever. Provenance is preserved either way.
   `CREATE TABLE IF NOT EXISTS work_item_aliases (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, work_item_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', source_id TEXT, interaction_id TEXT, match_score REAL NOT NULL DEFAULT 0, match_method TEXT NOT NULL DEFAULT 'fingerprint', match_reason TEXT NOT NULL DEFAULT '', confirmed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
   `CREATE INDEX IF NOT EXISTS idx_aliases_item ON work_item_aliases(work_item_id, created_at)`,
+  // One press of Simplify. Findings persist rather than being computed and thrown away
+  // so that a connected agent can attach its own to the same run, and so that applying
+  // one is auditable after the fact.
+  `CREATE TABLE IF NOT EXISTS simplification_runs (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', requested_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+  `CREATE INDEX IF NOT EXISTS idx_simplification_runs_project ON simplification_runs(project_id, created_at)`,
+  // proposed_command is a lib/contracts.ts Command, so applying a finding runs the same
+  // executeCommand path as everything else instead of a second write path that could
+  // drift from it. agreed_by accumulates the agents that independently reported the
+  // same finding, mirroring how work items accumulate corroborating providers.
+  `CREATE TABLE IF NOT EXISTS simplification_findings (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, kind TEXT NOT NULL, work_item_id TEXT, related_work_item_id TEXT, verdict TEXT NOT NULL DEFAULT 'possible', reason TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', proposed_command TEXT, origin TEXT NOT NULL DEFAULT 'matcher', agreed_by TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'open', dedupe_key TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(run_id, dedupe_key))`,
+  `CREATE INDEX IF NOT EXISTS idx_simplification_findings_run ON simplification_findings(run_id, created_at)`,
 ] as const;
 
 /**
@@ -90,6 +101,10 @@ export const MIGRATION_STATEMENTS = [
   // self-registers under the same client_name, so renaming the client would rename
   // every connection made from that client at once.
   `ALTER TABLE oauth_token_families ADD COLUMN IF NOT EXISTS label TEXT`,
+  // The item a merge archived. split_alias restores that exact item (and its key)
+  // instead of minting a new one, so undoing a wrong merge returns the board to where
+  // it was rather than leaving a differently-numbered copy behind.
+  `ALTER TABLE work_item_aliases ADD COLUMN IF NOT EXISTS archived_work_item_id TEXT`,
 ] as const;
 
 let initialized = false;

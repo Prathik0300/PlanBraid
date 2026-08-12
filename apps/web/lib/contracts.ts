@@ -130,4 +130,5 @@ export type Command =
   | { action: "add_evidence"; projectId: string; itemId: string; type: string; label: string; uri?: string; result?: string; sourceId?: string; idempotencyKey: string }
   | { action: "add_dependency"; projectId: string; fromWorkItemId: string; toWorkItemId: string; type?: string; reason?: string; sourceId?: string; idempotencyKey: string }
   | { action: "split_alias"; projectId: string; aliasId: string; idempotencyKey: string }
+  | { action: "merge_items"; projectId: string; winnerItemId: string; loserItemId: string; reason?: string; sourceId?: string; idempotencyKey: string }
   | { action: "mark_notification"; notificationId: string; read?: boolean; resolved?: boolean; idempotencyKey: string };
