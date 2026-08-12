@@ -2,7 +2,7 @@ import { waitUntil } from "@vercel/functions";
 import type { PgD1 } from "@/db/pg-d1";
 import { ensureSchema } from "@/db/setup";
 import type { DashboardState, WorkStatus } from "@/lib/contracts";
-import { createWorkItemsDeduplicated, executeCommand, getReadyWork, loadDashboard, principalFromBearer, recordInteraction, registerSourceSession, updateSourceHeartbeat, type Principal } from "@/lib/store";
+import { createWorkItemsDeduplicated, executeCommand, findMatchingProject, getReadyWork, loadDashboard, organizationFor, principalFromBearer, recordInteraction, registerSourceSession, updateSourceHeartbeat, type Principal } from "@/lib/store";
 import { ANNOTATION_EDGE_TYPES, DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
 import { dispatchNotification, type PushEnvironment } from "@/lib/push";
 import { oauthChallenge } from "@/lib/oauth";
@@ -17,8 +17,8 @@ type Json = Record<string, unknown>;
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18"];
 
 const tools = [
-  { name: "resolve_project", description: "Resolve a canonical Planbraid project from an explicit ID, repository path, remote, or name. Call this before planning when project identity is uncertain.", inputSchema: { type: "object", properties: { project_id: { type: "string" }, query: { type: "string" } } } },
-  { name: "create_project", description: "Create a Planbraid project, optionally bound to the repository or directory it tracks. Always call resolve_project first: if it returns a match, use that project instead of creating a second one for the same work.", inputSchema: { type: "object", required: ["name", "idempotency_key"], properties: { name: { type: "string" }, directory: { type: "string", description: "Absolute path of the repository or working directory this project tracks, for example /Users/you/Projects/my-app." }, description: { type: "string" }, git_remote: { type: "string", description: "Canonical remote URL, for example https://github.com/owner/repo." }, idempotency_key: { type: "string" } } } },
+  { name: "resolve_project", description: "Resolve the canonical Planbraid project for the work at hand. Always call this first, passing this session's absolute working directory and the repository's git remote when you have them: those identify a project exactly, while a name alone can miss and lead to a duplicate.", inputSchema: { type: "object", properties: { project_id: { type: "string" }, query: { type: "string" }, directory: { type: "string", description: "Absolute path of the current working directory." }, git_remote: { type: "string", description: "The repository's origin remote, in any form; git@ and .git spellings are normalized." } } } },
+  { name: "create_project", description: "Create a Planbraid project for a repository or initiative. Pass directory and git_remote whenever you have them: proposals are matched against existing projects first, so calling this for a repository someone already set up in the web UI returns that project (status 'matched') rather than creating a duplicate. Check the returned status and use the returned project_id either way.", inputSchema: { type: "object", required: ["name", "idempotency_key"], properties: { name: { type: "string" }, directory: { type: "string", description: "Absolute path of the repository or working directory this project tracks, for example /Users/you/Projects/my-app." }, description: { type: "string" }, git_remote: { type: "string", description: "Canonical remote URL, for example https://github.com/owner/repo." }, idempotency_key: { type: "string" } } } },
   { name: "update_project", description: "Update a project's details. Use this to bind your absolute working directory to a project that was created in the web UI without one: a project with no directory cannot be matched to this repository by future sessions. Omitted fields are left unchanged.", inputSchema: { type: "object", required: ["project_id", "idempotency_key"], properties: { project_id: { type: "string" }, name: { type: "string" }, description: { type: "string" }, directory: { type: "string", description: "Absolute path of the working directory this project tracks." }, git_remote: { type: "string" }, idempotency_key: { type: "string" } } } },
   { name: "get_project_brief", description: "Get compact current project context: active, ready, blocked, review, recent events, sources, and recommended next actions.", inputSchema: { type: "object", required: ["project_id"], properties: { project_id: { type: "string" }, focus: { type: "string" } } } },
   { name: "list_work_items", description: "List current project work with structured status/source filters.", inputSchema: { type: "object", required: ["project_id"], properties: { project_id: { type: "string" }, status: { type: "string" }, source_id: { type: "string" }, query: { type: "string" }, limit: { type: "number" } } } },
@@ -106,9 +106,20 @@ async function callTool(db: PgD1, principal: Principal, name: string, args: Json
   if (name === "resolve_project") {
     const data = await state();
     const explicit = args.project_id ? data.projects.find((project) => project.id === args.project_id) : null;
+    if (explicit) return { project: explicit, confidence: "exact" };
+
+    // Identity first: a remote or working directory pins one project exactly, and a
+    // bare query string can miss it (".git" suffixes, name casing) and mislead an agent
+    // into creating a duplicate.
+    const strong = await findMatchingProject(db, await organizationFor(db, principal), { directory: optional(args, "directory"), gitRemote: optional(args, "git_remote") });
+    if (strong) {
+      const project = data.projects.find((entry) => entry.id === strong.id);
+      if (project) return { project, confidence: "exact", matchedOn: strong.matchedOn };
+    }
+
     const query = String(args.query ?? "").toLowerCase();
-    const matches = explicit ? [explicit] : data.projects.filter((project) => !query || [project.name, project.directory, project.gitRemote ?? ""].some((value) => value.toLowerCase().includes(query)));
-    return matches.length === 1 ? { project: matches[0], confidence: explicit ? "exact" : "matched" } : { matches, ambiguous: matches.length !== 1 };
+    const matches = data.projects.filter((project) => !query || [project.name, project.directory, project.gitRemote ?? ""].some((value) => value.toLowerCase().includes(query)));
+    return matches.length === 1 ? { project: matches[0], confidence: "matched" } : { matches, ambiguous: matches.length !== 1 };
   }
   if (name === "create_project") {
     return executeCommand(db, principal, { action: "create_project", name: required(args, "name"), directory: optional(args, "directory"), description: optional(args, "description"), gitRemote: optional(args, "git_remote"), idempotencyKey: required(args, "idempotency_key") });

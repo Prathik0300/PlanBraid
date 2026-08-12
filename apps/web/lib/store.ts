@@ -180,6 +180,55 @@ async function ownedProject(db: PgD1, organizationId: string, projectId: string)
   return project;
 }
 
+/**
+ * Reduces any git remote spelling to `host/owner/repo` so the same repository compares
+ * equal however it was written. These are all one repository:
+ *   https://github.com/Owner/Repo      https://github.com/Owner/Repo.git
+ *   git@github.com:Owner/Repo.git      https://user@github.com/owner/repo/
+ * Real duplicates came from exactly this: the web UI stored the browse URL while the
+ * agent read `.git`-suffixed origin out of the checkout.
+ */
+export function normalizeGitRemote(raw?: string | null) {
+  const value = (raw ?? "").trim().toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "");
+  if (!value) return "";
+  const scp = /^[a-z0-9._-]+@([^:/]+):(.+)$/.exec(value);
+  if (scp) return `${scp[1]}/${scp[2]}`;
+  return value.replace(/^[a-z][a-z0-9+.-]*:\/\//, "").replace(/^[^@/]+@/, "");
+}
+
+/** Trailing separators are the only meaningful noise in a path we are given verbatim. */
+export function normalizeDirectory(raw?: string | null) {
+  return (raw ?? "").trim().replace(/\/+$/, "");
+}
+
+export type ProjectMatch = { id: string; name: string; matchedOn: "git remote" | "directory" | "name" };
+
+/**
+ * Finds the project an incoming create/resolve refers to. Ordered strongest first: a
+ * remote names one repository unambiguously, a working directory names one checkout,
+ * and an identical name is a strong hint when neither is present.
+ */
+export async function findMatchingProject(db: PgD1, organizationId: string, input: { name?: string; directory?: string; gitRemote?: string }): Promise<ProjectMatch | null> {
+  const rows = (await db.prepare("SELECT id, name, directory, git_remote FROM projects WHERE organization_id = ? AND status <> 'archived' ORDER BY created_at").bind(organizationId).all<Row>()).results;
+  const remote = normalizeGitRemote(input.gitRemote);
+  const directory = normalizeDirectory(input.directory);
+  const name = (input.name ?? "").trim().toLowerCase();
+
+  const byRemote = remote ? rows.find((row) => normalizeGitRemote(nullable(row, "git_remote")) === remote) : undefined;
+  if (byRemote) return { id: text(byRemote, "id"), name: text(byRemote, "name"), matchedOn: "git remote" };
+
+  // A remote names one repository, so a project carrying a different one is definitively
+  // not this work and must not match on weaker evidence. Without this, acme/api and
+  // contoso/api collapse into each other purely because both are called "api".
+  const candidates = remote ? rows.filter((row) => { const found = normalizeGitRemote(nullable(row, "git_remote")); return !found || found === remote; }) : rows;
+
+  const byDirectory = directory ? candidates.find((row) => normalizeDirectory(text(row, "directory")) === directory) : undefined;
+  if (byDirectory) return { id: text(byDirectory, "id"), name: text(byDirectory, "name"), matchedOn: "directory" };
+  const byName = name ? candidates.find((row) => text(row, "name").trim().toLowerCase() === name) : undefined;
+  if (byName) return { id: text(byName, "id"), name: text(byName, "name"), matchedOn: "name" };
+  return null;
+}
+
 function domainError(code: string, message: string, status = 422, details?: unknown) {
   return Object.assign(new Error(message), { code, status, details });
 }
@@ -229,7 +278,29 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const cleanName = command.name.trim().slice(0, 120);
     if (!cleanName) throw domainError("VALIDATION_FAILED", "Project name is required");
     const now = new Date().toISOString();
-    const response = { projectId, projectRevision: 1 };
+
+    // Match before creating, the same contract create_work_items uses for tasks. One
+    // repository opened from the web UI and from an agent is one project; without this
+    // the two produced parallel projects that each held half the work.
+    const existing = await findMatchingProject(db, organizationId, { name: cleanName, directory: command.directory, gitRemote: command.gitRemote });
+    if (existing) {
+      // Adopt identifying details the existing project is missing, so a project created
+      // in the browser (no directory) gains the agent's checkout path on first contact
+      // and resolves directly from then on.
+      const directory = normalizeDirectory(command.directory);
+      const gitRemote = command.gitRemote?.trim().slice(0, 500);
+      const adopted = await db.prepare("UPDATE projects SET directory = CASE WHEN directory = '' THEN COALESCE(?, directory) ELSE directory END, git_remote = COALESCE(git_remote, ?), updated_at = ? WHERE id = ? AND organization_id = ? RETURNING directory, git_remote")
+        .bind(directory || null, gitRemote || null, now, existing.id, organizationId).first<Row>();
+      const matchedResponse = {
+        projectId: existing.id, status: "matched" as const, matchedOn: existing.matchedOn,
+        project: { id: existing.id, name: existing.name, directory: text(adopted ?? {}, "directory"), gitRemote: nullable(adopted ?? {}, "git_remote") },
+        warning: `Matched the existing project "${existing.name}" by ${existing.matchedOn}; use this project instead of creating another for the same work.`,
+      };
+      await db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(matchedResponse)).run();
+      return matchedResponse;
+    }
+
+    const response = { projectId, projectRevision: 1, status: "created" as const };
     await commitMutation(db, [
       db.prepare("INSERT INTO projects (id, organization_id, project_key, name, description, directory, git_remote, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)").bind(projectId, organizationId, projectId, cleanName, command.description?.trim().slice(0, 2000) ?? "", command.directory?.trim().slice(0, 500) ?? "", command.gitRemote?.trim().slice(0, 500) || null, now),
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, 1, ?, 'project.created', ?, ?)").bind(id("evt"), organizationId, projectId, principal.displayName, `${principal.displayName} created ${cleanName}`, now),

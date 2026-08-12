@@ -141,10 +141,14 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .repo-options { display: flex; flex-direction: column; gap: 4px; max-height: 188px; overflow-y: auto; scrollbar-width: none; }.repo-options::-webkit-scrollbar { display: none; }
 .repo-options button { display: flex; align-items: center; gap: 9px; width: 100%; height: auto; min-height: 42px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); color: var(--text); text-align: left; }
 .repo-options button:hover { border-color: #4d608a; background: var(--hover); }
-.repo-options button > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.repo-options button strong { font-size: 12px; }.repo-options button small { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.repo-linked { display: flex; align-items: center; justify-content: space-between; gap: 9px; padding: 9px 10px; border: 1px solid #4d608a; border-radius: 7px; background: var(--panel-2); }
-.repo-linked > span { display: flex; align-items: center; gap: 8px; min-width: 0; }.repo-linked strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.repo-options button > span { display: flex; flex: 1 1 auto; min-width: 0; flex-direction: column; gap: 2px; }
+.repo-options button strong { font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.repo-options button small { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.repo-linked { display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid #4d608a; border-radius: 7px; background: var(--panel-2); }
+/* The name must be the element that shrinks, and Remove must stay pinned right: without
+   flex:1/min-width:0 here the name clipped early and dragged the button inward. */
+.repo-linked > span { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
+.repo-linked strong { font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.repo-linked button { flex: 0 0 auto; }
 .repo-linked button, .link-button { border: 0; background: transparent; color: var(--blue); font-size: 12px; font-weight: 500; padding: 0; }
 .repo-connect { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 38px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); color: var(--text); font-size: 12px; font-weight: 500; text-decoration: none; }
 .repo-connect:hover { border-color: #4d608a; background: var(--hover); }
