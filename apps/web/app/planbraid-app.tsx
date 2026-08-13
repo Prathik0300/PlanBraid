@@ -11,6 +11,8 @@ import type { Command, DashboardState, Notification, Project, Provider, Source, 
 import { deriveColumn, isStartedWhileBlocked } from "@/lib/graph/column.ts";
 import { DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
 import { accountDisplayName, labelFor, providerFamily } from "@/lib/providers.ts";
+import { confidenceOf } from "@/lib/trust/confidence.ts";
+import { provenanceLabel } from "@/lib/trust/provenance.ts";
 import claudeLogo from "@lobehub/icons-static-svg/icons/claude-color.svg";
 import codexLogo from "@lobehub/icons-static-svg/icons/codex-color.svg";
 import copilotLogo from "@lobehub/icons-static-svg/icons/copilot-color.svg";
@@ -19,16 +21,23 @@ import geminiLogo from "@lobehub/icons-static-svg/icons/gemini-color.svg";
 import openAILogo from "@lobehub/icons-static-svg/icons/openai.svg";
 import windsurfLogo from "@lobehub/icons-static-svg/icons/windsurf.svg";
 
-type View = "stream" | "board" | "list" | "inbox" | "agents";
+type View = "stream" | "board" | "proposals" | "decisions" | "list" | "inbox" | "agents";
 type Theme = "dark" | "light";
 type McpConnection = { id: string; name: string; scopes: string[]; lastUsedAt: string | null; createdAt: string };
 type CommandResult = { projectId?: string; status?: "created" | "matched" | "uncertain"; matchedOn?: string; project?: { id: string; name: string } };
 type GithubStatus = { connected: boolean; login: string | null; configured: boolean };
 type GithubRepo = { id: number; name: string; fullName: string; description: string; htmlUrl: string; cloneUrl: string; private: boolean; updatedAt: string };
 type BundledLogo = string | { src: string };
-type FindingKind = "duplicate" | "possible_duplicate" | "redundant_done" | "blocked_chain" | "cycle" | "started_while_blocked" | "stale" | "do_first";
+type FindingKind = "duplicate" | "possible_duplicate" | "redundant_done" | "conflicting_work" | "blocked_chain" | "cycle" | "started_while_blocked" | "stale" | "do_first" | "planning_loop" | "possibly_implemented" | "evidence_removed" | "agent_flagged";
 type SimplifyFinding = { id: string; kind: FindingKind; workItemId: string; relatedWorkItemId?: string; verdict: "certain" | "possible" | "informational"; reason: string; detail: string; proposedCommand?: unknown; origin: string; agreedBy: string[]; status: "open" | "applied" | "dismissed" };
 type SimplifyRun = { id: string; projectId: string; status: string; requestedBy: string; createdAt: string; findings: SimplifyFinding[] };
+type DecisionOption = { id: string; label: string; relatedWorkItemId: string | null; rationale: string; status: "open" | "accepted" | "rejected" };
+type Decision = { workItemId: string; itemKey: string; question: string; status: string; options: DecisionOption[] };
+type DebtEntry = { findingId: string; kind: string; weight: number; workItemId: string; itemKey: string | null; title: string | null; reason: string };
+type PlanningHealth = { debt: DebtEntry[]; totalWeight: number; score: number; breakdown: Array<{ kind: string; count: number; weight: number }> };
+type SavedViewName = "active" | "blocking_release" | "keeps_getting_proposed" | "no_proof" | "needs_decision";
+type SavedViewItem = { itemKey: string; workItemId: string; title: string; detail: string };
+const SAVED_VIEW_LABELS: Record<SavedViewName, string> = { active: "Active", blocking_release: "Blocking release", keeps_getting_proposed: "Keeps getting proposed", no_proof: "No proof", needs_decision: "Needs a decision" };
 
 /** GitHub's mark, inlined so the picker needs no network request to render. */
 function GithubMark() {
@@ -47,6 +56,18 @@ const statusMeta: Record<WorkStatus, { label: string; dot: string }> = {
   in_progress: { label: "In progress", dot: "●" }, blocked: { label: "Blocked", dot: "◆" }, in_review: { label: "Review", dot: "◈" },
   done: { label: "Done", dot: "✓" }, cancelled: { label: "Cancelled", dot: "×" },
 };
+
+/** Why a finished item finished the way it did. "Cancelled" alone never distinguished a
+ * rejected approach from one that is merely waiting for a better week. */
+const resolutionLabel: Record<string, string> = {
+  completed: "Completed", rejected: "Rejected", deferred: "Deferred", superseded: "Superseded",
+  duplicate: "Duplicate", abandoned: "Abandoned", obsolete: "No longer relevant", unspecified: "No reason recorded",
+};
+
+/** An item nobody has accepted yet. Both unaccepted rungs read the same on a card. */
+function isProposal(item: WorkItem) {
+  return item.maturity === "proposal" || item.maturity === "idea";
+}
 // Logos stay here rather than in lib/providers.ts: they are bundler-resolved asset
 // imports, and that module is imported by server code that must not pull in SVG assets.
 const providerLogo: Record<string, BundledLogo> = {
@@ -161,6 +182,17 @@ export function PlanbraidApp() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [simplifyRun, setSimplifyRun] = useState<SimplifyRun | null>(null);
   const [simplifying, setSimplifying] = useState(false);
+  const [handoffText, setHandoffText] = useState<string | null>(null);
+  const [handoffLoading, setHandoffLoading] = useState(false);
+  const [decisions, setDecisions] = useState<Decision[] | null>(null);
+  const [decisionsLoading, setDecisionsLoading] = useState(false);
+  const [health, setHealth] = useState<PlanningHealth | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [viewsOpen, setViewsOpen] = useState(false);
+  const [activeSavedView, setActiveSavedView] = useState<SavedViewName>("active");
+  const [savedViewItems, setSavedViewItems] = useState<SavedViewItem[] | null>(null);
+  const [savedViewLoading, setSavedViewLoading] = useState(false);
+  const [resolvingDecision, setResolvingDecision] = useState<string | null>(null);
   const [applyingFinding, setApplyingFinding] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [mutating, setMutating] = useState(false);
@@ -244,7 +276,12 @@ export function PlanbraidApp() {
   const project = data?.projects.find((entry) => entry.id === projectId) ?? null;
   const projectItems = useMemo(() => (data?.workItems ?? []).filter((item) => item.projectId === projectId), [data, projectId]);
   const sources = useMemo(() => (data?.sources ?? []).filter((source) => source.projectId === projectId), [data, projectId]);
-  const filteredItems = useMemo(() => projectItems.filter((item) => (!sourceId || item.sourceId === sourceId) && (statusFilter === "all" || deriveColumn(item) === statusFilter) && (!query || `${item.itemKey} ${item.title} ${item.description}`.toLowerCase().includes(query.toLowerCase()))), [projectItems, sourceId, statusFilter, query]);
+  const proposals = useMemo(() => projectItems.filter((item) => isProposal(item) && !["done", "cancelled"].includes(item.status)), [projectItems]);
+  // With gating on, unaccepted work leaves the board and lives in the Proposals queue
+  // instead. Off by default, so an existing project's board is unchanged until someone
+  // turns it on. See PLANNING_INTELLIGENCE_ROADMAP.md §9 decision 2.
+  const decidedItems = useMemo(() => project?.gateProposals ? projectItems.filter((item) => !isProposal(item)) : projectItems, [projectItems, project?.gateProposals]);
+  const filteredItems = useMemo(() => decidedItems.filter((item) => (!sourceId || item.sourceId === sourceId) && (statusFilter === "all" || deriveColumn(item) === statusFilter) && (!query || `${item.itemKey} ${item.title} ${item.description}`.toLowerCase().includes(query.toLowerCase()))), [decidedItems, sourceId, statusFilter, query]);
   const events = useMemo(() => (data?.events ?? []).filter((event) => {
     if (event.projectId !== projectId || (sourceId && event.sourceId !== sourceId) || (query && !event.summary.toLowerCase().includes(query.toLowerCase()))) return false;
     if (statusFilter === "all") return true;
@@ -280,6 +317,70 @@ export function PlanbraidApp() {
     finally { setSimplifying(false); }
   }
 
+  async function runHandoff() {
+    setHandoffLoading(true);
+    try {
+      const response = await fetch(`/api/handoff?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
+      const body = await response.json() as { data?: { text: string }; error?: { message?: string } };
+      if (!response.ok || !body.data) throw new Error(body.error?.message ?? "Could not prepare a handoff");
+      setHandoffText(body.data.text);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not prepare a handoff"); setTimeout(() => setToast(null), 4000); }
+    finally { setHandoffLoading(false); }
+  }
+
+  async function runHealth() {
+    setHealthLoading(true);
+    try {
+      const response = await fetch(`/api/health?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
+      const body = await response.json() as { data?: PlanningHealth; error?: { message?: string } };
+      if (!response.ok || !body.data) throw new Error(body.error?.message ?? "Could not compute planning health");
+      setHealth(body.data);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not compute planning health"); setTimeout(() => setToast(null), 4000); }
+    finally { setHealthLoading(false); }
+  }
+
+  const loadSavedView = useCallback(async (view: SavedViewName) => {
+    if (!projectId) return;
+    setSavedViewLoading(true);
+    try {
+      const response = await fetch(`/api/views?projectId=${encodeURIComponent(projectId)}&view=${view}`, { cache: "no-store" });
+      const body = await response.json() as { data?: { items: SavedViewItem[] }; error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not load this view");
+      setSavedViewItems(body.data?.items ?? []);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not load this view"); setTimeout(() => setToast(null), 4000); }
+    finally { setSavedViewLoading(false); }
+  }, [projectId]);
+
+  useEffect(() => { if (viewsOpen) void loadSavedView(activeSavedView); }, [viewsOpen, activeSavedView, loadSavedView]);
+
+  const loadDecisions = useCallback(async () => {
+    if (!projectId) return;
+    setDecisionsLoading(true);
+    try {
+      const response = await fetch(`/api/decisions?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
+      const body = await response.json() as { data?: Decision[]; error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not load decisions");
+      setDecisions(body.data ?? []);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not load decisions"); setTimeout(() => setToast(null), 4000); }
+    finally { setDecisionsLoading(false); }
+  }, [projectId]);
+
+  useEffect(() => { if (view === "decisions") void loadDecisions(); }, [view, loadDecisions]);
+
+  async function resolveDecisionChoice(decisionWorkItemId: string, winningOptionId: string) {
+    setResolvingDecision(winningOptionId);
+    try {
+      const response = await fetch("/api/decisions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId, decisionWorkItemId, winningOptionId }) });
+      const body = await response.json() as { data?: Decision; error?: { message?: string } };
+      if (!response.ok) throw new Error(body.error?.message ?? "Could not resolve this decision");
+      setDecisions((current) => current ? current.filter((entry) => entry.workItemId !== decisionWorkItemId) : current);
+      setToast(`${body.data?.itemKey ?? "Decision"} resolved`);
+      setTimeout(() => setToast(null), 4000);
+      await refresh(true);
+    } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not resolve this decision"); setTimeout(() => setToast(null), 4000); }
+    finally { setResolvingDecision(null); }
+  }
+
   async function resolveFinding(findingId: string, action: "apply" | "dismiss") {
     setApplyingFinding(findingId);
     try {
@@ -305,18 +406,26 @@ export function PlanbraidApp() {
     <main className={`app-shell ${sidebarOpen ? "sidebar-open" : ""}`}>
       <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} />
       <section className="workspace" aria-label="Unified project workspace">
-        <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
-        {project && view !== "inbox" && view !== "agents" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} project={project} sources={sources} importRequests={data?.importRequests ?? []} onSetup={() => setSetupOpen(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
+        <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} proposalCount={proposals.length} decisionCount={decisions?.length ?? 0} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
+        {project && view !== "inbox" && view !== "agents" && view !== "proposals" && view !== "decisions" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} onHandoff={() => void runHandoff()} handoffLoading={handoffLoading} onHealth={() => void runHealth()} healthLoading={healthLoading} onViews={() => setViewsOpen(true)} project={project} sources={sources} importRequests={data?.importRequests ?? []} onSetup={() => setSetupOpen(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
         {newUpdates > 0 && <button className="new-updates" onClick={() => { setNewUpdates(0); window.scrollTo({ top: 0, behavior: "smooth" }); }}>↑ {newUpdates} new {newUpdates === 1 ? "update" : "updates"}</button>}
         <div className="workspace-body">
           {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
           {project && view === "stream" && <Stream events={events} items={projectItems} sources={sources} onItem={setSelectedItemId} />}
           {project && view === "board" && <Board items={filteredItems} sources={sources} aliases={data?.aliases ?? []} dependencies={data?.dependencies ?? []} onItem={setSelectedItemId} onTransition={(item, status) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status, idempotencyKey: requestId("drag") }, `${item.itemKey} moved to ${statusMeta[status].label}`)} />}
+          {project && view === "proposals" && <Proposals
+            items={proposals} sources={sources} busy={mutating} gated={project.gateProposals} onItem={setSelectedItemId}
+            onAccept={(item) => void command({ action: "set_maturity", projectId: item.projectId, itemIds: [item.id], maturity: "accepted", idempotencyKey: requestId("accept") }, `${item.itemKey} accepted`)}
+            onAcceptAll={() => void command({ action: "set_maturity", projectId, itemIds: proposals.map((item) => item.id), maturity: "accepted", idempotencyKey: requestId("accept-all") }, `${proposals.length} proposal${proposals.length === 1 ? "" : "s"} accepted`)}
+            onReject={(item) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status: "cancelled", resolution: "rejected", reason: "Rejected from the proposals queue", idempotencyKey: requestId("reject") }, `${item.itemKey} rejected`)}
+            onToggleGate={() => void command({ action: "update_project", projectId, gateProposals: !project.gateProposals, idempotencyKey: requestId("gate") }, project.gateProposals ? "Proposals now appear on the board again" : "Proposals are kept off the board until accepted")}
+          />}
+          {project && view === "decisions" && <Decisions decisions={decisions} loading={decisionsLoading} items={projectItems} resolvingOptionId={resolvingDecision} onResolve={resolveDecisionChoice} onItem={setSelectedItemId} />}
           {project && view === "list" && <ListView items={filteredItems} sources={sources} aliases={data?.aliases ?? []} onItem={setSelectedItemId} />}
           {project && view === "inbox" && <Inbox notifications={data!.notifications.filter((entry) => entry.projectId === projectId)} onOpen={(notification) => { if (notification.workItemId) setSelectedItemId(notification.workItemId); void command({ action: "mark_notification", notificationId: notification.id, read: true, idempotencyKey: requestId("read") }, "Notification marked read"); }} onResolve={(notification) => void command({ action: "mark_notification", notificationId: notification.id, read: true, resolved: true, idempotencyKey: requestId("resolve") }, "Action resolved")} />}
-          {project && view === "agents" && <Agents sources={sources} items={projectItems} />}
+          {project && view === "agents" && <Agents sources={sources} items={projectItems} claims={data?.claims ?? []} />}
         </div>
-        {project && view !== "inbox" && view !== "agents" && <Composer project={project} sources={sources} busy={mutating} onCreate={(title, source) => void command({ action: "create_item", projectId, title, sourceId: source || undefined, status: "proposed", idempotencyKey: requestId("create") }, "Task added to the unified plan")} />}
+        {project && view !== "inbox" && view !== "agents" && view !== "proposals" && <Composer project={project} sources={sources} busy={mutating} onCreate={(title, source) => void command({ action: "create_item", projectId, title, sourceId: source || undefined, status: "proposed", idempotencyKey: requestId("create") }, "Task added to the unified plan")} />}
       </section>
       {selectedItem && <TaskDrawer item={selectedItem} source={sources.find((entry) => entry.id === selectedItem.sourceId) ?? null} sources={sources} events={(data?.events ?? []).filter((event) => event.workItemId === selectedItem.id)} evidence={(data?.evidence ?? []).filter((entry) => entry.workItemId === selectedItem.id)} dependencies={(data?.dependencies ?? []).filter((entry) => entry.fromWorkItemId === selectedItem.id || entry.toWorkItemId === selectedItem.id)} aliases={(data?.aliases ?? []).filter((entry) => entry.workItemId === selectedItem.id)} allItems={projectItems} busy={mutating} close={() => setSelectedItemId(null)} transition={(status, reason) => void command({ action: "transition_item", projectId: selectedItem.projectId, itemId: selectedItem.id, expectedVersion: selectedItem.version, status, reason, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("transition") }, `${selectedItem.itemKey} is now ${statusMeta[status].label}`)} note={(summary) => void command({ action: "add_note", projectId: selectedItem.projectId, itemId: selectedItem.id, summary, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("note") }, "Progress recorded")} splitAlias={(aliasId) => void command({ action: "split_alias", projectId: selectedItem.projectId, aliasId, idempotencyKey: requestId("split") }, "Moved back into its own task")} />}
       {commandOpen && <CommandDialog projects={data!.projects} currentProject={projectId} initialMode={commandOpen === "project" ? "project" : "search"} busy={mutating} close={() => setCommandOpen(false)} create={async (input) => {
@@ -334,6 +443,9 @@ export function PlanbraidApp() {
       {setupOpen && <SetupDialog project={project} close={() => setSetupOpen(false)} toast={setToast} />}
       {profileOpen && <ProfileDialog viewer={data!.viewer} close={() => setProfileOpen(false)} />}
       {simplifyRun && <SimplifyPanel run={simplifyRun} busy={applyingFinding} close={() => setSimplifyRun(null)} onApply={(findingId) => void resolveFinding(findingId, "apply")} onDismiss={(findingId) => void resolveFinding(findingId, "dismiss")} />}
+      {handoffText && <HandoffDialog text={handoffText} close={() => setHandoffText(null)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
+      {health && <HealthDialog health={health} close={() => setHealth(null)} onItem={(id) => { setHealth(null); setSelectedItemId(id); }} />}
+      {viewsOpen && <ViewsDialog active={activeSavedView} setActive={setActiveSavedView} items={savedViewItems} loading={savedViewLoading} close={() => { setViewsOpen(false); setSavedViewItems(null); }} onItem={(id) => { setViewsOpen(false); setSavedViewItems(null); setSelectedItemId(id); }} />}
       {toast && <div className="toast" role="status">{toast}</div>}
       {project && <nav className="mobile-nav" aria-label="Mobile navigation">
         <button className={view === "stream" ? "active" : ""} onClick={() => setView("stream")}>Activity</button><button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>Board</button><button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>Inbox{unread ? ` · ${unread}` : ""}</button><button className={view === "agents" ? "active" : ""} onClick={() => setView("agents")}>Agents</button>
@@ -368,11 +480,11 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
   </aside>;
 }
 
-function Header({ project, itemCount, sources, unread, view, setView, query, setQuery, theme, toggleTheme, onSetup, viewer, avatarUrl, onProfile }: { project: Project | null; itemCount: number; sources: Source[]; unread: number; view: View; setView: (view: View) => void; query: string; setQuery: (query: string) => void; theme: Theme; toggleTheme: () => void; onSetup: () => void; viewer: DashboardState["viewer"]; avatarUrl: string | null; onProfile: () => void }) {
+function Header({ project, itemCount, sources, unread, proposalCount, decisionCount, view, setView, query, setQuery, theme, toggleTheme, onSetup, viewer, avatarUrl, onProfile }: { project: Project | null; itemCount: number; sources: Source[]; unread: number; proposalCount: number; decisionCount: number; view: View; setView: (view: View) => void; query: string; setQuery: (query: string) => void; theme: Theme; toggleTheme: () => void; onSetup: () => void; viewer: DashboardState["viewer"]; avatarUrl: string | null; onProfile: () => void }) {
   return <><header className="workspace-header">
     {project && <div className="workspace-heading"><span className="workspace-project"><h1>{project.name}</h1><p>{itemCount} {itemCount === 1 ? "task" : "tasks"} · {sources.length} connected {sources.length === 1 ? "conversation" : "conversations"}</p></span></div>}
     <div className="header-actions">{project && <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search tasks and updates" aria-label="Search tasks and updates"/></label>}{project && <div className="sync-pill" aria-label={`${sources.filter((source) => source.status === "active").length} active agents`}><span className="presence active" /> Live</div>}<button className={`theme-switch ${theme}`} role="switch" aria-checked={theme === "light"} onClick={toggleTheme} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}><span className="theme-switch-thumb" aria-hidden="true"><span className="theme-switch-icon moon">☾</span><span className="theme-switch-icon sun">☼</span></span></button><button className="setup-button" onClick={onSetup}>Connect agent</button><button className="profile-trigger" onClick={onProfile} aria-label="Open account and profile" title="Account and profile"><span className="avatar">{avatarUrl ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(avatarUrl)})` }} aria-hidden="true" /> : viewer.name.slice(0, 1).toUpperCase()}</span></button></div>
-  </header>{project && <nav className="view-tabs" aria-label="Project views">{(["stream", "board", "list", "inbox", "agents"] as View[]).map((entry) => <button key={entry} className={view === entry ? "active" : ""} aria-pressed={view === entry} onClick={() => setView(entry)}>{entry === "stream" ? "Activity" : entry[0].toUpperCase() + entry.slice(1)}{entry === "inbox" && unread > 0 ? <b>{unread}</b> : null}</button>)}</nav>}</>;
+  </header>{project && <nav className="view-tabs" aria-label="Project views">{(["stream", "board", "proposals", "decisions", "list", "inbox", "agents"] as View[]).map((entry) => <button key={entry} className={view === entry ? "active" : ""} aria-pressed={view === entry} onClick={() => setView(entry)}>{entry === "stream" ? "Activity" : entry[0].toUpperCase() + entry.slice(1)}{entry === "inbox" && unread > 0 ? <b>{unread}</b> : null}{entry === "proposals" && proposalCount > 0 ? <b>{proposalCount}</b> : null}{entry === "decisions" && decisionCount > 0 ? <b>{decisionCount}</b> : null}</button>)}</nav>}</>;
 }
 
 function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; close: () => void }) {
@@ -475,11 +587,11 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
   </section></div>;
 }
 
-function FilterBar({ items, filter, setFilter, source, clearSource, onSimplify, simplifying, project, sources, importRequests, onSetup, toast }: { items: WorkItem[]; filter: WorkStatus | "all"; setFilter: (status: WorkStatus | "all") => void; source: Source | null; clearSource: () => void; onSimplify: () => void; simplifying: boolean; project: Project; sources: Source[]; importRequests: DashboardState["importRequests"]; onSetup: () => void; toast: (message: string) => void }) {
+function FilterBar({ items, filter, setFilter, source, clearSource, onSimplify, simplifying, onHandoff, handoffLoading, onHealth, healthLoading, onViews, project, sources, importRequests, onSetup, toast }: { items: WorkItem[]; filter: WorkStatus | "all"; setFilter: (status: WorkStatus | "all") => void; source: Source | null; clearSource: () => void; onSimplify: () => void; simplifying: boolean; onHandoff: () => void; handoffLoading: boolean; onHealth: () => void; healthLoading: boolean; onViews: () => void; project: Project; sources: Source[]; importRequests: DashboardState["importRequests"]; onSetup: () => void; toast: (message: string) => void }) {
   const statuses: Array<WorkStatus | "all"> = ["all", "in_progress", "ready", "blocked", "in_review", "done"];
   // Simplify is the rightmost control, so it owns the margin-left:auto that used to sit
   // on .source-filter; the source chip now just trails the status filters.
-  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}<button className="simplify-button" onClick={onSimplify} disabled={simplifying || !items.length} title="Find duplicates, blocked chains, and what to do first">{simplifying ? "Reviewing…" : "Simplify"}</button><ImportMenu project={project} sources={sources} importRequests={importRequests} onSetup={onSetup} toast={toast} /></div>;
+  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}<button className="views-button" onClick={onViews} title="Saved structured views: active, blocking release, keeps getting proposed, no proof, needs a decision">Views</button><button className="health-button" onClick={onHealth} disabled={healthLoading} title="See planning debt: open findings weighted by kind">{healthLoading ? "Checking…" : "Health"}</button><button className="handoff-button" onClick={onHandoff} disabled={handoffLoading} title="Copy a project handoff for another agent">{handoffLoading ? "Preparing…" : "Handoff"}</button><button className="simplify-button" onClick={onSimplify} disabled={simplifying || !items.length} title="Find duplicates, blocked chains, and what to do first">{simplifying ? "Reviewing…" : "Simplify"}</button><ImportMenu project={project} sources={sources} importRequests={importRequests} onSetup={onSetup} toast={toast} /></div>;
 }
 
 /**
@@ -598,7 +710,7 @@ function TaskCard({ item, source, aliases, sources, ambiguousFamilies, dependenc
   const column = deriveColumn(item);
   const waitingOn = column === "blocked" && item.status !== "blocked" ? unresolvedBlockers(item, dependencies, allItems) : [];
   const anomaly = isStartedWhileBlocked(item);
-  return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="blocker-copy">Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}{/* corroboration already includes the card's own source, so a plural stack replaces
+  return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{isProposal(item) && <span className="proposal-badge" title="Proposed by an agent and not yet accepted by anyone.">proposal</span>}{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.resolution && item.resolution !== "completed" && <p className="resolution-copy">{resolutionLabel[item.resolution] ?? item.resolution}{item.resolutionReason ? `: ${item.resolutionReason}` : ""}</p>}{item.deferredUntil && <p className="blocker-copy">Deferred until {new Date(item.deferredUntil).toLocaleDateString()}</p>}{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="blocker-copy">Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}{/* corroboration already includes the card's own source, so a plural stack replaces
     the single-source label rather than sitting beside a duplicate of itself. */}
           <footer>{corroborated ? <ProviderStack accounts={corroboration} ambiguousFamilies={ambiguousFamilies} /> : source ? <span><ProviderIcon provider={source.provider} /> {sourceName(source, ambiguousFamilies)}</span> : <span>Manual</span>}</footer></button><select aria-label={`Move ${item.itemKey}`} value={item.status} onChange={(event) => onMove(event.target.value as WorkStatus)}>{Object.entries(statusMeta).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></article>;
 }
@@ -619,11 +731,24 @@ function ListView({ items, sources, aliases, onItem }: { items: WorkItem[]; sour
 const findingGroups: Array<{ kinds: FindingKind[]; title: string; blurb: string }> = [
   { kinds: ["duplicate", "possible_duplicate"], title: "Duplicates", blurb: "The same work written twice. Merging keeps the older task and files the other under it." },
   { kinds: ["redundant_done"], title: "Already covered", blurb: "Open work that repeats something finished." },
+  { kinds: ["conflicting_work"], title: "Conflicting work", blurb: "Opposite intent on the same thing. Record a decision to pick one." },
   { kinds: ["cycle"], title: "Circular dependencies", blurb: "These wait on each other, so none of them can start." },
   { kinds: ["blocked_chain"], title: "Blocked chains", blurb: "What each blocked task is actually waiting on." },
   { kinds: ["do_first"], title: "Start here", blurb: "Unblocked work that frees the most once it lands." },
-  { kinds: ["started_while_blocked", "stale"], title: "Worth a look", blurb: "Not wrong, but not right either." },
+  { kinds: ["planning_loop"], title: "Planning loops", blurb: "Proposed again and again, by different agents, with nothing ever implemented. Resolve, reject, or schedule it." },
+  { kinds: ["possibly_implemented", "evidence_removed"], title: "Plan vs. repository", blurb: "What a connected agent's own commits say does not match what the plan says." },
+  { kinds: ["started_while_blocked", "stale", "agent_flagged"], title: "Worth a look", blurb: "Not wrong, but not right either." },
 ];
+
+const DIVERGENCE_KINDS = new Set<FindingKind>(["possibly_implemented", "evidence_removed"]);
+
+/** "Claude and Codex", "Claude, Codex and Gemini": model family keys from a finding's
+ * agreedBy, turned into the display names the rest of the app already uses. */
+function listOfLabels(families: string[]) {
+  const labels = families.map((family) => labelFor(family));
+  if (labels.length <= 1) return labels.join("");
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+}
 
 function SimplifyPanel({ run, busy, close, onApply, onDismiss }: { run: SimplifyRun; busy: string | null; close: () => void; onApply: (findingId: string) => void; onDismiss: (findingId: string) => void }) {
   const open = run.findings.filter((finding) => finding.status === "open");
@@ -639,10 +764,16 @@ function SimplifyPanel({ run, busy, close, onApply, onDismiss }: { run: Simplify
             <h3>{group.title} <span>{found.length}</span></h3>
             <p className="simplify-blurb">{group.blurb}</p>
             {found.map((finding) => <article className={`simplify-finding ${finding.verdict}`} key={finding.id}>
-              <div><strong>{finding.reason}</strong><small>{finding.detail}</small></div>
+              <div><strong>{finding.reason}</strong><small>{finding.detail}</small>
+                {/* agreedBy holds independent corroboration: a connected agent agreeing
+                    with the structural pass, or with another agent, the same signal a
+                    task card shows via corroboratingProviders, applied to a finding
+                    instead of a task. Named agents, never a count alone. */}
+                {finding.agreedBy.length > 0 && <small className="simplify-corroboration">Also flagged by {listOfLabels(finding.agreedBy)}.</small>}
+              </div>
               {finding.proposedCommand ? <span className="simplify-actions">
-                <button className="simplify-apply" disabled={busy === finding.id} onClick={() => onApply(finding.id)}>{busy === finding.id ? "Applying…" : finding.kind === "redundant_done" ? "Cancel it" : "Merge"}</button>
-                <button className="simplify-dismiss" disabled={busy === finding.id} onClick={() => onDismiss(finding.id)}>Keep both</button>
+                <button className="simplify-apply" disabled={busy === finding.id} onClick={() => onApply(finding.id)}>{busy === finding.id ? "Applying…" : finding.kind === "redundant_done" ? "Cancel it" : DIVERGENCE_KINDS.has(finding.kind) ? "Move to ready" : "Merge"}</button>
+                <button className="simplify-dismiss" disabled={busy === finding.id} onClick={() => onDismiss(finding.id)}>{DIVERGENCE_KINDS.has(finding.kind) ? "Leave as is" : "Keep both"}</button>
               </span> : null}
             </article>)}
           </section>;
@@ -654,13 +785,162 @@ function SimplifyPanel({ run, busy, close, onApply, onDismiss }: { run: Simplify
   </div>;
 }
 
+/** M13: the plain-text form of the project handoff, ready to paste into any agent that
+ * isn't connected yet. A textarea rather than a styled summary on purpose: the point is
+ * copying the exact text a model reads, not a prettier restatement of it. */
+function HandoffDialog({ text, close, toast }: { text: string; close: () => void; toast: (message: string) => void }) {
+  async function copy() {
+    try { await navigator.clipboard.writeText(text); toast("Handoff copied"); }
+    catch { toast("Could not copy; select the text and copy manually"); }
+  }
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <section className="handoff-dialog" role="dialog" aria-modal="true" aria-labelledby="handoff-title">
+      <header><div><span className="eyebrow">HANDOFF</span><h2 id="handoff-title">Project handoff</h2><p>Paste this into any agent picking up the project cold.</p></div><button className="icon-button" onClick={close} aria-label="Close handoff">×</button></header>
+      <textarea className="handoff-text" readOnly value={text} onFocus={(event) => event.target.select()} />
+      <footer className="handoff-footer"><button onClick={() => void copy()}>Copy to clipboard</button></footer>
+    </section>
+  </div>;
+}
+
+/** M22: the debt list first, the score only as a visible sum of it - never an opaque
+ * number on its own, matching the roadmap's own rule for this feature. */
+function HealthDialog({ health, close, onItem }: { health: PlanningHealth; close: () => void; onItem: (workItemId: string) => void }) {
+  const level = health.score >= 80 ? "good" : health.score >= 50 ? "fair" : "poor";
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <section className="health-dialog" role="dialog" aria-modal="true" aria-labelledby="health-title">
+      <header><div><span className="eyebrow">PLANNING HEALTH</span><h2 id="health-title">Planning debt</h2><p>Weighted by kind, heaviest first. The score below is just the sum of this list.</p></div><button className="icon-button" onClick={close} aria-label="Close planning health">×</button></header>
+      <div className={`health-score ${level}`}><strong>{health.score}</strong><span>/ 100</span></div>
+      {health.breakdown.length > 0 && <div className="health-breakdown">{health.breakdown.map((entry) => <span key={entry.kind}>{entry.kind.replaceAll("_", " ")} <b>{entry.count}</b></span>)}</div>}
+      {health.debt.length
+        ? <div className="health-debt-list">{health.debt.map((entry) => <button className="health-debt-row" key={entry.findingId} onClick={() => onItem(entry.workItemId)}>
+            <span className="health-weight">{entry.weight}</span>
+            <span><strong>{entry.itemKey ? `${entry.itemKey} ` : ""}{entry.reason}</strong><small>{entry.kind.replaceAll("_", " ")}</small></span>
+          </button>)}</div>
+        : <Empty title="No planning debt found" body="Every open Simplify finding is either resolved or informational-only. Nothing here to act on." />}
+    </section>
+  </div>;
+}
+
+/** M23: five fixed, named queries over structured state - no prose parsing, no free-form
+ * search. Switching the segment re-fetches rather than filtering client-side data already
+ * loaded, since some views (no_proof, blocking_release) need computation the dashboard's
+ * own state does not carry. */
+function ViewsDialog({ active, setActive, items, loading, close, onItem }: { active: SavedViewName; setActive: (view: SavedViewName) => void; items: SavedViewItem[] | null; loading: boolean; close: () => void; onItem: (workItemId: string) => void }) {
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <section className="views-dialog" role="dialog" aria-modal="true" aria-labelledby="views-title">
+      <header><div><span className="eyebrow">SAVED VIEWS</span><h2 id="views-title">{SAVED_VIEW_LABELS[active]}</h2><p>Fixed structured queries over the current plan, not a search.</p></div><button className="icon-button" onClick={close} aria-label="Close saved views">×</button></header>
+      <div className="views-segment">{(Object.keys(SAVED_VIEW_LABELS) as SavedViewName[]).map((view) => <button key={view} className={active === view ? "active" : ""} onClick={() => setActive(view)}>{SAVED_VIEW_LABELS[view]}</button>)}</div>
+      {loading
+        ? <p className="muted views-loading">Loading…</p>
+        : items && items.length
+          ? <div className="views-list">{items.map((item) => <button className="views-row" key={item.workItemId} onClick={() => onItem(item.workItemId)}>
+              <span><strong>{item.itemKey} {item.title}</strong><small>{item.detail}</small></span>
+            </button>)}</div>
+          : <Empty title="Nothing here" body="This view has nothing to show right now." />}
+    </section>
+  </div>;
+}
+
+/**
+ * The queue that keeps AI brainstorming out of the plan.
+ *
+ * An agent listing "we could migrate to GraphQL" produces a proposal, not a task. Nothing
+ * here is destructive: accepting promotes, rejecting records a rejection with a reason
+ * (which is what later stops the same idea coming back), and doing neither leaves it
+ * exactly where it is.
+ */
+function Proposals({ items, sources, busy, gated, onItem, onAccept, onAcceptAll, onReject, onToggleGate }: { items: WorkItem[]; sources: Source[]; busy: boolean; gated: boolean; onItem: (id: string) => void; onAccept: (item: WorkItem) => void; onAcceptAll: () => void; onReject: (item: WorkItem) => void; onToggleGate: () => void }) {
+  const ambiguousFamilies = ambiguousFamiliesOf(sources);
+  return <div className="proposals-view">
+    <div className="inbox-heading">
+      <span>
+        <h2>Proposals</h2>
+        <p>Work agents suggested but nobody has accepted yet. Accepting makes it part of the plan.</p>
+      </span>
+      <div className="proposal-controls">
+        <button className="secondary" onClick={onToggleGate} disabled={busy} title={gated ? "Proposals are currently hidden from the board" : "Proposals currently appear on the board alongside accepted work"}>
+          {gated ? "Showing on board: off" : "Showing on board: on"}
+        </button>
+        {items.length > 1 && <button onClick={onAcceptAll} disabled={busy}>Accept all {items.length}</button>}
+      </div>
+    </div>
+    {!items.length
+      ? <Empty title="Nothing waiting" body="Everything an agent proposed has been accepted or rejected. New proposals show up here as agents record them." />
+      : <div className="proposal-list">{items.map((item) => {
+        const source = sources.find((entry) => entry.id === item.sourceId);
+        return <article className="proposal-card" key={item.id}>
+          <div className="proposal-body">
+            <button className="proposal-open" onClick={() => onItem(item.id)}>
+              <span className="proposal-meta">{source ? <ProviderIcon provider={source.provider} /> : null}<b>{item.itemKey}</b><small>{source ? sourceName(source, ambiguousFamilies) : "Manual"} · {relative(item.createdAt)}</small></span>
+              <strong>{item.title}</strong>
+              {item.description && <p>{item.description.slice(0, 240)}</p>}
+            </button>
+          </div>
+          <div className="proposal-actions">
+            <button onClick={() => onAccept(item)} disabled={busy}>Accept</button>
+            <button className="secondary" onClick={() => onReject(item)} disabled={busy}>Reject</button>
+          </div>
+        </article>;
+      })}</div>}
+  </div>;
+}
+
+/** M19's decision queue. A decision is raised by anyone, agent or person, but only a
+ * person can resolve one from here: choosing an option cancels every other option's
+ * linked work item as superseded, which is exactly the kind of permanent, plan-shaping
+ * call this product never lets an agent make on its own. */
+function Decisions({ decisions, loading, items, resolvingOptionId, onResolve, onItem }: { decisions: Decision[] | null; loading: boolean; items: WorkItem[]; resolvingOptionId: string | null; onResolve: (decisionWorkItemId: string, winningOptionId: string) => void; onItem: (id: string) => void }) {
+  return <div className="proposals-view">
+    <div className="inbox-heading">
+      <span>
+        <h2>Decisions</h2>
+        <p>Competing approaches somebody flagged as mutually exclusive. Choosing one supersedes the rest.</p>
+      </span>
+    </div>
+    {loading && !decisions
+      ? <Empty title="Loading decisions…" body="" />
+      : !decisions?.length
+        ? <Empty title="Nothing to decide" body="A decision shows up here when an agent or teammate flags two approaches as conflicting with record_decision." />
+        : <div className="proposal-list">{decisions.map((decision) => <article className="proposal-card decision-card" key={decision.workItemId}>
+          <div className="proposal-body">
+            <button className="proposal-open" onClick={() => onItem(decision.workItemId)}>
+              <span className="proposal-meta"><b>{decision.itemKey}</b></span>
+              <strong>{decision.question}</strong>
+            </button>
+            <div className="decision-options">{decision.options.map((option) => {
+              const related = option.relatedWorkItemId ? items.find((entry) => entry.id === option.relatedWorkItemId) : null;
+              return <div className="decision-option" key={option.id}>
+                <div className="decision-option-body">
+                  <strong>{option.label}</strong>
+                  {related && <small>Keeps {related.itemKey}: {related.title}</small>}
+                  {option.rationale && <p>{option.rationale}</p>}
+                </div>
+                <button onClick={() => onResolve(decision.workItemId, option.id)} disabled={resolvingOptionId !== null}>
+                  {resolvingOptionId === option.id ? "Choosing…" : "Choose"}
+                </button>
+              </div>;
+            })}</div>
+          </div>
+        </article>)}</div>}
+  </div>;
+}
+
 function Inbox({ notifications, onOpen, onResolve }: { notifications: Notification[]; onOpen: (notification: Notification) => void; onResolve: (notification: Notification) => void }) {
   const [tab, setTab] = useState<"action" | "updates" | "all">("action");
   const visible = notifications.filter((notification) => tab === "all" || tab === "action" ? (tab === "all" || notification.requiresAction && !notification.resolvedAt) : !notification.requiresAction);
   return <div className="inbox"><div className="inbox-heading"><span><h2>Inbox</h2><p>Decisions, completed turns, blockers, and agent health.</p></span><div className="segment"><button className={tab === "action" ? "active" : ""} onClick={() => setTab("action")}>Needs action</button><button className={tab === "updates" ? "active" : ""} onClick={() => setTab("updates")}>Updates</button><button className={tab === "all" ? "active" : ""} onClick={() => setTab("all")}>All</button></div></div>{visible.length ? <div className="inbox-list">{visible.map((notification) => <article className={`notification-card ${notification.readAt ? "read" : ""}`} key={notification.id}><span className={`notification-priority ${notification.priority}`}>!</span><button className="notification-main" onClick={() => onOpen(notification)}><div><strong>{notification.title}</strong><time>{relative(notification.createdAt)}</time></div><p>{notification.body}</p><small>{notification.eventType.replaceAll("_", " ").replaceAll(".", " · ")}</small></button>{notification.requiresAction && !notification.resolvedAt && <button className="resolve-button" onClick={() => onResolve(notification)}>Resolve</button>}</article>)}</div> : <Empty title="You’re caught up" body="Nothing in this notification view needs your attention." />}</div>;
 }
 
-function Agents({ sources, items }: { sources: Source[]; items: WorkItem[] }) { const agentAmbiguousFamilies = ambiguousFamiliesOf(sources); return <div className="agents-view"><div className="inbox-heading"><span><h2>Connected agents</h2><p>Sessions, coding spaces, capture assurance, and current work.</p></span></div><div className="agent-grid">{sources.map((source) => <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{sourceName(source, agentAmbiguousFamilies)}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{items.filter((item) => item.sourceId === source.id && !["done", "cancelled"].includes(item.status)).map((item) => <span key={item.id}><b>{item.itemKey}</b> {item.title}</span>)}</div></article>)}</div></div>; }
+/** M14: "who holds what, and for how long" - read from live work_claims leases (F1), not
+ * from sourceId (who originally proposed an item). A session can hold work someone else
+ * created, and conflating the two would show the wrong agent as the active holder. */
+function Agents({ sources, items, claims }: { sources: Source[]; items: WorkItem[]; claims: DashboardState["claims"] }) {
+  const agentAmbiguousFamilies = ambiguousFamiliesOf(sources);
+  return <div className="agents-view"><div className="inbox-heading"><span><h2>Connected agents</h2><p>Sessions, coding spaces, capture assurance, and current work.</p></span></div><div className="agent-grid">{sources.map((source) => {
+    const held = claims.filter((claim) => claim.sourceId === source.id).map((claim) => ({ claim, item: items.find((entry) => entry.id === claim.workItemId) })).filter((entry): entry is { claim: DashboardState["claims"][number]; item: WorkItem } => entry.item != null);
+    return <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{sourceName(source, agentAmbiguousFamilies)}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{held.length ? held.map(({ claim, item }) => <span key={claim.id}><b>{item.itemKey}</b> {item.title} <small>holds for {expiresIn(claim.leaseExpiresAt)}</small></span>) : <span className="muted">Holding nothing right now</span>}</div></article>;
+  })}</div></div>;
+}
 
 function Composer({ project, sources, busy, onCreate }: { project: Project | null; sources: Source[]; busy: boolean; onCreate: (title: string, source: string) => void }) {
   const [title, setTitle] = useState(""); const [source, setSource] = useState("");
@@ -671,11 +951,38 @@ function Composer({ project, sources, busy, onCreate }: { project: Project | nul
 
 function TaskDrawer({ item, source, sources, events, evidence, dependencies, aliases, allItems, busy, close, transition, note, splitAlias }: { item: WorkItem; source: Source | null; sources: Source[]; events: WorkEvent[]; evidence: DashboardState["evidence"]; dependencies: DashboardState["dependencies"]; aliases: DashboardState["aliases"]; allItems: WorkItem[]; busy: boolean; close: () => void; transition: (status: WorkStatus, reason?: string) => void; note: (summary: string) => void; splitAlias: (aliasId: string) => void }) {
   const [tab, setTab] = useState<"overview" | "activity" | "evidence">("overview"); const [noteText, setNoteText] = useState("");
+  const [whyNotDoneItemId, setWhyNotDoneItemId] = useState(item.id);
+  const [whyNotDone, setWhyNotDone] = useState<{ summary: string } | null>(null);
+  // The "adjust state during render" pattern React recommends for resetting state when a
+  // prop changes, rather than an effect that calls setState synchronously on every run:
+  // switching items must clear stale text before the new fetch resolves, so a card never
+  // briefly shows another item's explanation.
+  if (item.id !== whyNotDoneItemId) { setWhyNotDoneItemId(item.id); setWhyNotDone(null); }
+  // Fetched per item rather than derived client-side: the causal answer needs work_claims
+  // (who currently holds it) and the project-wide dependency chain, neither of which
+  // DashboardState carries. Errors are swallowed: this is a supplementary explanation,
+  // not something the drawer's core functionality should ever block on.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/explain?workItemId=${encodeURIComponent(item.id)}`, { cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((body) => { if (!cancelled && body?.data) setWhyNotDone(body.data); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [item.id]);
   const corroboratedProviders = corroboratingProviders(item, aliases, sources);
+  // Derived here rather than stored, so a card whose evidence was deleted or whose blocker
+  // reopened stops claiming yesterday's confidence. See lib/trust/confidence.ts.
+  const confidence = confidenceOf({
+    item, events, corroboration: corroboratedProviders.length,
+    evidenceCount: evidence.length,
+    verifiedEvidenceCount: evidence.filter((entry) => entry.result === "verified").length,
+    now: currentTime(),
+  });
   const drawerAmbiguousFamilies = ambiguousFamiliesOf(sources);
   const waitingOn = unresolvedBlockers(item, dependencies, allItems);
   const anomaly = isStartedWhileBlocked(item);
-  return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><aside className="task-drawer" aria-label={`${item.itemKey} details`}><header className="drawer-header"><span className={`status-badge ${item.status}`}>{statusMeta[item.status].dot} {statusMeta[item.status].label}</span><button className="icon-button" onClick={close} aria-label="Close task">×</button></header><div className="drawer-title"><small>{item.itemKey} · v{item.version}</small><h2>{item.title}</h2><p>{item.description || "No description has been added yet."}</p>{corroboratedProviders.length > 1 && <p className="corroboration-banner">Proposed independently by {corroboratedProviders.map((account) => accountName(account, drawerAmbiguousFamilies)).join(" and ")}.</p>}{anomaly && <p className="anomaly-banner">⚠ In progress, but {waitingOn.length ? `${waitingOn.map((entry) => entry.itemKey).join(", ")} is still unresolved` : "a prerequisite is still unresolved"}.</p>}</div><div className="drawer-fields"><label>Status<select value={item.status} disabled={busy} onChange={(event) => transition(event.target.value as WorkStatus, event.target.value === "blocked" ? "Blocked from task detail" : undefined)}>{Object.entries(statusMeta).map(([value, meta]) => <option value={value} key={value}>{meta.label}</option>)}</select></label><label>Priority<strong className={`priority-value ${item.priority}`}>{item.priority}</strong></label><label>Owner<strong>{item.assignee ?? "Unassigned"}</strong></label><label>Source<strong>{source ? <><ProviderIcon provider={source.provider} /> {sourceName(source, drawerAmbiguousFamilies)}</> : "Manual"}</strong></label></div><nav className="drawer-tabs"><button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button><button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity {events.length}</button><button className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>Evidence {evidence.length}</button></nav><div className="drawer-body">{tab === "overview" && <><section><h3>Completion</h3><div className="confidence"><span>{item.completionConfidence}</span><span>{item.verificationStatus}</span></div></section>{item.blockerReason && <section className="blocker-panel"><h3>Blocker</h3><p>{item.blockerReason}</p></section>}{waitingOn.length > 0 && <section className="blocker-panel"><h3>Waiting on</h3>{waitingOn.map((entry) => <p key={entry.id}><b>{entry.itemKey}</b> {entry.title} · {statusMeta[entry.status].label}</p>)}</section>}<section><h3>Dependencies</h3>{dependencies.length ? dependencies.map((edge) => { const linkedId = edge.fromWorkItemId === item.id ? edge.toWorkItemId : edge.fromWorkItemId; const linked = allItems.find((entry) => entry.id === linkedId); return <div className="dependency-row" key={edge.id}><span>{edge.type}</span><b>{linked?.itemKey}</b><p>{linked?.title}</p></div>; }) : <p className="muted">No dependencies.</p>}</section>{aliases.length > 0 && <section><h3>Also proposed</h3>{aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return <div className="alias-row" key={alias.id}><ProviderIcon provider={(aliasSource?.provider ?? "system") as Provider} /><span><strong>{alias.title}</strong><small>{aliasSource ? sourceName(aliasSource, drawerAmbiguousFamilies) : "Another agent"} · {relative(alias.createdAt)} · {alias.matchReason}</small></span><button className="alias-split" disabled={busy} onClick={() => splitAlias(alias.id)}>Not the same, make separate task</button></div>; })}</section>}</>}{tab === "activity" && events.map((event) => { const eventSource = sources.find((entry) => entry.id === event.sourceId); return <div className="mini-event" key={event.id}><ProviderIcon provider={(eventSource?.provider ?? "system") as Provider}/><span><strong>{event.summary}</strong><small>{event.actorName} · {relative(event.createdAt)}</small></span></div>; })}{tab === "evidence" && (evidence.length ? evidence.map((entry) => { const evidenceSource = sources.find((entry2) => entry2.id === entry.sourceId); return <div className="evidence-row" key={entry.id}>{evidenceSource ? <ProviderIcon provider={evidenceSource.provider} /> : <span className="evidence-check">✓</span>}<span><strong>{entry.label}</strong><small>{entry.type} · {entry.result ?? "recorded"} · {evidenceSource ? `by ${sourceName(evidenceSource, drawerAmbiguousFamilies)}` : "Manual"} · {relative(entry.createdAt)}</small></span></div>; }) : <p className="muted">No evidence attached yet.</p>)}</div><form className="drawer-note" onSubmit={(event) => { event.preventDefault(); if (!noteText.trim()) return; note(noteText.trim()); setNoteText(""); }}><input value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="Add a progress update…"/><button disabled={!noteText.trim() || busy}>Add</button></form></aside></div>;
+  return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><aside className="task-drawer" aria-label={`${item.itemKey} details`}><header className="drawer-header"><span className={`status-badge ${item.status}`}>{statusMeta[item.status].dot} {statusMeta[item.status].label}</span><button className="icon-button" onClick={close} aria-label="Close task">×</button></header><div className="drawer-title"><small>{item.itemKey} · v{item.version}</small><h2>{item.title}</h2><p>{item.description || "No description has been added yet."}</p>{corroboratedProviders.length > 1 && <p className="corroboration-banner">Proposed independently by {corroboratedProviders.map((account) => accountName(account, drawerAmbiguousFamilies)).join(" and ")}.</p>}{anomaly && <p className="anomaly-banner">⚠ In progress, but {waitingOn.length ? `${waitingOn.map((entry) => entry.itemKey).join(", ")} is still unresolved` : "a prerequisite is still unresolved"}.</p>}</div><div className="drawer-fields"><label>Status<select value={item.status} disabled={busy} onChange={(event) => transition(event.target.value as WorkStatus, event.target.value === "blocked" ? "Blocked from task detail" : undefined)}>{Object.entries(statusMeta).map(([value, meta]) => <option value={value} key={value}>{meta.label}</option>)}</select></label><label>Priority<strong className={`priority-value ${item.priority}`}>{item.priority}</strong></label><label>Owner<strong>{item.assignee ?? "Unassigned"}</strong></label><label>Source<strong>{source ? <><ProviderIcon provider={source.provider} /> {sourceName(source, drawerAmbiguousFamilies)}</> : "Manual"}</strong></label></div><nav className="drawer-tabs"><button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button><button className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>Activity {events.length}</button><button className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>Evidence {evidence.length}</button></nav><div className="drawer-body">{tab === "overview" && <><section><h3>Standing</h3><div className="confidence"><span>{item.maturity}</span>{item.resolution && <span>{resolutionLabel[item.resolution] ?? item.resolution}</span>}</div>{item.resolutionReason && <p className="muted">{item.resolutionReason}</p>}{item.deferredUntil && <p className="muted">Deferred until {new Date(item.deferredUntil).toLocaleDateString()}.</p>}{whyNotDone && <p className="why-not-done">{whyNotDone.summary}</p>}</section><section><h3>Confidence</h3><div className="confidence"><span className={`confidence-level ${confidence.level}`}>{confidence.level}</span><span>{item.completionConfidence}</span></div><ul className="confidence-reasons">{confidence.reasons.map((line) => <li key={line}>{line}</li>)}</ul>{confidence.lastConfirmedAt && <p className="muted">Last confirmed {relative(confidence.lastConfirmedAt)}{confidence.basis ? `, ${provenanceLabel[confidence.basis]}` : ""}.</p>}</section>{item.blockerReason && <section className="blocker-panel"><h3>Blocker</h3><p>{item.blockerReason}</p></section>}{waitingOn.length > 0 && <section className="blocker-panel"><h3>Waiting on</h3>{waitingOn.map((entry) => <p key={entry.id}><b>{entry.itemKey}</b> {entry.title} · {statusMeta[entry.status].label}</p>)}</section>}<section><h3>Dependencies</h3>{dependencies.length ? dependencies.map((edge) => { const linkedId = edge.fromWorkItemId === item.id ? edge.toWorkItemId : edge.fromWorkItemId; const linked = allItems.find((entry) => entry.id === linkedId); return <div className="dependency-row" key={edge.id}><span>{edge.type}</span><b>{linked?.itemKey}</b><p>{linked?.title}</p></div>; }) : <p className="muted">No dependencies.</p>}</section>{aliases.length > 0 && <section><h3>Also proposed</h3>{aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return <div className="alias-row" key={alias.id}><ProviderIcon provider={(aliasSource?.provider ?? "system") as Provider} /><span><strong>{alias.title}</strong><small>{aliasSource ? sourceName(aliasSource, drawerAmbiguousFamilies) : "Another agent"} · {relative(alias.createdAt)} · {alias.matchReason}</small></span><button className="alias-split" disabled={busy} onClick={() => splitAlias(alias.id)}>Not the same, make separate task</button></div>; })}</section>}</>}{tab === "activity" && events.map((event) => { const eventSource = sources.find((entry) => entry.id === event.sourceId); return <div className="mini-event" key={event.id}><ProviderIcon provider={(eventSource?.provider ?? "system") as Provider}/><span><strong>{event.summary}</strong><small>{event.actorName} · {relative(event.createdAt)}</small></span></div>; })}{tab === "evidence" && (evidence.length ? evidence.map((entry) => { const evidenceSource = sources.find((entry2) => entry2.id === entry.sourceId); return <div className="evidence-row" key={entry.id}>{evidenceSource ? <ProviderIcon provider={evidenceSource.provider} /> : <span className="evidence-check">✓</span>}<span><strong>{entry.label}</strong><small>{entry.type} · {entry.result ?? "recorded"} · {evidenceSource ? `by ${sourceName(evidenceSource, drawerAmbiguousFamilies)}` : "Manual"} · {relative(entry.createdAt)}</small></span></div>; }) : <p className="muted">No evidence attached yet.</p>)}</div><form className="drawer-note" onSubmit={(event) => { event.preventDefault(); if (!noteText.trim()) return; note(noteText.trim()); setNoteText(""); }}><input value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="Add a progress update…"/><button disabled={!noteText.trim() || busy}>Add</button></form></aside></div>;
 }
 
 function CommandDialog({ projects, currentProject, initialMode = "search", busy, close, create }: { projects: Project[]; currentProject: string; initialMode?: "search" | "project"; busy: boolean; close: () => void; create: (input: { name: string; description: string; gitRemote: string }) => Promise<CommandResult> }) {
@@ -970,7 +1277,12 @@ function ProviderStack({ accounts, ambiguousFamilies }: { accounts: ProposingAcc
 }
 function Assurance({ value }: { value: Source["assurance"] }) { return <span className={`assurance ${value}`} title={`Capture assurance: ${value}`}>{value === "enforced" ? "✓" : value === "observed" ? "◉" : value === "instructed" ? "↗" : "○"}</span>; }
 function Empty({ title, body, action, onAction, secondaryAction, onSecondaryAction }: { title: string; body: string; action?: string; onAction?: () => void; secondaryAction?: string; onSecondaryAction?: () => void }) { return <div className="empty-state"><span>☷</span><h3>{title}</h3><p>{body}</p><div className="empty-actions">{action && onAction && <button onClick={onAction}>{action}</button>}{secondaryAction && onSecondaryAction && <button className="secondary" onClick={onSecondaryAction}>{secondaryAction}</button>}</div></div>; }
+/** react-hooks/purity flags Date.now() called directly in a component body; routed through
+ * a plain function the same way `relative` already is. */
+function currentTime() { return Date.now(); }
 function relative(value: string) { const delta = Date.now() - new Date(value).getTime(); const minutes = Math.max(0, Math.floor(delta / 60000)); if (minutes < 1) return "now"; if (minutes < 60) return `${minutes}m`; const hours = Math.floor(minutes / 60); if (hours < 24) return `${hours}h`; return `${Math.floor(hours / 24)}d`; }
+/** A lease's remaining time, the future-facing counterpart to relative()'s past-facing one. */
+function expiresIn(value: string) { const delta = new Date(value).getTime() - Date.now(); if (delta <= 0) return "0m"; const minutes = Math.ceil(delta / 60000); if (minutes < 60) return `${minutes}m`; const hours = Math.floor(minutes / 60); if (hours < 24) return `${hours}h`; return `${Math.floor(hours / 24)}d`; }
 function eventAction(event: string) { return ({ "work_item.created": "created work", "work_item.started": "started work", "work_item.blocked": "reported a blocker", "work_item.completion_reported": "requested review", "work_item.completion_verified": "completed work", "work_item.progress_reported": "shared progress", "interaction.completed": "completed a turn", "evidence.attached": "attached evidence" } as Record<string, string>)[event] ?? event.replaceAll("_", " ").replace("work item.", ""); }
 function eventTone(event: WorkEvent) { if (event.eventType.includes("unblocked")) return "success"; if (event.eventType.includes("blocked") || event.eventType.includes("failed")) return "danger"; if (event.eventType.includes("verified") || event.toStatus === "done") return "success"; if (event.eventType.includes("review")) return "review"; return "normal"; }
 async function showSystemNotification(title: string, body: string) { if (typeof Notification === "undefined" || Notification.permission !== "granted" || document.visibilityState === "visible") return; const registration = await navigator.serviceWorker.ready; await registration.showNotification(title, { body, icon: "/planbraid-mark.png", badge: "/planbraid-mark.png", tag: `planbraid-${title}`, data: { url: "/" } }); }

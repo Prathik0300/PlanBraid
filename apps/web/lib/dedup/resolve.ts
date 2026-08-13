@@ -12,6 +12,7 @@ import type { PgD1 } from "@/db/pg-d1";
 import type { WorkItem } from "@/lib/contracts";
 import { buildSignature, fingerprint } from "./signature.ts";
 import { bestMatch, explain, type Candidate, type Proposal } from "./match.ts";
+import { classifyRelation, type RelationType } from "./relations.ts";
 
 export type Outcome = {
   ref?: string;
@@ -35,6 +36,11 @@ export type Outcome = {
     /** Conclusive enough to collapse, or only close enough to mention. */
     certain: boolean;
   };
+  /** E4 — Stage 3's classification of `match`, present whenever the proposal creates a
+   * new item alongside a non-duplicate match (`possible` or `conflict`). Absent when
+   * there is no match at all, or when the match collapsed the proposal into `duplicate`
+   * (an item that never gets created has nothing to relate to). */
+  relation?: { type: RelationType; reason: string };
   /** Content the proposal carried that the matched item does not already say. */
   delta: string[];
 };
@@ -95,6 +101,16 @@ export async function resolveProposals(
       if (match.verdict === "duplicate") {
         outcome.delta = describeDelta(description, canonical?.description ?? "");
         outcome.batchIndex = batchIndexById.get(match.candidate.id);
+      } else {
+        // E4 — Stage 3: what kind of relationship this is, for whatever gets created
+        // alongside the match. A candidate still provisional in this same batch
+        // (`batch:${index}`, no real id yet) is skipped — there is nothing in the
+        // database yet to link an edge or a decision option to, and it will exist as a
+        // normal item by the time a *later* proposal in the batch could match it.
+        if (!match.candidate.id.startsWith("batch:")) {
+          const relation = classifyRelation({ signature, fingerprintValue }, match.candidate);
+          if (relation.type !== "NEW") outcome.relation = relation;
+        }
       }
     }
 

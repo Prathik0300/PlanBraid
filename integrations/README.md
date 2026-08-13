@@ -42,6 +42,8 @@ Hook schemas change independently across providers. The bridge deliberately acce
 
 The hook bridge stores only a small session-to-source mapping under `~/.planbraid/bridge` (or `PLANBRAID_STATE_DIR`). It never opens provider transcript files. Cache files use owner-only permissions and are written atomically. A temporary Planbraid outage does not block the coding agent; the hook prints a short degraded-capture warning and exits successfully.
 
+At the end of each turn the bridge also reports repository state (M15): the commit sha, branch, and file paths changed since the merge base, via `git diff --name-status` (which of those paths were deleted or renamed away is reported too, for M17). This is paths and commit metadata only — never file contents or diffs, and never provider transcript files. Set `PLANBRAID_VERIFY_COMMAND` to a test/build command to have its exit status reported alongside; only the exit code is sent, never its output. Set `PLANBRAID_DISABLE_REPO_STATE=1` to opt out of this reporting entirely. Work items whose known files intersect the changed paths get evidence attached automatically, and that evidence is only ever marked verified when a configured verification command actually ran and exited zero. A deleted path never attaches evidence for itself — a removal is not confirmation of anything — and instead feeds Simplify's `evidence_removed` finding: a done item whose evidenced file was later deleted.
+
 Sessions with working start/stop hooks are shown as **enforced**. MCP-only integrations are shown as **instructed**, because the model must remember to call `sync_interaction` before responding.
 
 ## Web Push configuration

@@ -20,7 +20,7 @@ let counter = 0;
 function item(over = {}) {
   counter += 1;
   return {
-    id: `wi_${counter}`, projectId: "p1", sequence: counter, itemKey: `#${counter}`, parentId: null, type: "task",
+    id: `wi_${counter}`, projectId: "p1", sequence: counter, itemKey: `#${counter}`, type: "task",
     title: "", description: "", status: "proposed", priority: "normal", assignee: null, sourceId: null,
     codingSpaceId: null, completionConfidence: "reported", verificationStatus: "pending", blockerReason: null,
     blockingCount: 0, unblockedAt: null, version: 1, startedAt: null, completedAt: null,

@@ -25,11 +25,31 @@ class PgliteAdapter {
   }
 }
 
-/** Fresh in-memory database with the production schema, bypassing ensureSchema's process-wide singleton guard. */
+/**
+ * One PGlite per test process, reused across every createTestDb() call.
+ *
+ * Each PGlite is a WASM instance with its own multi-megabyte heap, and nothing closes
+ * them — so creating one per test leaked an instance per test, and with node:test running
+ * files in parallel the process eventually died with a V8 fatal error. The symptom was a
+ * suite that failed on a *different* file each run, which reads like flaky product code
+ * and is not.
+ *
+ * Reusing the instance and recreating the schema keeps memory flat. Top-level tests within
+ * a file run sequentially under node:test, so one test's reset can never land in the
+ * middle of another's queries.
+ */
+let shared;
+
+/** Fresh database state with the production schema, bypassing ensureSchema's process-wide singleton guard. */
 export async function createTestDb() {
   const { SCHEMA_STATEMENTS, MIGRATION_STATEMENTS } = await import("../../db/setup.ts");
-  const pglite = new PGlite();
-  for (const statement of SCHEMA_STATEMENTS) await pglite.query(statement);
-  for (const statement of MIGRATION_STATEMENTS) { try { await pglite.query(statement); } catch { /* already applied in this schema version */ } }
-  return new PgD1(new PgliteAdapter(pglite));
+  shared ??= new PGlite();
+  // Dropping and recreating `public` is what makes this a *fresh* database rather than a
+  // reused one: every table, sequence and index in it goes, so no test can see another's
+  // rows or leftover identity counters.
+  await shared.query("DROP SCHEMA IF EXISTS public CASCADE");
+  await shared.query("CREATE SCHEMA public");
+  for (const statement of SCHEMA_STATEMENTS) await shared.query(statement);
+  for (const statement of MIGRATION_STATEMENTS) { try { await shared.query(statement); } catch { /* already applied in this schema version */ } }
+  return new PgD1(new PgliteAdapter(shared));
 }

@@ -1,5 +1,36 @@
 export const WORK_STATUSES = ["proposed", "planned", "ready", "in_progress", "blocked", "in_review", "done", "cancelled"] as const;
 export type WorkStatus = (typeof WORK_STATUSES)[number];
+
+/**
+ * Planning maturity: whether this is work yet, or still something somebody said.
+ *
+ * Deliberately a second axis rather than five more statuses. `status` is a state machine
+ * with a transition table, derived board columns and a resolved-set that three modules
+ * read; maturity is a property of the item's standing, and the two vary independently —
+ * a proposal can be blocked, an accepted task can be proposed again.
+ *
+ * `supported` is absent on purpose: independent corroboration is derived from aliases by
+ * provider family, never stored, for the same reason the board column is derived.
+ */
+export const MATURITIES = ["idea", "proposal", "accepted", "committed"] as const;
+export type Maturity = (typeof MATURITIES)[number];
+
+/** Maturity at or below which an agent may write without a human's say-so. */
+export const AGENT_WRITABLE_MATURITIES: readonly Maturity[] = ["idea", "proposal"];
+
+/**
+ * Why a terminal item ended the way it did. `unspecified` is a real value, not a gap:
+ * "cancelled and nobody recorded why" is itself worth knowing, and inventing a reason
+ * would be worse than admitting there isn't one.
+ */
+export const RESOLUTIONS = ["completed", "rejected", "deferred", "superseded", "duplicate", "abandoned", "obsolete", "unspecified"] as const;
+export type Resolution = (typeof RESOLUTIONS)[number];
+
+/** How a maturity promotion was authorized. An agent reporting that the user agreed is
+ * weaker evidence than the user clicking accept, and the two must never be recorded
+ * identically. */
+export const AUTHORITIES = ["human_approved", "human_stated", "agent_proposed"] as const;
+export type Authority = (typeof AUTHORITIES)[number];
 /** Free-form MCP client or model-provider identifier supplied by the connecting client. */
 export type Provider = string;
 
@@ -13,6 +44,9 @@ export type Project = {
   revision: number;
   status: string;
   updatedAt: string;
+  /** When true, work no human has accepted is kept out of the board's working columns and
+   * listed in the Proposals queue instead. Off until a project turns it on. */
+  gateProposals: boolean;
 };
 
 export type CodingSpace = {
@@ -50,11 +84,17 @@ export type WorkItem = {
   projectId: string;
   sequence: number;
   itemKey: string;
-  parentId: string | null;
   type: string;
   title: string;
   description: string;
   status: WorkStatus;
+  /** Whether this is accepted work or still a proposal. See MATURITIES. */
+  maturity: Maturity;
+  /** Set only in a terminal status: why it ended this way. */
+  resolution: Resolution | null;
+  resolutionReason: string | null;
+  /** "Not now, revisit on this date." Excluded from ready work until it passes. */
+  deferredUntil: string | null;
   priority: "urgent" | "high" | "normal" | "low" | "none";
   assignee: string | null;
   sourceId: string | null;
@@ -62,6 +102,8 @@ export type WorkItem = {
   completionConfidence: string;
   verificationStatus: string;
   blockerReason: string | null;
+  /** How the item's current status was learned. See lib/trust/provenance.ts. */
+  statusProvenance: string | null;
   /** Count of unresolved hard-dependency prerequisites. Drives the derived board column: see lib/graph/column.ts. */
   blockingCount: number;
   unblockedAt: string | null;
@@ -85,6 +127,10 @@ export type WorkEvent = {
   fromStatus: WorkStatus | null;
   toStatus: WorkStatus | null;
   metadata: Record<string, unknown>;
+  /** How this claim was learned, when the write path recorded it. */
+  provenance: string | null;
+  /** Structured "why", separate from `summary`'s prose. */
+  reason: string | null;
   createdAt: string;
 };
 
@@ -119,15 +165,22 @@ export type DashboardState = {
   aliases: Array<{ id: string; workItemId: string; title: string; description: string; sourceId: string | null; matchMethod: string; matchReason: string; createdAt: string }>;
   /** Open "report everything you know" requests to a specific connected agent. See requestImport in lib/store.ts. */
   importRequests: Array<{ id: string; projectId: string; sourceId: string; createdAt: string }>;
+  /** Live work_claims leases (F1) not yet expired — who holds what right now, and until
+   * when. See lib/read/rows.ts's mapClaim for why this is kept distinct from source_id. */
+  claims: Array<{ id: string; workItemId: string; sourceId: string; mode: string; leaseExpiresAt: string; heartbeatAt: string }>;
   serverTime: string;
 };
 
 export type Command =
   | { action: "create_project"; name: string; directory?: string; description?: string; gitRemote?: string; idempotencyKey: string }
-  | { action: "update_project"; projectId: string; name?: string; description?: string; directory?: string; gitRemote?: string; idempotencyKey: string }
-  | { action: "create_item"; projectId: string; title: string; description?: string; status?: WorkStatus; priority?: WorkItem["priority"]; sourceId?: string; contentFingerprint?: string; idempotencyKey: string }
+  | { action: "update_project"; projectId: string; name?: string; description?: string; directory?: string; gitRemote?: string; gateProposals?: boolean; idempotencyKey: string }
+  | { action: "create_item"; projectId: string; title: string; description?: string; status?: WorkStatus; maturity?: Maturity; priority?: WorkItem["priority"]; sourceId?: string; contentFingerprint?: string; type?: string; idempotencyKey: string }
   | { action: "update_item"; projectId: string; itemId: string; expectedVersion: number; title?: string; description?: string; priority?: WorkItem["priority"]; assignee?: string | null; sourceId?: string; idempotencyKey: string }
-  | { action: "transition_item"; projectId: string; itemId: string; expectedVersion: number; status: WorkStatus; reason?: string; sourceId?: string; idempotencyKey: string }
+  | { action: "transition_item"; projectId: string; itemId: string; expectedVersion: number; status: WorkStatus; reason?: string; resolution?: Resolution; resolutionReason?: string; deferredUntil?: string | null; sourceId?: string; idempotencyKey: string }
+  /** Promote or demote planning maturity. `statedBy` names the person whose decision this
+   * was, and is what lets an agent record an acceptance it witnessed without being able to
+   * manufacture one. */
+  | { action: "set_maturity"; projectId: string; itemIds: string[]; maturity: Maturity; statedBy?: string; reason?: string; sourceId?: string; idempotencyKey: string }
   | { action: "add_note"; projectId: string; itemId: string; summary: string; sourceId?: string; idempotencyKey: string }
   | { action: "add_evidence"; projectId: string; itemId: string; type: string; label: string; uri?: string; result?: string; sourceId?: string; idempotencyKey: string }
   | { action: "add_dependency"; projectId: string; fromWorkItemId: string; toWorkItemId: string; type?: string; reason?: string; sourceId?: string; idempotencyKey: string }

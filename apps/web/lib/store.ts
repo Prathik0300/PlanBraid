@@ -1,17 +1,31 @@
 import { ensureSchema } from "@/db/setup";
 import type { PgD1, PgD1PreparedStatement } from "@/db/pg-d1";
-import type { Command, DashboardState, Notification, Project, Source, WorkEvent, WorkItem, WorkStatus } from "@/lib/contracts";
+import { AGENT_WRITABLE_MATURITIES, MATURITIES, RESOLUTIONS, type Authority, type Command, type DashboardState, type Maturity, type Resolution, type WorkItem, type WorkStatus } from "@/lib/contracts";
 import type { Proposal } from "@/lib/dedup/match.ts";
 import { aliasStatement, resolveProposals } from "@/lib/dedup/resolve.ts";
+import { edgeTypeForRelation } from "@/lib/dedup/relations.ts";
+import { backfillBlockingIndex, blockingIndexStatements, retrieveCandidates } from "@/lib/dedup/blocking.ts";
+import { captureLabelStatement, snapshotAdjudication } from "@/lib/dedup/labels.ts";
+import { appendPlanOp, type AuthorKind } from "@/lib/ops/log.ts";
+import { opPayloadFrom } from "@/lib/ops/hash.ts";
 import { DAG_EDGE_TYPES, DAG_EDGE_TYPE_SQL_LIST, isDagEdgeType } from "@/lib/graph/edges.ts";
 import { accountDisplayName, agentAccountKey, normalizeAccountLabel, providerFamily } from "@/lib/providers.ts";
+import { provenanceFor, type Provenance } from "@/lib/trust/provenance.ts";
+import { mapAlias, mapClaim, mapDependency, mapEvent, mapEvidence, mapItem, mapNotification, mapProject, mapSource, nullable, number, parseJson, text, type Row } from "@/lib/read/rows.ts";
+import { itemKeysFor } from "@/lib/read/project-view.ts";
 
 export type Principal = {
   userId: string;
   email: string;
   displayName: string;
   scopes?: string[];
-  authentication?: "browser" | "personal_token" | "oauth" | "local";
+  /**
+   * How this request authenticated. Required, not optional: it is what decides whether the
+   * caller may accept work or only propose it (see isHumanPrincipal), and a path that
+   * forgot to set it would silently get one answer or the other. Making it mandatory moves
+   * that from a convention to a compile error.
+   */
+  authentication: "browser" | "personal_token" | "oauth" | "local";
   /** The credential the request authenticated with, and the agent login it stands for.
    * Set for token/OAuth connections; absent for browser sessions, which are the person
    * themselves rather than one of their agents. */
@@ -19,8 +33,6 @@ export type Principal = {
   agentAccountId?: string;
   agentAccountLabel?: string;
 };
-
-type Row = Record<string, unknown>;
 
 const ALLOWED_TRANSITIONS: Record<WorkStatus, WorkStatus[]> = {
   proposed: ["planned", "ready", "cancelled"],
@@ -38,24 +50,33 @@ const ALLOWED_TRANSITIONS: Record<WorkStatus, WorkStatus[]> = {
  * downstream subtree permanently and invisibly. */
 const RESOLVED_STATUSES = new Set<WorkStatus>(["done", "cancelled"]);
 
-export function isLocalRequest(request: Request) {
-  const hostname = new URL(request.url).hostname;
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+/**
+ * A signed-in person acting in the web UI, as opposed to one of their agents holding a
+ * token. This is the whole of the agent-permission model: an agent may propose, and only a
+ * person may decide. See PLANNING_INTELLIGENCE_ROADMAP.md D1.
+ */
+function isHumanPrincipal(principal: Principal) {
+  return principal.authentication === "browser";
 }
 
-export function principalFromHeaders(headers: Headers, allowLocalDemo = false): Principal {
-  const authenticatedUserId = headers.get("oai-authenticated-user-id");
-  if (!authenticatedUserId && !allowLocalDemo) {
-    throw Object.assign(new Error("Authentication required"), { code: "AUTHENTICATION_REQUIRED", status: 401 });
-  }
-  const userId = authenticatedUserId ?? "local-demo-user";
-  const email = headers.get("oai-authenticated-user-email") ?? "you@planbraid.local";
-  const encodedName = headers.get("oai-authenticated-user-full-name");
-  let displayName = email.split("@")[0] || "You";
-  if (encodedName && headers.get("oai-authenticated-user-full-name-encoding") === "percent-encoded-utf-8") {
-    try { displayName = decodeURIComponent(encodedName); } catch { /* display fallback */ }
-  }
-  return { userId, email, displayName };
+function authorKindOf(principal: Principal): AuthorKind {
+  return isHumanPrincipal(principal) ? "human" : "agent";
+}
+
+/**
+ * Where a promotion's authority came from. An agent reporting "the user said yes" is real
+ * evidence and worth recording, but it is not the same evidence as the user clicking
+ * accept, and collapsing the two would make the distinction unrecoverable later.
+ */
+function authorityFor(principal: Principal, statedBy?: string): Authority {
+  if (isHumanPrincipal(principal)) return "human_approved";
+  return statedBy?.trim() ? "human_stated" : "agent_proposed";
+}
+
+/** The maturity a newly proposed item starts at, by who is proposing it. A person typing
+ * a task in the UI is deciding; an agent listing tasks is suggesting. */
+function defaultMaturity(principal: Principal): Maturity {
+  return isHumanPrincipal(principal) ? "accepted" : "proposal";
 }
 
 function id(prefix: string) {
@@ -68,14 +89,6 @@ async function digest(value: string) {
   return Array.from(new Uint8Array(hashed), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function parseJson<T>(value: unknown, fallback: T): T {
-  if (typeof value !== "string") return fallback;
-  try { return JSON.parse(value) as T; } catch { return fallback; }
-}
-
-function text(row: Row, key: string) { return String(row[key] ?? ""); }
-function nullable(row: Row, key: string) { return row[key] == null ? null : String(row[key]); }
-function number(row: Row, key: string) { return Number(row[key] ?? 0); }
 
 export async function organizationFor(db: PgD1, principal: Principal) {
   await ensureSchema(db);
@@ -86,6 +99,7 @@ export async function organizationFor(db: PgD1, principal: Principal) {
   if (existing) {
     await removeLegacyDemoData(db, existing.id, suffix);
     await removeGeneratedProjectShorthands(db, existing.id);
+    await resetUnearnedVerification(db, existing.id);
     return existing.id;
   }
 
@@ -98,12 +112,37 @@ export async function organizationFor(db: PgD1, principal: Principal) {
     db.prepare("INSERT INTO organizations (id, name, owner_user_id) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING").bind(organizationId, `${principal.displayName}'s workspace`, principal.userId),
     db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, LEGACY_DEMO_MIGRATION),
     db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, PROJECT_SHORTHAND_MIGRATION),
+    // A brand-new organization has nothing to correct, so the marker is written up front
+    // rather than making every future load re-check an empty table.
+    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, VERIFICATION_HONESTY_MIGRATION),
   ]);
   return organizationId;
 }
 
 const LEGACY_DEMO_MIGRATION = "2026-08-10-remove-built-in-demo-data";
 const PROJECT_SHORTHAND_MIGRATION = "2026-08-10-remove-generated-project-shorthands";
+const VERIFICATION_HONESTY_MIGRATION = "2026-08-13-verification-status-is-not-status";
+
+/**
+ * Undoes finding F4's damage to existing data.
+ *
+ * Every item ever moved to done was stamped verification_status='passed' and
+ * completion_confidence='verified' purely because of the move, with nothing having checked
+ * anything. Leaving those values would mean the trust layer's first act is to report
+ * fabricated verification, so they are reset for every item with no evidence at all.
+ *
+ * Items that do carry evidence keep 'supported': something was attached, even if nothing
+ * has machine-checked it yet. That is what M16's verifier will upgrade.
+ */
+async function resetUnearnedVerification(db: PgD1, organizationId: string) {
+  const alreadyApplied = await db.prepare("SELECT 1 FROM data_migrations WHERE organization_id = ? AND migration_key = ?").bind(organizationId, VERIFICATION_HONESTY_MIGRATION).first();
+  if (alreadyApplied) return;
+  await db.batch([
+    db.prepare("UPDATE work_items SET verification_status = 'pending', completion_confidence = 'reported' WHERE organization_id = ? AND NOT EXISTS (SELECT 1 FROM evidence WHERE evidence.work_item_id = work_items.id)").bind(organizationId),
+    db.prepare("UPDATE work_items SET verification_status = 'pending', completion_confidence = 'supported' WHERE organization_id = ? AND verification_status = 'passed' AND EXISTS (SELECT 1 FROM evidence WHERE evidence.work_item_id = work_items.id)").bind(organizationId),
+    db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, VERIFICATION_HONESTY_MIGRATION),
+  ]);
+}
 
 async function removeLegacyDemoData(db: PgD1, organizationId: string, suffix: string) {
   const alreadyApplied = await db.prepare("SELECT 1 FROM data_migrations WHERE organization_id = ? AND migration_key = ?").bind(organizationId, LEGACY_DEMO_MIGRATION).first();
@@ -140,28 +179,9 @@ async function removeGeneratedProjectShorthands(db: PgD1, organizationId: string
   ]);
 }
 
-function mapProject(row: Row): Project {
-  return { id: text(row, "id"), name: text(row, "name"), description: text(row, "description"), directory: text(row, "directory"), gitRemote: nullable(row, "git_remote"), defaultBranch: text(row, "default_branch"), revision: number(row, "revision"), status: text(row, "status"), updatedAt: text(row, "updated_at") };
-}
-function mapSource(row: Row): Source {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), codingSpaceId: nullable(row, "coding_space_id"), provider: text(row, "provider") as Source["provider"], externalId: text(row, "external_id"), title: text(row, "title"), model: nullable(row, "model"), status: text(row, "status"), assurance: text(row, "assurance") as Source["assurance"], currentTaskIds: parseJson(text(row, "current_task_ids"), []), lastSeenAt: text(row, "last_seen_at"), agentAccountId: nullable(row, "agent_account_id"), agentAccountLabel: nullable(row, "agent_account_label") };
-}
-function mapItem(row: Row): WorkItem {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), sequence: number(row, "sequence"), itemKey: text(row, "item_key"), parentId: nullable(row, "parent_id"), type: text(row, "type"), title: text(row, "title"), description: text(row, "description"), status: text(row, "status") as WorkStatus, priority: text(row, "priority") as WorkItem["priority"], assignee: nullable(row, "assignee"), sourceId: nullable(row, "source_id"), codingSpaceId: nullable(row, "coding_space_id"), completionConfidence: text(row, "completion_confidence"), verificationStatus: text(row, "verification_status"), blockerReason: nullable(row, "blocker_reason"), blockingCount: number(row, "blocking_count"), unblockedAt: nullable(row, "unblocked_at"), version: number(row, "version"), startedAt: nullable(row, "started_at"), completedAt: nullable(row, "completed_at"), createdAt: text(row, "created_at"), updatedAt: text(row, "updated_at") };
-}
-function mapEvent(row: Row): WorkEvent {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), projectRevision: number(row, "project_revision"), workItemId: nullable(row, "work_item_id"), sourceId: nullable(row, "source_id"), interactionId: nullable(row, "interaction_id"), actorName: text(row, "actor_name"), eventType: text(row, "event_type"), summary: text(row, "summary"), fromStatus: nullable(row, "from_status") as WorkStatus | null, toStatus: nullable(row, "to_status") as WorkStatus | null, metadata: parseJson(text(row, "metadata"), {}), createdAt: text(row, "created_at") };
-}
-function mapNotification(row: Row): Notification {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), workItemId: nullable(row, "work_item_id"), sourceId: nullable(row, "source_id"), interactionId: nullable(row, "interaction_id"), eventType: text(row, "event_type"), priority: text(row, "priority"), title: text(row, "title"), body: text(row, "body"), deepLink: text(row, "deep_link"), requiresAction: Boolean(row.requires_action), readAt: nullable(row, "read_at"), resolvedAt: nullable(row, "resolved_at"), createdAt: text(row, "created_at") };
-}
-function mapAlias(row: Row) {
-  return { id: text(row, "id"), workItemId: text(row, "work_item_id"), title: text(row, "title"), description: text(row, "description"), sourceId: nullable(row, "source_id"), matchMethod: text(row, "match_method"), matchReason: text(row, "match_reason"), createdAt: text(row, "created_at") };
-}
-
 export async function loadDashboard(db: PgD1, principal: Principal): Promise<DashboardState> {
   const organizationId = await organizationFor(db, principal);
-  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows] = await db.batch([
+  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows, claimRows] = await db.batch([
     db.prepare("SELECT * FROM projects WHERE organization_id = ? ORDER BY updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM coding_spaces WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM sources WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
@@ -172,6 +192,9 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     db.prepare("SELECT * FROM evidence WHERE organization_id = ? ORDER BY created_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM work_item_aliases WHERE organization_id = ? ORDER BY created_at DESC LIMIT 500").bind(organizationId),
     db.prepare("SELECT * FROM import_requests WHERE organization_id = ? AND status = 'pending' ORDER BY created_at DESC").bind(organizationId),
+    // work_claims carries no organization_id of its own (F1's schema), so scoping goes
+    // through work_items; only unexpired leases are ever worth shipping to a client.
+    db.prepare("SELECT wc.* FROM work_claims wc JOIN work_items wi ON wi.id = wc.work_item_id WHERE wi.organization_id = ? AND wc.lease_expires_at > now()").bind(organizationId),
   ]);
   return {
     viewer: { id: principal.userId, name: principal.displayName, email: principal.email },
@@ -181,10 +204,11 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     workItems: (items.results as Row[]).map(mapItem),
     events: (events.results as Row[]).map(mapEvent),
     notifications: (notifications.results as Row[]).map(mapNotification),
-    dependencies: (dependencies.results as Row[]).map((row) => ({ id: text(row, "id"), fromWorkItemId: text(row, "from_work_item_id"), toWorkItemId: text(row, "to_work_item_id"), type: text(row, "type"), reason: text(row, "reason") })),
-    evidence: (evidenceRows.results as Row[]).map((row) => ({ id: text(row, "id"), workItemId: text(row, "work_item_id"), sourceId: nullable(row, "source_id"), type: text(row, "type"), label: text(row, "label"), uri: nullable(row, "uri"), result: nullable(row, "result"), createdAt: text(row, "created_at") })),
+    dependencies: (dependencies.results as Row[]).map(mapDependency),
+    evidence: (evidenceRows.results as Row[]).map(mapEvidence),
     aliases: (aliasRows.results as Row[]).map(mapAlias),
     importRequests: (importRequestRows.results as Row[]).map((row) => ({ id: text(row, "id"), projectId: text(row, "project_id"), sourceId: text(row, "source_id"), createdAt: text(row, "created_at") })),
+    claims: (claimRows.results as Row[]).map(mapClaim),
     serverTime: new Date().toISOString(),
   };
 }
@@ -281,7 +305,13 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
 
   if (command.action === "mark_notification") {
     const now = new Date().toISOString();
-    const update = await db.prepare("UPDATE notifications SET read_at = CASE WHEN ? = 1 THEN ? ELSE NULL END, resolved_at = CASE WHEN ? = 1 THEN ? ELSE resolved_at END WHERE id = ? AND organization_id = ? AND recipient_user_id = ? RETURNING id").bind(command.read === false ? 0 : 1, now, command.resolved ? 1 : 0, now, command.notificationId, organizationId, principal.userId).first();
+    // Explicit ::timestamptz casts on both the timestamp literal and the untyped NULL: a
+    // CASE mixing a bound text-looking parameter, a bare NULL, and a TIMESTAMPTZ column
+    // reference leaves Postgres nothing but context to infer a type from, and this
+    // pattern had zero test coverage in the whole suite — nothing had ever actually run
+    // this query before. Real booleans (not 0/1 integers compared against a literal)
+    // read as what they mean.
+    const update = await db.prepare("UPDATE notifications SET read_at = CASE WHEN ?::boolean THEN ?::timestamptz ELSE NULL::timestamptz END, resolved_at = CASE WHEN ?::boolean THEN ?::timestamptz ELSE resolved_at END WHERE id = ? AND organization_id = ? AND recipient_user_id = ? RETURNING id").bind(command.read !== false, now, Boolean(command.resolved), now, command.notificationId, organizationId, principal.userId).first();
     if (!update) throw domainError("NOT_FOUND", "Notification not found", 404);
     const response = { notificationId: command.notificationId };
     await db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)).run();
@@ -351,11 +381,16 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     if (command.name !== undefined && !cleanName) throw domainError("VALIDATION_FAILED", "Project name cannot be empty");
     const directory = command.directory?.trim().slice(0, 500);
     const gitRemote = command.gitRemote?.trim().slice(0, 500);
-    const changed = [cleanName && "name", command.description !== undefined && "description", directory && "directory", gitRemote && "remote"].filter(Boolean).join(", ") || "details";
+    const changed = [cleanName && "name", command.description !== undefined && "description", directory && "directory", gitRemote && "remote", command.gateProposals !== undefined && "proposal gating"].filter(Boolean).join(", ") || "details";
+    // Merged into the existing settings rather than replacing them, so adding a second
+    // setting later cannot silently clear the first.
+    const settings = command.gateProposals === undefined
+      ? null
+      : JSON.stringify({ ...parseJson<Record<string, unknown>>(text(project, "settings"), {}), gateProposals: command.gateProposals });
     const response = { projectId: command.projectId, projectRevision: nextRevision };
     await commitMutation(db, [
-      db.prepare("UPDATE projects SET name = COALESCE(?, name), description = COALESCE(?, description), directory = COALESCE(?, directory), git_remote = COALESCE(?, git_remote), revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?")
-        .bind(cleanName ?? null, command.description?.trim().slice(0, 2000) ?? null, directory ?? null, gitRemote ?? null, nextRevision, now, command.projectId, organizationId, currentRevision),
+      db.prepare("UPDATE projects SET name = COALESCE(?, name), description = COALESCE(?, description), directory = COALESCE(?, directory), git_remote = COALESCE(?, git_remote), settings = COALESCE(?, settings), revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?")
+        .bind(cleanName ?? null, command.description?.trim().slice(0, 2000) ?? null, directory ?? null, gitRemote ?? null, settings, nextRevision, now, command.projectId, organizationId, currentRevision),
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'project.updated', ?, ?)")
         .bind(id("evt"), organizationId, command.projectId, nextRevision, principal.displayName, `${principal.displayName} updated ${changed}`, now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
@@ -371,14 +406,26 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const itemId = id("wi");
     const itemKey = `#${sequence}`;
     const status = command.status ?? "proposed";
+    // An agent may not create work already accepted. Anything it asks for above its
+    // ceiling is clamped rather than rejected: the item is still real and still recorded,
+    // it just arrives as a proposal awaiting a person, which is the honest state.
+    const requested = command.maturity && MATURITIES.includes(command.maturity) ? command.maturity : defaultMaturity(principal);
+    const maturity: Maturity = isHumanPrincipal(principal) || AGENT_WRITABLE_MATURITIES.includes(requested) ? requested : "proposal";
     const actor = command.sourceId ? await sourceActor(db, organizationId, command.sourceId) : principal.displayName;
-    const response = { itemId, itemKey, version: 1, projectRevision: nextRevision };
+    const interactionId = await activeInteractionId(db, command.sourceId);
+    const description = command.description?.trim().slice(0, 10000) ?? "";
+    const itemType = command.type?.trim().slice(0, 40) || "task";
+    const response = { itemId, itemKey, version: 1, projectRevision: nextRevision, maturity };
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?").bind(nextRevision, now, command.projectId, organizationId, currentRevision),
-      db.prepare("INSERT INTO work_items (id, organization_id, project_id, sequence, item_key, title, description, status, priority, source_id, content_fingerprint, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)").bind(itemId, organizationId, command.projectId, sequence, itemKey, cleanTitle, command.description?.trim().slice(0, 10000) ?? "", status, command.priority ?? "normal", command.sourceId ?? null, command.contentFingerprint ?? null, now, now),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, to_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.created', ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, itemId, command.sourceId ?? null, actor, `${actor} created ${itemKey}: ${cleanTitle}`, status, now),
+      db.prepare("INSERT INTO work_items (id, organization_id, project_id, sequence, item_key, type, title, description, status, maturity, priority, source_id, content_fingerprint, status_provenance, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)").bind(itemId, organizationId, command.projectId, sequence, itemKey, itemType, cleanTitle, description, status, maturity, command.priority ?? "normal", command.sourceId ?? null, command.contentFingerprint ?? null, provenanceFor(principal), now, now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, to_status, provenance, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'work_item.created', ?, ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, itemId, command.sourceId ?? null, interactionId, actor, `${actor} created ${itemKey}: ${cleanTitle}`, status, provenanceFor(principal), now),
+      // Indexed in the same batch as the insert, so an item is never visible to a reader
+      // without being visible to the matcher that has to find it.
+      ...blockingIndexStatements(db, { organizationId, projectId: command.projectId, workItemId: itemId, title: cleanTitle, description, now }),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom({ ...command, itemId }), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
     return response;
   }
 
@@ -391,6 +438,7 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     if (!from.results.length || !to.results.length) throw domainError("NOT_FOUND", "Dependency task not found", 404);
     const edgeType = command.type ?? "blocks";
     const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(to.results[0], "source_id"));
+    const dependencyInteractionId = await activeInteractionId(db, command.sourceId ?? nullable(to.results[0], "source_id"));
     // A duplicate edge is a no-op, not a conflict: two agents independently declaring
     // the same prerequisite agree with each other. Without this check the INSERT below
     // trips the UNIQUE(from, to, type) constraint and commitMutation's generic handler
@@ -409,7 +457,7 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const statements = [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("INSERT INTO dependencies (id, organization_id, project_id, from_work_item_id, to_work_item_id, type, reason) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(dependencyId, organizationId, command.projectId, command.fromWorkItemId, command.toWorkItemId, edgeType, command.reason?.slice(0, 1000) ?? ""),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'dependency.added', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.toWorkItemId, command.sourceId ?? nullable(to.results[0], "source_id"), actor, `${actor} added a dependency`, now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dependency.added', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.toWorkItemId, command.sourceId ?? nullable(to.results[0], "source_id"), dependencyInteractionId, actor, `${actor} added a dependency`, now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ];
     // Only a hard, unresolved prerequisite blocks anything. An edge to an already-done
@@ -418,12 +466,55 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
       statements.push(db.prepare("UPDATE work_items SET blocking_count = blocking_count + 1, updated_at = ? WHERE id = ?").bind(now, command.toWorkItemId));
     }
     await commitMutation(db, statements);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom({ ...command, dependencyId }), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
+    return response;
+  }
+
+  if (command.action === "set_maturity") {
+    if (!MATURITIES.includes(command.maturity)) throw domainError("VALIDATION_FAILED", `Unknown maturity: ${command.maturity}`);
+    const itemIds = [...new Set(command.itemIds)].slice(0, 100);
+    if (!itemIds.length) throw domainError("VALIDATION_FAILED", "At least one task is required");
+    const statedBy = command.statedBy?.trim().slice(0, 120);
+    const authority = authorityFor(principal, statedBy);
+    // The agent-permission model in one branch: an agent may propose, and may *report* a
+    // person's decision (naming them), but may not manufacture one. Without `statedBy`
+    // there is nobody the acceptance can be attributed to, which is precisely the state
+    // that must not become project policy.
+    if (authority === "agent_proposed" && !AGENT_WRITABLE_MATURITIES.includes(command.maturity)) {
+      throw domainError("AUTHORITY_REQUIRED", `Only a person can mark work ${command.maturity}. Pass stated_by naming who decided, or leave it as a proposal for them to accept.`, 403, { allowed: AGENT_WRITABLE_MATURITIES });
+    }
+    const rows = await db.prepare("SELECT id, item_key, maturity FROM work_items WHERE organization_id = ? AND project_id = ? AND archived_at IS NULL AND id = ANY(?::text[])")
+      .bind(organizationId, command.projectId, itemIds).all<{ id: string; item_key: string; maturity: string }>();
+    if (!rows.results.length) throw domainError("NOT_FOUND", "Task not found", 404);
+    // Items already at the target maturity are dropped rather than rewritten, so a
+    // repeated accept does not bump versions and invalidate every agent's expected_version.
+    const changing = rows.results.filter((row) => row.maturity !== command.maturity);
+    const keys = changing.map((row) => row.item_key);
+    const actor = await resolveActor(db, organizationId, principal, command.sourceId, null);
+    const maturityInteractionId = await activeInteractionId(db, command.sourceId);
+    const response = { projectId: command.projectId, maturity: command.maturity, authority, changed: changing.map((row) => row.id), itemKeys: keys, unchanged: rows.results.length - changing.length, projectRevision: changing.length ? nextRevision : currentRevision };
+    if (!changing.length) {
+      await db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)).run();
+      return response;
+    }
+    const summary = `${actor} marked ${keys.join(", ")} ${command.maturity}${statedBy ? `, as decided by ${statedBy}` : ""}${command.reason ? `: ${command.reason.slice(0, 300)}` : ""}`;
+    await commitMutation(db, [
+      db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?").bind(nextRevision, now, command.projectId, organizationId, currentRevision),
+      db.prepare("UPDATE work_items SET maturity = ?, version = version + 1, updated_at = ? WHERE organization_id = ? AND id = ANY(?::text[])").bind(command.maturity, now, organizationId, changing.map((row) => row.id)),
+      // One aggregate event, not one per item: work_events has UNIQUE(project_id,
+      // project_revision), so N events would need N revisions, and "accepted 6 tasks" is
+      // also the sentence a person wants to read.
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, metadata, provenance, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'work_item.maturity_changed', ?, ?, ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, nextRevision, changing.length === 1 ? changing[0].id : null, command.sourceId ?? null, maturityInteractionId, actor, summary, JSON.stringify({ maturity: command.maturity, authority, statedBy: statedBy ?? null, workItemIds: changing.map((row) => row.id), itemKeys: keys }), provenanceFor(principal, { statedBy }), now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom({ ...command, itemIds: changing.map((row) => row.id) }), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
     return response;
   }
 
   if (command.action === "split_alias") {
     const alias = await db.prepare(
-      "SELECT a.*, wi.item_key AS target_item_key FROM work_item_aliases a JOIN work_items wi ON wi.id = a.work_item_id WHERE a.id = ? AND a.organization_id = ? AND a.project_id = ?",
+      "SELECT a.*, wi.item_key AS target_item_key, wi.title AS target_title, wi.description AS target_description FROM work_item_aliases a JOIN work_items wi ON wi.id = a.work_item_id WHERE a.id = ? AND a.organization_id = ? AND a.project_id = ?",
     ).bind(command.aliasId, organizationId, command.projectId).first<Row>();
     if (!alias) throw domainError("NOT_FOUND", "Alias not found", 404);
     const cleanTitle = text(alias, "title").trim().slice(0, 240) || "Untitled task";
@@ -437,13 +528,25 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
         const restored = { itemId: archived.id, itemKey: archived.item_key, version: 1, projectRevision: nextRevision, splitFromWorkItemId: text(alias, "work_item_id"), restored: true };
         await commitMutation(db, [
           db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?").bind(nextRevision, now, command.projectId, organizationId, currentRevision),
-          db.prepare("UPDATE work_items SET archived_at = NULL, version = version + 1, updated_at = ? WHERE id = ? AND organization_id = ?").bind(now, archived.id, organizationId),
+          // artifacts_indexed_at back to NULL because merge_items deleted this item's index
+          // rows; the next dedup call backfills them rather than this write recomputing a
+          // signature it does not otherwise need.
+          db.prepare("UPDATE work_items SET archived_at = NULL, artifacts_indexed_at = NULL, resolution = NULL, resolution_reason = NULL, version = version + 1, updated_at = ? WHERE id = ? AND organization_id = ?").bind(now, archived.id, organizationId),
           db.prepare("DELETE FROM work_item_aliases WHERE id = ? AND organization_id = ?").bind(command.aliasId, organizationId),
           db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.split_from_alias', ?, ?, ?)")
             .bind(id("evt"), organizationId, command.projectId, nextRevision, archived.id, nullable(alias, "source_id"), principal.displayName, `${principal.displayName} restored ${archived.item_key} out of ${text(alias, "target_item_key")}`, JSON.stringify({ splitFromWorkItemId: text(alias, "work_item_id"), splitFromItemKey: text(alias, "target_item_key"), restored: true }), now),
           db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(restored)),
+          // E0's golden set: a person undoing a merge is a negative label — "these are
+          // not the same" — the correction to whatever earlier positive label the merge
+          // itself recorded. See lib/dedup/labels.ts.
+          captureLabelStatement(db, {
+            organizationId, projectId: command.projectId, leftItemId: text(alias, "work_item_id"), rightItemId: archived.id,
+            verdict: "different", confidence: "high", source: "split",
+            adjudication: snapshotAdjudication({ title: text(alias, "target_title"), description: text(alias, "target_description") }, { title: text(alias, "title"), description: text(alias, "description") }),
+          }),
         ]);
         await recomputeBlockingCounts(db, organizationId, command.projectId);
+        await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom({ ...command, restoredItemId: archived.id }), authorKind: authorKindOf(principal), authorName: principal.displayName, sourceId: nullable(alias, "source_id") });
         return restored;
       }
     }
@@ -460,7 +563,16 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
       db.prepare("DELETE FROM work_item_aliases WHERE id = ? AND organization_id = ?").bind(command.aliasId, organizationId),
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.split_from_alias', ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, itemId, aliasSourceId, principal.displayName, `${principal.displayName} split "${cleanTitle}" out from ${targetItemKey} as ${itemKey}`, JSON.stringify({ splitFromWorkItemId: text(alias, "work_item_id"), splitFromItemKey: targetItemKey }), now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+      // Same negative label as the restore path above, for a match that was never a
+      // merge — the structural matcher folded a fresh proposal into an existing item, and
+      // a person is now saying it should not have.
+      captureLabelStatement(db, {
+        organizationId, projectId: command.projectId, leftItemId: text(alias, "work_item_id"), rightItemId: itemId,
+        verdict: "different", confidence: "high", source: "split",
+        adjudication: snapshotAdjudication({ title: text(alias, "target_title"), description: text(alias, "target_description") }, { title: cleanTitle, description: text(alias, "description") }),
+      }),
     ]);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom({ ...command, newItemId: itemId }), authorKind: authorKindOf(principal), authorName: principal.displayName, sourceId: aliasSourceId });
     return response;
   }
 
@@ -499,14 +611,28 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
       db.prepare(
         "INSERT INTO work_item_aliases (id, organization_id, project_id, work_item_id, title, description, source_id, match_score, match_method, match_reason, archived_work_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'merge', ?, ?)",
       ).bind(id("als"), organizationId, command.projectId, command.winnerItemId, text(loser, "title"), text(loser, "description"), nullable(loser, "source_id"), reason, command.loserItemId),
-      db.prepare("UPDATE work_items SET archived_at = ?, updated_at = ? WHERE id = ? AND organization_id = ?").bind(now, now, command.loserItemId, organizationId),
+      // The loser is archived rather than cancelled, but it still carries why it ended:
+      // "duplicate" is the answer to "what happened to #7", and split_alias can undo it.
+      db.prepare("UPDATE work_items SET archived_at = ?, resolution = 'duplicate', resolution_reason = ?, updated_at = ? WHERE id = ? AND organization_id = ?").bind(now, reason, now, command.loserItemId, organizationId),
+      // Retrieval already filters archived items, so leaving these would only be dead
+      // weight — but split_alias can restore the loser, which re-indexes on the way back.
+      db.prepare("DELETE FROM work_item_artifacts WHERE work_item_id = ? AND project_id = ?").bind(command.loserItemId, command.projectId),
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.merged', ?, ?, ?)")
         .bind(id("evt"), organizationId, command.projectId, nextRevision, command.winnerItemId, command.sourceId ?? nullable(loser, "source_id"), actor, `${actor} merged ${loserKey} into ${winnerKey}: ${text(loser, "title")}`, JSON.stringify({ loserItemId: command.loserItemId, loserItemKey: loserKey, reason }), now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+      // E0's golden set: a person merging two items is a positive label — "these are the
+      // same work" — captured at the moment of the decision, in the same commit as the
+      // merge itself. See lib/dedup/labels.ts.
+      captureLabelStatement(db, {
+        organizationId, projectId: command.projectId, leftItemId: command.winnerItemId, rightItemId: command.loserItemId,
+        verdict: "same", confidence: "high", source: "merge", justification: reason,
+        adjudication: snapshotAdjudication({ title: text(winner, "title"), description: text(winner, "description") }, { title: text(loser, "title"), description: text(loser, "description") }),
+      }),
     ]);
     // Moving edges changes who blocks whom; recompute rather than trying to track the
     // delta through three conditional deletes and two moves.
     await recomputeBlockingCounts(db, organizationId, command.projectId);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom(command), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
     return response;
   }
 
@@ -518,13 +644,15 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const summary = command.summary.trim().slice(0, 2000);
     if (!summary) throw domainError("VALIDATION_FAILED", "Progress update is required");
     const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
+    const noteInteractionId = await activeInteractionId(db, command.sourceId);
     const response = { itemId: command.itemId, version: number(item, "version") + 1, projectRevision: nextRevision };
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("UPDATE work_items SET version = version + 1, updated_at = ? WHERE id = ?").bind(now, command.itemId),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.progress_reported', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? null, actor, summary, now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, provenance, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'work_item.progress_reported', ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? null, noteInteractionId, actor, summary, provenanceFor(principal), now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom(command), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
     return response;
   }
 
@@ -536,13 +664,15 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     // source (rather than jumping straight to the generic principal display name) is
     // what actually resolves "Connected agent attached evidence" to the real agent.
     const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
+    const evidenceInteractionId = await activeInteractionId(db, command.sourceId);
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("INSERT INTO evidence (id, organization_id, project_id, work_item_id, type, label, uri, result, source_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(evidenceId, organizationId, command.projectId, command.itemId, command.type.slice(0, 40), command.label.slice(0, 300), command.uri?.slice(0, 2000) ?? null, command.result?.slice(0, 500) ?? null, command.sourceId ?? null, now),
       db.prepare("UPDATE work_items SET completion_confidence = 'supported', version = version + 1, updated_at = ? WHERE id = ?").bind(now, command.itemId),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'evidence.attached', ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? null, actor, `${actor} attached ${command.type} evidence: ${command.label}`, JSON.stringify({ evidenceId }), now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, metadata, provenance, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'evidence.attached', ?, ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? null, evidenceInteractionId, actor, `${actor} attached ${command.type} evidence: ${command.label}`, JSON.stringify({ evidenceId }), provenanceFor(principal), now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom({ ...command, evidenceId }), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
     return response;
   }
 
@@ -555,24 +685,51 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     const priority = command.priority ?? text(item, "priority");
     const assignee = command.assignee === undefined ? nullable(item, "assignee") : command.assignee;
     const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
+    const updateInteractionId = await activeInteractionId(db, command.sourceId ?? nullable(item, "source_id"));
     const response = { itemId: command.itemId, version: command.expectedVersion + 1, projectRevision: nextRevision };
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("UPDATE work_items SET title = ?, description = ?, priority = ?, assignee = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?").bind(title, description, priority, assignee, now, command.itemId, command.expectedVersion),
-      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'work_item.updated', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? nullable(item, "source_id"), actor, `${actor} updated ${itemKey}`, now),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'work_item.updated', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? nullable(item, "source_id"), updateInteractionId, actor, `${actor} updated ${itemKey}`, now),
+      // Re-indexed rather than appended to: an edited title can *drop* an artifact, and an
+      // index that only grows keeps matching a file the task no longer mentions.
+      ...blockingIndexStatements(db, { organizationId, projectId: command.projectId, workItemId: command.itemId, title, description, now }),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
+    await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom(command), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
     return response;
   }
 
   const currentStatus = text(item, "status") as WorkStatus;
   if (!ALLOWED_TRANSITIONS[currentStatus].includes(command.status) && currentStatus !== command.status) throw domainError("INVALID_TRANSITION", `Cannot move ${itemKey} from ${currentStatus} to ${command.status}`, 422, { allowed: ALLOWED_TRANSITIONS[currentStatus] });
   const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
+  const transitionInteractionId = await activeInteractionId(db, command.sourceId ?? nullable(item, "source_id"));
   const blockerReason = command.status === "blocked" ? command.reason?.trim().slice(0, 2000) || "Blocked without a reason" : null;
   const startedAt = command.status === "in_progress" && !item.started_at ? now : nullable(item, "started_at");
   const completedAt = command.status === "done" ? now : command.status === "in_progress" || command.status === "ready" ? null : nullable(item, "completed_at");
-  const verification = command.status === "done" ? "passed" : text(item, "verification_status");
-  const confidence = command.status === "done" ? "verified" : text(item, "completion_confidence");
+  // F4: neither of these is written from `status` any more. Moving a card to done said
+  // nothing about whether anything was verified, yet it set verification_status='passed'
+  // and completion_confidence='verified' — which made the product's central distinction
+  // ("an agent says it finished" versus "the implementation exists") unrepresentable even
+  // though both columns existed. They now change only when evidence changes.
+  const verification = text(item, "verification_status");
+  const confidence = text(item, "completion_confidence");
+  if (command.resolution && !RESOLUTIONS.includes(command.resolution)) throw domainError("VALIDATION_FAILED", `Unknown resolution: ${command.resolution}`);
+  const enteringTerminal = RESOLVED_STATUSES.has(command.status);
+  // Completing a task resolves it as completed; cancelling one without saying why is
+  // recorded as 'unspecified' rather than guessed at. "Nobody wrote down the reason" is
+  // itself a fact worth keeping, and inventing 'abandoned' or 'rejected' would assert
+  // something no actor said.
+  const resolution: Resolution | null = enteringTerminal
+    ? command.resolution ?? (command.status === "done" ? "completed" : "unspecified")
+    : null;
+  const resolutionReason = enteringTerminal ? command.resolutionReason?.trim().slice(0, 1000) ?? command.reason?.trim().slice(0, 1000) ?? null : null;
+  // Deferral is cleared by starting or finishing the work: an item somebody is actively
+  // holding is not "not now", whatever date was on it.
+  const deferredUntil = command.deferredUntil !== undefined
+    ? command.deferredUntil
+    : ["in_progress", "in_review", "done", "cancelled"].includes(command.status) ? null : nullable(item, "deferred_until");
+  const statusProvenance: Provenance = provenanceFor(principal);
   const eventType = transitionEvent(command.status);
   const summary = `${actor} moved ${itemKey} from ${currentStatus.replaceAll("_", " ")} to ${command.status.replaceAll("_", " ")}${command.reason ? `: ${command.reason.slice(0, 500)}` : ""}`;
   const notificationId = id("ntf");
@@ -598,8 +755,8 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   const response = { itemId: command.itemId, version: command.expectedVersion + 1, projectRevision: finalRevision, notificationId };
   const statements = [
     db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(finalRevision, now, command.projectId, currentRevision),
-    db.prepare("UPDATE work_items SET status = ?, blocker_reason = ?, started_at = ?, completed_at = ?, verification_status = ?, completion_confidence = ?, source_id = COALESCE(?, source_id), version = version + 1, updated_at = ? WHERE id = ? AND version = ?").bind(command.status, blockerReason, startedAt, completedAt, verification, confidence, command.sourceId ?? null, now, command.itemId, command.expectedVersion),
-    db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, actor_name, event_type, summary, from_status, to_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? nullable(item, "source_id"), actor, eventType, summary, currentStatus, command.status, now),
+    db.prepare("UPDATE work_items SET status = ?, blocker_reason = ?, started_at = ?, completed_at = ?, verification_status = ?, completion_confidence = ?, resolution = ?, resolution_reason = ?, deferred_until = ?, status_provenance = ?, source_id = COALESCE(?, source_id), version = version + 1, updated_at = ? WHERE id = ? AND version = ?").bind(command.status, blockerReason, startedAt, completedAt, verification, confidence, resolution, resolutionReason, deferredUntil, statusProvenance, command.sourceId ?? null, now, command.itemId, command.expectedVersion),
+    db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, from_status, to_status, provenance, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? nullable(item, "source_id"), transitionInteractionId, actor, eventType, summary, currentStatus, command.status, statusProvenance, command.reason?.trim().slice(0, 1000) ?? resolutionReason, now),
     db.prepare("INSERT INTO notifications (id, organization_id, recipient_user_id, project_id, work_item_id, source_id, event_type, priority, title, body, deep_link, dedupe_key, requires_action, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(notificationId, organizationId, principal.userId, command.projectId, command.itemId, command.sourceId ?? nullable(item, "source_id"), eventType, command.status === "blocked" ? "high" : "normal", `${itemKey} · ${command.status.replaceAll("_", " ")}`, summary, `/?project=${command.projectId}&item=${command.itemId}`, `${eventType}:${command.itemId}:${nextRevision}`, requiresAction, now),
     db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
   ];
@@ -638,6 +795,7 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   }
 
   await commitMutation(db, statements);
+  await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom(command), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
   return response;
 }
 
@@ -650,6 +808,29 @@ async function downstreamOf(db: PgD1, organizationId: string, projectId: string,
         AND d.type IN (${DAG_EDGE_TYPE_SQL_LIST})`,
   ).bind(itemId, projectId, organizationId, ...DAG_EDGE_TYPES).all<{ id: string; itemKey: string; blockingCount: number }>();
   return rows.results;
+}
+
+/**
+ * How many items each of `itemIds` is the *last* remaining blocker for — the greedy
+ * scheduling signal `get_ready_work` ranks on.
+ *
+ * One grouped query rather than a `downstreamOf` per candidate: the loop version issued a
+ * query for every ready item on every "what next" call, and this is the hottest read path
+ * an agent has. Items with no downstream simply do not appear in the result, so callers
+ * default to 0.
+ */
+async function unlockCountsFor(db: PgD1, organizationId: string, projectId: string, itemIds: string[]) {
+  const counts = new Map<string, number>();
+  if (!itemIds.length) return counts;
+  const rows = await db.prepare(
+    `SELECT d.from_work_item_id AS id, COUNT(*) AS "unlockCount" FROM dependencies d
+       JOIN work_items wi ON wi.id = d.to_work_item_id
+      WHERE d.project_id = ? AND wi.organization_id = ? AND d.type IN (${DAG_EDGE_TYPE_SQL_LIST})
+        AND wi.blocking_count = 1 AND d.from_work_item_id = ANY(?::text[])
+      GROUP BY d.from_work_item_id`,
+  ).bind(projectId, organizationId, ...DAG_EDGE_TYPES, itemIds).all<{ id: string; unlockCount: number }>();
+  for (const row of rows.results) counts.set(row.id, Number(row.unlockCount));
+  return counts;
 }
 
 /**
@@ -693,6 +874,29 @@ async function sourceActor(db: PgD1, organizationId: string, sourceId: string) {
  * item, which with two logins for one model connected is regularly not whoever is
  * acting now. The authenticated connection is, and it carries a real name.
  */
+/**
+ * The interaction currently open for a source, if any — what every mutation event should
+ * be tagged with, so reconciliation can ask "which events happened during this exact
+ * interaction" instead of guessing from a timestamp window (finding F9).
+ *
+ * A timestamp window cannot answer that question correctly once two interactions from the
+ * same source overlap: `created_at >= started_at` with no matching upper bound counts
+ * every later interaction's events too, and a source with two interactions genuinely open
+ * at once has no way to tell, from time alone, which one produced which event. Tagging the
+ * event itself at write time removes the ambiguity instead of narrowing the window.
+ *
+ * Most sources have at most one 'started' interaction at a time — the normal
+ * begin/complete-per-turn pattern — so this is a single indexed lookup, not a scan. If more
+ * than one is somehow open (a retried begin_interaction, a client bug), the most recently
+ * started one is treated as current: it is the one most likely to actually be receiving new
+ * mutations right now.
+ */
+async function activeInteractionId(db: PgD1, sourceId: string | null | undefined) {
+  if (!sourceId) return null;
+  const row = await db.prepare("SELECT id FROM interactions WHERE source_id = ? AND status = 'started' ORDER BY started_at DESC LIMIT 1").bind(sourceId).first<{ id: string }>();
+  return row?.id ?? null;
+}
+
 async function resolveActor(db: PgD1, organizationId: string, principal: Principal, sourceId: string | null | undefined, itemSourceId: string | null | undefined) {
   if (sourceId) return sourceActor(db, organizationId, sourceId);
   if (principal.agentAccountId) return principal.displayName;
@@ -832,8 +1036,26 @@ export async function recordInteraction(db: PgD1, principal: Principal, input: {
   const currentRevision = number(project, "revision");
   const nextRevision = currentRevision + 1;
   const summary = input.summary?.trim().slice(0, 2000) || `${text(source, "provider")} interaction completed with no todo summary`;
-  const eventCount = await db.prepare("SELECT COUNT(*) AS count FROM work_events WHERE source_id = ? AND created_at >= COALESCE((SELECT started_at FROM interactions WHERE id = ?), now() - interval '1 hour')").bind(input.sourceId, interactionId).first<{ count: number }>();
-  const reconciliation = Number(eventCount?.count ?? 0) > 0 ? "todos_changed" : "no_todo_change";
+  // F9: a source with two interactions genuinely open at once could not be told apart by a
+  // timestamp window — `created_at >= started_at` with no upper bound at all counted every
+  // later interaction's events too, so two overlapping turns from one source each saw the
+  // other's mutations as their own. Every mutation event is now tagged with the interaction
+  // that was open when it was written (see activeInteractionId), so when this interaction
+  // really did have a begin_interaction call, reconciliation is an exact match: no window,
+  // no ambiguity, no cross-attribution regardless of what else was happening concurrently.
+  let reconciliation: string;
+  if (existing) {
+    const exact = await db.prepare("SELECT COUNT(*) AS count FROM work_events WHERE interaction_id = ?").bind(interactionId).first<{ count: number }>();
+    reconciliation = Number(exact?.count ?? 0) > 0 ? "todos_changed" : "no_todo_change";
+  } else {
+    // No begin_interaction was ever recorded for this turn, so nothing could have been
+    // tagged with this id while it happened — there was no 'started' row for
+    // activeInteractionId to find. Falls back to the old best-effort window, but now with
+    // a genuine upper bound (this call's own timestamp) instead of none at all, so it can
+    // no longer reach into events produced by a later, unrelated interaction.
+    const windowed = await db.prepare("SELECT COUNT(*) AS count FROM work_events WHERE source_id = ? AND created_at >= now() - interval '1 hour' AND created_at <= ?").bind(input.sourceId, now).first<{ count: number }>();
+    reconciliation = Number(windowed?.count ?? 0) > 0 ? "todos_changed" : "no_todo_change";
+  }
   const notificationId = id("ntf");
   await commitMutation(db, [
     existing
@@ -974,9 +1196,12 @@ export async function createWorkItemsDeduplicated(
 ) {
   const organizationId = await organizationFor(db, principal);
   await ownedProject(db, organizationId, input.projectId);
-  const rows = await db.prepare("SELECT * FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL ORDER BY updated_at DESC LIMIT 500")
-    .bind(input.projectId, organizationId).all<Row>();
-  const existingItems = rows.results.map(mapItem);
+  // Items written before the artifact index existed carry no index rows, so they would be
+  // reachable only through retrieval's recency arm — exactly the gap this replaces. Bounded
+  // per call; a large project converges over a few writes and degrades to the old behaviour
+  // meanwhile rather than to a wrong one.
+  await backfillBlockingIndex(db, organizationId, input.projectId);
+  const existingItems = await retrieveCandidates(db, organizationId, input.projectId, input.proposals);
   const outcomes = await resolveProposals({ proposals: input.proposals, existingItems });
 
   const results: Record<string, unknown>[] = [];
@@ -994,16 +1219,44 @@ export async function createWorkItemsDeduplicated(
       const record = await executeCommand(db, principal, {
         action: "create_item", projectId: input.projectId, title: outcome.title, description: outcome.description,
         status: outcome.status as WorkStatus | undefined, priority: outcome.priority as WorkItem["priority"] | undefined,
+        // Left to create_item's own default, which is the point of the ladder: an agent
+        // batch arrives as proposals, a person's own entry arrives accepted.
         sourceId: input.sourceId, contentFingerprint: outcome.fingerprintValue, idempotencyKey: `${input.idempotencyKey}:${index}`,
-      }) as unknown as { itemId: string; itemKey: string };
+      }) as unknown as { itemId: string; itemKey: string; maturity: Maturity };
       createdByIndex.set(index, record);
       targetByIndex.set(index, record);
       created += 1;
 
-      const entry: Record<string, unknown> = { ref: outcome.ref, status: "created", workItemId: record.itemId, itemKey: record.itemKey };
+      const entry: Record<string, unknown> = { ref: outcome.ref, status: "created", workItemId: record.itemId, itemKey: record.itemKey, maturity: record.maturity };
+      // Said out loud rather than left to be inferred from a field: an agent that believes
+      // it just created accepted work will report it that way to the user.
+      if (record.maturity === "proposal") entry.note = "Recorded as a proposal awaiting acceptance. Ask the user to accept it, then call accept_work_items naming who decided.";
       // Resembles existing work but not conclusively. The item is created either way;
       // the resemblance is a note, not a decision the agent has to make.
       if (outcome.match) entry.resembles = { itemKey: outcome.match.itemKey, workItemId: outcome.match.workItemId, note: outcome.match.explanation };
+
+      // E4 — Stage 3/4: a typed relation becomes a real edge here, including CONFLICT
+      // (the direct new-item↔existing-item `conflicts_with` fact). The route handler
+      // additionally raises a *decision* for CONFLICT once this returns
+      // (`lib/planning/decisions.ts`'s `recordDecision` sits above this module and
+      // itself calls back into `executeCommand`, so calling it from here would be a
+      // circular import) — that decision gets its own two `conflicts_with` edges from
+      // the decision to each option, a separate M19 fact from this direct item-to-item
+      // one. This module reports the relation either way, so the caller always has what
+      // it needs to act on it.
+      if (outcome.relation) {
+        const edgeType = edgeTypeForRelation(outcome.relation.type);
+        if (edgeType) {
+          await executeCommand(db, principal, {
+            action: "add_dependency", projectId: input.projectId, fromWorkItemId: record.itemId, toWorkItemId: outcome.match!.workItemId,
+            type: edgeType, reason: outcome.relation.reason, sourceId: input.sourceId, idempotencyKey: `${input.idempotencyKey}:relation:${index}`,
+          });
+        }
+        entry.relation = {
+          type: outcome.relation.type, reason: outcome.relation.reason,
+          workItemId: outcome.match!.workItemId, itemKey: outcome.match!.itemKey,
+        };
+      }
       results.push(entry);
       continue;
     }
@@ -1054,7 +1307,15 @@ export async function createWorkItemsDeduplicated(
     for (const [index, outcome] of outcomes.entries()) {
       if (outcome.ref) { const resolved = targetByIndex.get(index); if (resolved) refIndex.set(outcome.ref, resolved); }
     }
-    const existingKeyById = new Map(existingItems.map((entry) => [entry.id, entry.itemKey] as const));
+    // A literal depends_on value that isn't a batch ref is an existing item's id, and its
+    // display key has to be looked up directly rather than read off `existingItems` — that
+    // array is E1's blocking candidate set now (RECONCILIATION_ARCHITECTURE.md §5), scoped
+    // to what plausibly duplicates one of *these* proposals, not "every item this batch
+    // might reference by id". A prerequisite named by id is routinely unrelated in wording
+    // to the item that depends on it (a database-provisioning task and the migration that
+    // needs it share no vocabulary at all), so it would almost never appear there.
+    const literalRefs = [...new Set(outcomes.flatMap((outcome) => (outcome.dependsOn ?? []).filter((ref) => !refIndex.has(ref))))];
+    const existingKeyById = await itemKeysFor(db, organizationId, literalRefs);
 
     for (const [index, outcome] of outcomes.entries()) {
       if (!outcome.dependsOn?.length) continue;
@@ -1110,35 +1371,44 @@ export async function getReadyWork(
   input: { projectId: string; sourceId?: string; limit?: number; avoidCollisions?: boolean },
 ) {
   const organizationId = await organizationFor(db, principal);
-  await ownedProject(db, organizationId, input.projectId);
+  const project = await ownedProject(db, organizationId, input.projectId);
   const avoidCollisions = input.avoidCollisions !== false;
   const limit = Math.min(Math.max(Number(input.limit ?? 5), 1), 50);
+  // With gating on, work no person has accepted is not handed to an agent to start. Off by
+  // default so turning the ladder on does not silently empty a working queue.
+  const gateProposals = parseJson<{ gateProposals?: boolean }>(text(project, "settings"), {}).gateProposals === true;
+  const maturityClause = gateProposals ? " AND maturity IN ('accepted', 'committed')" : "";
 
-  const [itemRows, sourceRows, aliasRows] = await db.batch([
-    db.prepare("SELECT * FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL AND status = 'ready' AND blocking_count = 0").bind(input.projectId, organizationId),
+  const [itemRows, sourceRows, aliasRows, claimRows] = await db.batch([
+    // `deferred_until` is compared in SQL rather than filtered afterwards so a deferral
+    // simply expires: the item comes back on its date with no job to run and no write.
+    db.prepare(`SELECT * FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL AND status = 'ready' AND blocking_count = 0 AND (deferred_until IS NULL OR deferred_until <= now())${maturityClause}`).bind(input.projectId, organizationId),
     db.prepare("SELECT * FROM sources WHERE project_id = ? AND organization_id = ?").bind(input.projectId, organizationId),
     db.prepare("SELECT * FROM work_item_aliases WHERE project_id = ? AND organization_id = ?").bind(input.projectId, organizationId),
+    // Live leases (finding F1): unlike sources.current_task_ids, a lease expires on its
+    // own, so a crashed session's claim stops blocking anything without a scheduler or a
+    // person having to notice and clear it. Skipped entirely when collisions aren't wanted.
+    avoidCollisions
+      ? db.prepare("SELECT DISTINCT wc.work_item_id AS id FROM work_claims wc JOIN work_items wi ON wi.id = wc.work_item_id WHERE wi.project_id = ? AND wi.organization_id = ? AND wc.lease_expires_at > now() AND wc.source_id <> ?").bind(input.projectId, organizationId, input.sourceId ?? "")
+      : db.prepare("SELECT NULL AS id WHERE false"),
   ]);
   const candidates = itemRows.results.map(mapItem);
   // The SQL predicate above is the same rule deriveColumn applies for a "ready" item, so
   // this list can never diverge from what the board shows in the Ready column.
   const sources = sourceRows.results.map(mapSource);
   const aliases = aliasRows.results.map(mapAlias);
+  const claimed = new Set((claimRows.results as Array<{ id: string }>).map((row) => row.id));
 
-  const claimed = new Set<string>();
-  if (avoidCollisions) {
-    for (const source of sources) {
-      if (source.status === "ended" || source.id === input.sourceId) continue;
-      for (const taskId of source.currentTaskIds) claimed.add(taskId);
-    }
-  }
+  const actionable = candidates.filter((item) => !claimed.has(item.id));
+  const excludedByCollision = candidates.length - actionable.length;
+  // One grouped query for every candidate's unlock count, rather than one `downstreamOf`
+  // per candidate inside the loop (finding F5). `blocking_count = 1` is the same
+  // "would reach zero" predicate the per-item version filtered on.
+  const unlockCounts = await unlockCountsFor(db, organizationId, input.projectId, actionable.map((item) => item.id));
 
-  let excludedByCollision = 0;
   const ranked = [];
-  for (const item of candidates) {
-    if (claimed.has(item.id)) { excludedByCollision += 1; continue; }
-    const downstream = await downstreamOf(db, organizationId, input.projectId, item.id);
-    const unlockCount = downstream.filter((entry) => entry.blockingCount === 1).length;
+  for (const item of actionable) {
+    const unlockCount = unlockCounts.get(item.id) ?? 0;
     // Keyed by model family, not by the raw provider string or the agent account: two
     // accounts of one model reason near-identically, so counting them as two would
     // outrank a task Claude and Codex genuinely arrived at separately. The UI still
@@ -1168,9 +1438,107 @@ export async function getReadyWork(
   };
 }
 
+/** How long a claim survives without a fresh heartbeat. A crashed or forgotten session's
+ * hold on a task expires on its own after this, with no scheduler needed — readers simply
+ * filter on `lease_expires_at > now()`. Long enough for a real task, short enough that an
+ * abandoned session stops mattering before anyone notices. See finding F1. */
+const CLAIM_LEASE_MS = 45 * 60 * 1000;
+
+/**
+ * Keeps `work_claims` in sync with a heartbeat's reported task IDs — the write side of
+ * finding F1. The table existed with the right columns from the start; the only thing
+ * missing was anything that wrote to it, so `getReadyWork`'s collision check fell back to
+ * `sources.current_task_ids`, which has no expiry at all.
+ *
+ * A crashed agent's claim now heals itself: its lease simply stops being renewed and
+ * expires, instead of blocking the item forever until a person notices and manually clears
+ * it (which nothing in the product today lets them do).
+ */
+async function syncClaims(db: PgD1, sourceId: string, taskIds: string[], ended: boolean) {
+  if (ended) {
+    await db.prepare("DELETE FROM work_claims WHERE source_id = ?").bind(sourceId).run();
+    return;
+  }
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + CLAIM_LEASE_MS).toISOString();
+  const statements: PgD1PreparedStatement[] = [
+    // Anything this source held before and is not reporting any more is released
+    // immediately, not left to expire — a task an agent has visibly moved off of should
+    // stop showing as claimed right away.
+    taskIds.length
+      ? db.prepare("DELETE FROM work_claims WHERE source_id = ? AND NOT (work_item_id = ANY(?::text[]))").bind(sourceId, taskIds)
+      : db.prepare("DELETE FROM work_claims WHERE source_id = ?").bind(sourceId),
+  ];
+  for (const taskId of taskIds) {
+    statements.push(
+      db.prepare(
+        "INSERT INTO work_claims (id, work_item_id, source_id, mode, lease_expires_at, heartbeat_at) VALUES (?, ?, ?, 'exclusive', ?, ?) " +
+        "ON CONFLICT (work_item_id, source_id) DO UPDATE SET lease_expires_at = excluded.lease_expires_at, heartbeat_at = excluded.heartbeat_at, version = work_claims.version + 1",
+      ).bind(id("clm"), taskId, sourceId, expiresAt, now),
+    );
+  }
+  await db.batch(statements);
+}
+
 export async function updateSourceHeartbeat(db: PgD1, principal: Principal, input: { sourceId: string; state?: string; currentTaskIds?: string[]; end?: boolean }) {
   const organizationId = await organizationFor(db, principal);
-  const result = await db.prepare("UPDATE sources SET status = ?, current_task_ids = ?, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? RETURNING id").bind(input.end ? "ended" : input.state ?? "active", JSON.stringify((input.currentTaskIds ?? []).slice(0, 100)), input.sourceId, organizationId).first();
+  const taskIds = (input.currentTaskIds ?? []).slice(0, 100);
+  const result = await db.prepare("UPDATE sources SET status = ?, current_task_ids = ?, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? RETURNING id").bind(input.end ? "ended" : input.state ?? "active", JSON.stringify(taskIds), input.sourceId, organizationId).first();
   if (!result) throw domainError("NOT_FOUND", "Source session not found", 404);
+  // input.currentTaskIds is undefined (as opposed to []) when a heartbeat only updates
+  // presence and says nothing about current work; claims are left untouched in that case
+  // rather than being wiped by an update that never meant to report on them.
+  if (input.end || input.currentTaskIds !== undefined) await syncClaims(db, input.sourceId, taskIds, Boolean(input.end));
   return { sourceId: input.sourceId, status: input.end ? "ended" : input.state ?? "active" };
+}
+
+/**
+ * M14's other half of `start_work`, alongside collision.ts's artifact check: an exclusive
+ * lease taken and enforced at the moment work actually starts, not only whenever a
+ * heartbeat happens to follow. Before this, `start_work` moved an item to `in_progress`
+ * with no lease check at all — two sessions could both "start" the same item, and neither
+ * would know about the other until a heartbeat eventually raced to write `work_claims`.
+ * `force: true` is the intentional override (a person reassigning stuck work), and is
+ * recorded in the transition's own reason rather than silently overwriting the claim.
+ */
+export async function startWork(db: PgD1, principal: Principal, input: { projectId: string; itemId: string; expectedVersion: number; reason?: string; sourceId?: string; force?: boolean; idempotencyKey: string }) {
+  const organizationId = await organizationFor(db, principal);
+  let takeoverNote = "";
+  if (input.sourceId) {
+    const holder = await db.prepare(
+      "SELECT wc.source_id, wc.lease_expires_at, s.provider, s.agent_account_label FROM work_claims wc " +
+      "JOIN sources s ON s.id = wc.source_id AND s.organization_id = ? WHERE wc.work_item_id = ? AND wc.lease_expires_at > now() AND wc.source_id <> ?",
+    ).bind(organizationId, input.itemId, input.sourceId).first<{ source_id: string; lease_expires_at: string; provider: string; agent_account_label: string | null }>();
+    if (holder) {
+      const holderLabel = holder.agent_account_label ? `${holder.provider} · ${holder.agent_account_label}` : holder.provider;
+      if (!input.force) {
+        throw domainError("WORK_LEASED", `Already claimed by ${holderLabel}, lease expires ${holder.lease_expires_at}`, 409, {
+          holderSourceId: holder.source_id, provider: holder.provider, accountLabel: holder.agent_account_label, leaseExpiresAt: holder.lease_expires_at,
+        });
+      }
+      takeoverNote = ` (forced takeover from ${holderLabel})`;
+    }
+  }
+
+  const response = await executeCommand(db, principal, {
+    action: "transition_item", projectId: input.projectId, itemId: input.itemId, expectedVersion: input.expectedVersion, status: "in_progress",
+    reason: `${input.reason ?? "Started"}${takeoverNote}`, sourceId: input.sourceId, idempotencyKey: input.idempotencyKey,
+  });
+
+  if (input.sourceId) {
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + CLAIM_LEASE_MS).toISOString();
+    // work_claims' conflict target is (work_item_id, source_id), not work_item_id alone —
+    // inserting this session's row would sit *alongside* another source's still-present
+    // claim rather than replace it, since the two never collide on that composite key.
+    // Exclusive mode means exactly one holder, so any other row on this item is cleared
+    // first: an expired one is stale bookkeeping nothing was reading anyway, and a live
+    // one only survives to this point at all because `force` was just used to override it.
+    await db.prepare("DELETE FROM work_claims WHERE work_item_id = ? AND source_id <> ?").bind(input.itemId, input.sourceId).run();
+    await db.prepare(
+      "INSERT INTO work_claims (id, work_item_id, source_id, mode, lease_expires_at, heartbeat_at) VALUES (?, ?, ?, 'exclusive', ?, ?) " +
+      "ON CONFLICT (work_item_id, source_id) DO UPDATE SET lease_expires_at = excluded.lease_expires_at, heartbeat_at = excluded.heartbeat_at, version = work_claims.version + 1",
+    ).bind(id("clm"), input.itemId, input.sourceId, expiresAt, now).run();
+  }
+  return response;
 }

@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildSignature, extractAction, extractArtifacts, fingerprint, jaccard } from "../lib/dedup/signature.ts";
+import { buildSignature, compareSubsystems, deriveSubsystem, extractAction, extractArtifacts, extractCriteria, fingerprint, jaccard } from "../lib/dedup/signature.ts";
 import { adjudicate, bestMatch, explain } from "../lib/dedup/match.ts";
 
 async function proposalOf(title, description = "") {
@@ -77,6 +77,26 @@ test("veto: opposite actions on the same object are not a duplicate", async () =
   );
   assert.equal(decision.verdict, "distinct");
   assert.match(decision.reason, /Opposite actions/);
+});
+
+test("veto: opposite actions on the SAME concrete artifact is a conflict, not plain distinct (E4, fixes F3)", async () => {
+  const decision = adjudicate(
+    await proposalOf("Add lib/auth/middleware.ts"),
+    await candidateOf("Remove lib/auth/middleware.ts"),
+  );
+  assert.equal(decision.verdict, "conflict");
+  assert.equal(decision.method, "conflict");
+  assert.match(decision.reason, /Opposite actions/);
+  assert.match(decision.reason, /middleware\.ts/);
+});
+
+test("veto: a conflict verdict outranks a merely-possible match in bestMatch", async () => {
+  const proposal = await proposalOf("Remove lib/auth/middleware.ts");
+  const conflicting = await candidateOf("Add lib/auth/middleware.ts", { itemKey: "#1" });
+  const lexicallySimilar = await candidateOf("Remove the old middleware config", { itemKey: "#2" });
+  const winner = bestMatch({ signature: proposal.signature, fingerprintValue: proposal.fingerprintValue }, [conflicting, lexicallySimilar]);
+  assert.equal(winner.verdict, "conflict");
+  assert.equal(winner.candidate.itemKey, "#1");
 });
 
 test("veto: different kinds of work on the same object are not a duplicate", async () => {
@@ -155,4 +175,121 @@ test("explanation warns when the matched item is already complete", async () => 
   assert.match(message, /#3/);
   assert.match(message, /already done/);
   assert.match(message, /Reopen/);
+});
+
+// ── E2 — signature v2: synonym lexicon, qualifiers, criteria, subsystem ────────────────
+
+test("signature v2: a synonym pair canonicalizes to one object token", () => {
+  const full = buildSignature("Fix the authentication bug");
+  const short = buildSignature("Fix the auth bug");
+  assert.deepEqual(full.objectTokens, short.objectTokens);
+  assert.ok(full.objectTokens.includes("auth"), `expected canonicalized 'auth', got ${JSON.stringify(full.objectTokens)}`);
+});
+
+test("signature v2: an unrelated word is never accidentally canonicalized", () => {
+  const signature = buildSignature("Fix the authorization bug");
+  // authorization -> authz is a real, distinct pair from authentication -> auth; the two
+  // must never collapse into each other just because both start with 'auth'.
+  assert.ok(signature.objectTokens.includes("authz"));
+  assert.ok(!signature.objectTokens.includes("auth"));
+});
+
+test("signature v2: qualifiers are extracted and pulled out of the object-token bag", () => {
+  const signature = buildSignature("Add dark mode on mobile");
+  assert.deepEqual(signature.qualifiers, ["mobile"]);
+  assert.ok(!signature.objectTokens.includes("mobile"), "a qualifier must not also count as ordinary lexical overlap");
+});
+
+test("signature v2: no qualifier present is an empty array, not undefined or a crash", () => {
+  const signature = buildSignature("Add dark mode");
+  assert.deepEqual(signature.qualifiers, []);
+});
+
+test("signature v2: a qualifier is real scope information — two titles differing only by one get different fingerprints", async () => {
+  const withoutScope = buildSignature("Add dark mode");
+  const withScope = buildSignature("Add dark mode on mobile");
+  assert.notEqual(await fingerprint(withoutScope), await fingerprint(withScope));
+});
+
+test("signature v2: multiple qualifiers are all captured, sorted and deduplicated", () => {
+  const signature = buildSignature("Test the mobile and web staging builds");
+  assert.deepEqual(signature.qualifiers, ["mobile", "staging", "web"]);
+});
+
+test("signature v2: extractCriteria reads a markdown checklist", () => {
+  const criteria = extractCriteria("Implementation notes.\n- [ ] Token is rejected after expiry\n- [x] Refresh endpoint returns 401 on reuse\n");
+  assert.deepEqual(criteria, ["token is rejected after expiry", "refresh endpoint returns 401 on reuse"]);
+});
+
+test("signature v2: extractCriteria reads Given/When/Then lines anywhere in the text", () => {
+  const criteria = extractCriteria("Some context first.\nGiven an expired token\nWhen the client calls /refresh\nThen the server returns 401\n");
+  assert.deepEqual(criteria, ["given an expired token", "when the client calls /refresh", "then the server returns 401"]);
+});
+
+test("signature v2: extractCriteria reads a bullet list under a recognized heading", () => {
+  const criteria = extractCriteria("Add pagination.\n\nAcceptance criteria:\n- Page size defaults to 20\n- Cursor is opaque to the client\n\nNotes: ship behind a flag.");
+  assert.deepEqual(criteria, ["page size defaults to 20", "cursor is opaque to the client"]);
+});
+
+test("signature v2: extractCriteria reads a numbered list under a heading", () => {
+  const criteria = extractCriteria("Requirements:\n1. Must not block the main thread\n2) Falls back gracefully offline\n");
+  assert.deepEqual(criteria, ["must not block the main thread", "falls back gracefully offline"]);
+});
+
+test("signature v2: a plain bullet list with no recognized heading is not mistaken for criteria", () => {
+  const criteria = extractCriteria("Some background.\n- this is just a list\n- not acceptance criteria at all\n");
+  assert.deepEqual(criteria, []);
+});
+
+test("signature v2: no description at all yields no criteria, not a crash", () => {
+  assert.deepEqual(extractCriteria(""), []);
+  assert.deepEqual(buildSignature("Add dark mode").criteria, []);
+});
+
+test("signature v2: a blank line ends a heading-triggered criteria section", () => {
+  const criteria = extractCriteria("Acceptance criteria:\n- First one\n\n- This bullet is after the blank line and must not count\n");
+  assert.deepEqual(criteria, ["first one"]);
+});
+
+test("signature v2: deriveSubsystem picks the directory shared by an item's own file artifacts", () => {
+  assert.equal(deriveSubsystem(["apps/web/lib/dedup/blocking.ts", "apps/web/lib/dedup/signature.ts"]), "apps/web");
+});
+
+test("signature v2: deriveSubsystem returns null when there is no file-kind artifact at all", () => {
+  assert.equal(deriveSubsystem(["/api/login", "DATABASE_URL", "refreshAccessToken"]), null);
+});
+
+test("signature v2: deriveSubsystem is null for a bare filename with no directory information", () => {
+  assert.equal(deriveSubsystem(["signature.ts"]), null);
+});
+
+test("signature v2: deriveSubsystem breaks a genuine tie deterministically", () => {
+  assert.equal(deriveSubsystem(["apps/web/a.ts", "lib/dedup/b.ts"]), "apps/web");
+});
+
+test("signature v2: compareSubsystems — same, adjacent, different, and unknown", () => {
+  assert.equal(compareSubsystems("apps/web", "apps/web"), "same");
+  assert.equal(compareSubsystems("apps/web", "apps/web/lib"), "adjacent");
+  assert.equal(compareSubsystems("apps/web/lib", "apps/web"), "adjacent");
+  assert.equal(compareSubsystems("apps/web", "lib/dedup"), "different");
+  assert.equal(compareSubsystems(null, "apps/web"), "unknown");
+  assert.equal(compareSubsystems("apps/web", null), "unknown");
+  assert.equal(compareSubsystems(null, null), "unknown");
+});
+
+test("signature v2: buildSignature wires subsystem end to end from title artifacts", () => {
+  const signature = buildSignature("Fix the token refresh in apps/web/lib/dedup/blocking.ts");
+  assert.equal(signature.subsystem, "apps/web");
+});
+
+test("signature v2: normalized includes the new fields, so two items differing only in criteria fingerprint differently", async () => {
+  const withoutCriteria = buildSignature("Add refresh tokens", "");
+  const withCriteria = buildSignature("Add refresh tokens", "Acceptance criteria:\n- Expires after 30 days\n");
+  assert.notEqual(await fingerprint(withoutCriteria), await fingerprint(withCriteria));
+});
+
+test("signature v2: fingerprints for two items with identical title, description, and no new-field content are unaffected — no spurious drift", async () => {
+  const a = buildSignature("Add rate limiting to /api/login");
+  const b = buildSignature("Add rate limiting to /api/login");
+  assert.equal(await fingerprint(a), await fingerprint(b));
 });

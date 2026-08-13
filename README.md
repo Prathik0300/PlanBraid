@@ -8,6 +8,8 @@ Work items form a dependency graph, not just a status field: a task that only be
 
 See `PRODUCT_ARCHITECTURE_PLAN.md` for the canonical architecture, `IMPLEMENTATION_PLAN.md` for what has shipped against it and in what order, and `AGENTS.md` for implementation rules. `GRAPH_ARCHITECTURE.md` and `DEDUPLICATION_ARCHITECTURE.md` cover the dependency graph and proposal-matching design in detail.
 
+Planned work is covered by four further documents. `PLANNING_INTELLIGENCE_ROADMAP.md` sequences the whole roadmap and lists what is half-built. `RECONCILIATION_ARCHITECTURE.md` specifies the reconciliation engine — the core module every other feature consumes. `PLAN_VERSION_CONTROL.md` covers the plan as a content-addressed operation log with conflicts as first-class objects, and where source control is authoritative. `CAPTURE_ARCHITECTURE.md` covers keeping Planbraid current by subscribing to the agent's harness rather than asking the model to remember.
+
 ## Local development
 
 ```text
