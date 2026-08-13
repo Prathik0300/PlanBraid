@@ -161,7 +161,7 @@ function mapAlias(row: Row) {
 
 export async function loadDashboard(db: PgD1, principal: Principal): Promise<DashboardState> {
   const organizationId = await organizationFor(db, principal);
-  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows] = await db.batch([
+  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows] = await db.batch([
     db.prepare("SELECT * FROM projects WHERE organization_id = ? ORDER BY updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM coding_spaces WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM sources WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
@@ -171,6 +171,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     db.prepare("SELECT * FROM dependencies WHERE organization_id = ?").bind(organizationId),
     db.prepare("SELECT * FROM evidence WHERE organization_id = ? ORDER BY created_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM work_item_aliases WHERE organization_id = ? ORDER BY created_at DESC LIMIT 500").bind(organizationId),
+    db.prepare("SELECT * FROM import_requests WHERE organization_id = ? AND status = 'pending' ORDER BY created_at DESC").bind(organizationId),
   ]);
   return {
     viewer: { id: principal.userId, name: principal.displayName, email: principal.email },
@@ -183,6 +184,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     dependencies: (dependencies.results as Row[]).map((row) => ({ id: text(row, "id"), fromWorkItemId: text(row, "from_work_item_id"), toWorkItemId: text(row, "to_work_item_id"), type: text(row, "type"), reason: text(row, "reason") })),
     evidence: (evidenceRows.results as Row[]).map((row) => ({ id: text(row, "id"), workItemId: text(row, "work_item_id"), sourceId: nullable(row, "source_id"), type: text(row, "type"), label: text(row, "label"), uri: nullable(row, "uri"), result: nullable(row, "result"), createdAt: text(row, "created_at") })),
     aliases: (aliasRows.results as Row[]).map(mapAlias),
+    importRequests: (importRequestRows.results as Row[]).map((row) => ({ id: text(row, "id"), projectId: text(row, "project_id"), sourceId: text(row, "source_id"), createdAt: text(row, "created_at") })),
     serverTime: new Date().toISOString(),
   };
 }
@@ -844,6 +846,47 @@ export async function recordInteraction(db: PgD1, principal: Principal, input: {
   return { interactionId, notificationId, reconciliation, projectRevision: nextRevision };
 }
 
+/** Is there an open "report everything you know" request waiting for this source? */
+async function pendingImportForSource(db: PgD1, projectId: string, sourceId: string) {
+  const row = await db.prepare("SELECT id, created_at FROM import_requests WHERE project_id = ? AND source_id = ? AND status = 'pending'").bind(projectId, sourceId).first<{ id: string; created_at: string }>();
+  return row ? { id: row.id, requestedAt: row.created_at } : null;
+}
+
+/**
+ * Asks one connected agent to report everything it knows about a project. Planbraid
+ * cannot reach into a live agent conversation (MCP here is request/response with no
+ * server-to-client channel), so this is deliberately a durable request rather than an
+ * action: it is picked up the next time that exact source calls registerSourceSession
+ * (see pendingImportRequest below) or resolved directly by a create_work_items batch
+ * that names it (see createWorkItemsDeduplicated's importRequestId handling) —
+ * whichever happens first. The partial unique index on (project_id, source_id) WHERE
+ * status = 'pending' is what makes re-clicking the same agent idempotent instead of
+ * piling up duplicate requests.
+ */
+export async function requestImport(db: PgD1, principal: Principal, input: { projectId: string; sourceId: string }) {
+  const organizationId = await organizationFor(db, principal);
+  await ownedProject(db, organizationId, input.projectId);
+  const source = await db.prepare("SELECT id FROM sources WHERE id = ? AND project_id = ? AND organization_id = ?").bind(input.sourceId, input.projectId, organizationId).first<{ id: string }>();
+  if (!source) throw domainError("NOT_FOUND", "Source not found", 404);
+  const existing = await pendingImportForSource(db, input.projectId, input.sourceId);
+  if (existing) return { importRequestId: existing.id, status: "already_pending" as const };
+  const importRequestId = id("imp");
+  try {
+    await db.prepare("INSERT INTO import_requests (id, organization_id, project_id, source_id, requested_by) VALUES (?, ?, ?, ?, ?)")
+      .bind(importRequestId, organizationId, input.projectId, input.sourceId, principal.userId).run();
+    return { importRequestId, status: "created" as const };
+  } catch (error) {
+    // A second click landed in the narrow window between the check above and this
+    // insert; the partial unique index caught it, so reuse the request that won
+    // rather than surface a race the user did nothing wrong to trigger.
+    const code = (error as { code?: string }).code;
+    if (code !== "23505") throw error;
+    const winner = await pendingImportForSource(db, input.projectId, input.sourceId);
+    if (winner) return { importRequestId: winner.id, status: "already_pending" as const };
+    throw error;
+  }
+}
+
 export async function registerSourceSession(db: PgD1, principal: Principal, input: { projectId: string; provider: string; externalId: string; title?: string; model?: string; codingSpaceId?: string; assurance?: string; accountLabel?: string }) {
   const organizationId = await organizationFor(db, principal);
   await ownedProject(db, organizationId, input.projectId);
@@ -868,13 +911,13 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
       externalId = `${requestedExternalId}::${accountId}`.slice(0, 240);
     } else {
       await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountId, accountLabel, existing.id).run();
-      return { sourceId: existing.id, idempotentReplay: true };
+      return { sourceId: existing.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, existing.id) };
     }
   }
   const forked = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
   if (forked) {
     await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountLabel, forked.id).run();
-    return { sourceId: forked.id, idempotentReplay: true };
+    return { sourceId: forked.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, forked.id) };
   }
   const sourceId = id("src");
   // Two concurrent register_agent_session calls for the same (project, provider,
@@ -884,9 +927,9 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
   // re-select on conflict rather than assume this insert is the row that landed.
   const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance, agent_account_id, agent_account_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
     .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed", accountId, accountLabel).first<{ id: string }>();
-  if (inserted) return { sourceId: inserted.id, idempotentReplay: false };
+  if (inserted) return { sourceId: inserted.id, idempotentReplay: false, pendingImportRequest: await pendingImportForSource(db, input.projectId, inserted.id) };
   const winner = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
-  return { sourceId: winner!.id, idempotentReplay: true };
+  return { sourceId: winner!.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, winner!.id) };
 }
 
 /**
@@ -895,10 +938,39 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
  * its original wording and the agent that authored it, so provenance survives and a
  * wrong match stays reversible.
  */
+/**
+ * Closes out an import_requests row from inside the same create_work_items batch that
+ * reports the content it asked for, instead of a separate "resolve" tool an agent could
+ * forget to call. A stale or mismatched id (an old prompt pasted twice, a request
+ * someone else already resolved) is silently a no-op rather than an error: the work
+ * items this batch created are real either way, so a bookkeeping row that no longer
+ * applies must never fail the whole call.
+ */
+async function completeImportRequest(db: PgD1, organizationId: string, projectId: string, sourceId: string, importRequestId: string, reportedCount: number, actor: string) {
+  const request = await db.prepare("SELECT id FROM import_requests WHERE id = ? AND project_id = ? AND source_id = ? AND status = 'pending'").bind(importRequestId, projectId, sourceId).first<{ id: string }>();
+  if (!request) return;
+  const project = await db.prepare("SELECT revision FROM projects WHERE id = ?").bind(projectId).first<{ revision: number }>();
+  if (!project) return;
+  const nextRevision = project.revision + 1;
+  const now = new Date().toISOString();
+  try {
+    await db.batch([
+      db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, projectId, project.revision),
+      db.prepare("UPDATE import_requests SET status = 'completed', reported_count = ?, completed_at = ? WHERE id = ?").bind(reportedCount, now, importRequestId),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, source_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, 'import.completed', ?, ?)")
+        .bind(id("evt"), organizationId, projectId, nextRevision, sourceId, actor, `${actor} imported ${reportedCount} task${reportedCount === 1 ? "" : "s"}`, now),
+    ]);
+  } catch {
+    // Lost a revision race to another concurrent write. The import itself already
+    // succeeded via the caller's create_work_items batch; only this activity-log
+    // entry is skipped, which is an acceptable silent degrade.
+  }
+}
+
 export async function createWorkItemsDeduplicated(
   db: PgD1,
   principal: Principal,
-  input: { projectId: string; proposals: Proposal[]; sourceId?: string; idempotencyKey: string },
+  input: { projectId: string; proposals: Proposal[]; sourceId?: string; importRequestId?: string; idempotencyKey: string },
 ) {
   const organizationId = await organizationFor(db, principal);
   await ownedProject(db, organizationId, input.projectId);
@@ -1008,6 +1080,11 @@ export async function createWorkItemsDeduplicated(
       if (linked.length) results[index].linkedDependencies = linked;
       if (warnings.length) results[index].dependencyWarnings = warnings;
     }
+  }
+
+  if (input.importRequestId && input.sourceId) {
+    const actor = await sourceActor(db, organizationId, input.sourceId);
+    await completeImportRequest(db, organizationId, input.projectId, input.sourceId, input.importRequestId, created + matched, actor);
   }
 
   return { results, summary: { created, matched } };

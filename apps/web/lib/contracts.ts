@@ -117,6 +117,8 @@ export type DashboardState = {
   evidence: Array<{ id: string; workItemId: string; sourceId: string | null; type: string; label: string; uri: string | null; result: string | null; createdAt: string }>;
   /** Restatements from other proposals that were matched into a work item instead of creating a duplicate. */
   aliases: Array<{ id: string; workItemId: string; title: string; description: string; sourceId: string | null; matchMethod: string; matchReason: string; createdAt: string }>;
+  /** Open "report everything you know" requests to a specific connected agent. See requestImport in lib/store.ts. */
+  importRequests: Array<{ id: string; projectId: string; sourceId: string; createdAt: string }>;
   serverTime: string;
 };
 

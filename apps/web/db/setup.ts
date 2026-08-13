@@ -76,6 +76,14 @@ export const SCHEMA_STATEMENTS = [
   // same finding, mirroring how work items accumulate corroborating providers.
   `CREATE TABLE IF NOT EXISTS simplification_findings (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, kind TEXT NOT NULL, work_item_id TEXT, related_work_item_id TEXT, verdict TEXT NOT NULL DEFAULT 'possible', reason TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', proposed_command TEXT, origin TEXT NOT NULL DEFAULT 'matcher', agreed_by TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'open', dedupe_key TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(run_id, dedupe_key))`,
   `CREATE INDEX IF NOT EXISTS idx_simplification_findings_run ON simplification_findings(run_id, created_at)`,
+  // Asking a specific connected agent to report everything it knows for a project.
+  // Resolved two ways (lib/store.ts): the agent's own next register_agent_session call
+  // surfaces it, or a create_work_items batch naming it as import_request_id closes it
+  // directly. The partial unique index is what makes re-clicking "Import from Codex"
+  // reuse the open request instead of piling up duplicates.
+  `CREATE TABLE IF NOT EXISTS import_requests (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, source_id TEXT NOT NULL, requested_by TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reported_count INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_import_requests_open ON import_requests(project_id, source_id) WHERE status = 'pending'`,
+  `CREATE INDEX IF NOT EXISTS idx_import_requests_org ON import_requests(organization_id, status)`,
 ] as const;
 
 /**

@@ -306,7 +306,7 @@ export function PlanbraidApp() {
       <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} />
       <section className="workspace" aria-label="Unified project workspace">
         <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
-        {project && view !== "inbox" && view !== "agents" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} />}
+        {project && view !== "inbox" && view !== "agents" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} project={project} sources={sources} importRequests={data?.importRequests ?? []} onSetup={() => setSetupOpen(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
         {newUpdates > 0 && <button className="new-updates" onClick={() => { setNewUpdates(0); window.scrollTo({ top: 0, behavior: "smooth" }); }}>↑ {newUpdates} new {newUpdates === 1 ? "update" : "updates"}</button>}
         <div className="workspace-body">
           {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
@@ -475,11 +475,99 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
   </section></div>;
 }
 
-function FilterBar({ items, filter, setFilter, source, clearSource, onSimplify, simplifying }: { items: WorkItem[]; filter: WorkStatus | "all"; setFilter: (status: WorkStatus | "all") => void; source: Source | null; clearSource: () => void; onSimplify: () => void; simplifying: boolean }) {
+function FilterBar({ items, filter, setFilter, source, clearSource, onSimplify, simplifying, project, sources, importRequests, onSetup, toast }: { items: WorkItem[]; filter: WorkStatus | "all"; setFilter: (status: WorkStatus | "all") => void; source: Source | null; clearSource: () => void; onSimplify: () => void; simplifying: boolean; project: Project; sources: Source[]; importRequests: DashboardState["importRequests"]; onSetup: () => void; toast: (message: string) => void }) {
   const statuses: Array<WorkStatus | "all"> = ["all", "in_progress", "ready", "blocked", "in_review", "done"];
   // Simplify is the rightmost control, so it owns the margin-left:auto that used to sit
   // on .source-filter; the source chip now just trails the status filters.
-  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}<button className="simplify-button" onClick={onSimplify} disabled={simplifying || !items.length} title="Find duplicates, blocked chains, and what to do first">{simplifying ? "Reviewing…" : "Simplify"}</button></div>;
+  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}<button className="simplify-button" onClick={onSimplify} disabled={simplifying || !items.length} title="Find duplicates, blocked chains, and what to do first">{simplifying ? "Reviewing…" : "Simplify"}</button><ImportMenu project={project} sources={sources} importRequests={importRequests} onSetup={onSetup} toast={toast} /></div>;
+}
+
+/**
+ * Asks one connected agent to report everything it knows about this project. Planbraid
+ * cannot reach into a live agent conversation, so clicking a row both files a durable
+ * request (picked up automatically the next time that agent's session starts) and
+ * copies a ready-to-paste prompt so it also works immediately without waiting for that.
+ *
+ * Positioned position: fixed and clamped to the viewport from the trigger button's own
+ * rect, computed on open rather than in CSS, because .filter-bar's ancestor
+ * .filter-scroll scrolls horizontally - anything positioned relative to a scrolling
+ * ancestor gets clipped by it exactly like the "Import complete Planbraid roadmap"
+ * chip that was cut off.
+ */
+function ImportMenu({ project, sources, importRequests, onSetup, toast }: { project: Project; sources: Source[]; importRequests: DashboardState["importRequests"]; onSetup: () => void; toast: (message: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [rect, setRect] = useState<{ top: number; left: number; opensUp: boolean } | null>(null);
+  const [busySourceId, setBusySourceId] = useState<string | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const ambiguousFamilies = ambiguousFamiliesOf(sources);
+  const MENU_WIDTH = 280;
+
+  const place = useCallback(() => {
+    const button = triggerRef.current;
+    if (!button) return;
+    const box = button.getBoundingClientRect();
+    // Right-aligned to the button by default, then clamped so it can never render off
+    // either edge of the viewport regardless of where the button sits. Opens upward
+    // instead of down when there isn't 200px of room below - just enough for the
+    // heading plus a couple of rows - so a trigger near the bottom of the screen
+    // doesn't produce a menu that opens mostly off-screen.
+    const left = Math.min(Math.max(8, box.right - MENU_WIDTH), window.innerWidth - MENU_WIDTH - 8);
+    const opensUp = window.innerHeight - box.bottom < 200 && box.top > 200;
+    // Anchored by the edge nearest the button either way: top of the menu 6px below the
+    // button when opening down, bottom of the menu 6px above it when opening up (via
+    // CSS `bottom`, since the menu's own height isn't known until it renders).
+    const top = opensUp ? window.innerHeight - box.top + 6 : box.bottom + 6;
+    setRect({ top, left, opensUp });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    place();
+    const onResize = () => place();
+    const onPointerDown = (event: MouseEvent) => {
+      if (menuRef.current?.contains(event.target as Node) || triggerRef.current?.contains(event.target as Node)) return;
+      setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    window.addEventListener("resize", onResize);
+    document.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("resize", onResize); document.removeEventListener("mousedown", onPointerDown); window.removeEventListener("keydown", onKey); };
+  }, [open, place]);
+
+  async function importFrom(source: Source) {
+    setBusySourceId(source.id);
+    try {
+      const response = await fetch("/api/import-requests", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: project.id, sourceId: source.id }) });
+      const body = await response.json() as { data?: { importRequestId: string; status: string }; error?: { message?: string } };
+      if (!response.ok || !body.data) throw new Error(body.error?.message ?? "Could not start the import");
+      const name = sourceName(source, ambiguousFamilies);
+      const prompt = `Call resolve_project for this repository (or use project_id "${project.id}" for "${project.name}") on Planbraid, then read every task or plan item you have for it and report all of them in one create_work_items call with your registered source_id and import_request_id="${body.data.importRequestId}", so Planbraid can match against existing work and mark this import complete.`;
+      await navigator.clipboard.writeText(prompt);
+      toast(`Prompt copied - paste it into ${name}`);
+      setOpen(false);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "Could not start the import");
+    } finally { setBusySourceId(null); }
+  }
+
+  return <div className="import-menu-wrap">
+    <button ref={triggerRef} type="button" className="import-menu-button" onClick={() => setOpen((value) => !value)} aria-haspopup="menu" aria-expanded={open} aria-label="Import from a connected agent" title="Import from a connected agent">⋯</button>
+    {open && rect && <div ref={menuRef} className="import-menu" role="menu" style={rect.opensUp ? { bottom: rect.top, left: rect.left, width: MENU_WIDTH } : { top: rect.top, left: rect.left, width: MENU_WIDTH }}>
+      <div className="import-menu-heading">Import from a connected agent</div>
+      {sources.length
+        ? sources.map((source) => {
+          const pending = importRequests.find((request) => request.sourceId === source.id);
+          const name = sourceName(source, ambiguousFamilies);
+          return <button key={source.id} type="button" role="menuitem" className="import-menu-item" disabled={Boolean(pending) || busySourceId === source.id} onClick={() => void importFrom(source)}>
+            <ProviderIcon provider={source.provider} />
+            <span className="import-menu-item-copy"><strong>{pending ? `Waiting for ${name}…` : `Import from ${name}`}</strong><small>{source.status === "active" ? "Active" : `Last seen ${relative(source.lastSeenAt)}`}</small></span>
+          </button>;
+        })
+        : <div className="import-menu-empty"><p>No agents connected yet.</p><button type="button" onClick={() => { setOpen(false); onSetup(); }}>Connect an agent</button></div>}
+    </div>}
+  </div>;
 }
 
 function Stream({ events, items, sources, onItem }: { events: WorkEvent[]; items: WorkItem[]; sources: Source[]; onItem: (id: string) => void }) {
