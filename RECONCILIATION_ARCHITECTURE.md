@@ -869,6 +869,296 @@ existing decisions, and the one behavior change the new `conflict` verdict could
 caused outside `match.ts` itself (Simplify's duplicate scan) was found and fixed as part
 of this milestone, not left for a later one to discover.
 
+**E5 shipped as full, tested plumbing — its own gate ("ablation proves the paraphrase
+case improves; otherwise delete it") is honestly unmet, and stated as unmet, because the
+one thing this milestone cannot produce in this environment is the actual distilled
+weight table.** §6.1's "Route A" design (vectors in Postgres, zero bytes added to the
+function bundle) is built exactly as specified and end-to-end tested against small,
+hand-built vectors — but `potion-base-8M`'s real ~8 MB token→vector table can't be
+downloaded or fabricated in this sandbox, and the user explicitly confirmed (asked
+directly, mid-milestone, given the size of that caveat) to build the full pipeline
+against synthetic data rather than skip the milestone or wait for the real weights.
+Every claim below is about the plumbing being correct, never about it having proven
+anything on real semantic similarity yet.
+
+- **`db/setup.ts`**: `CREATE EXTENSION IF NOT EXISTS vector`, `token_vectors(token TEXT
+  PRIMARY KEY, vec vector(256), weight REAL)` — the distilled model's own lookup table,
+  shared and read-only, ships empty — and `work_item_embeddings(...,  embedding
+  vector(256), ...)` with an HNSW cosine index, the ANN structure §6.1 calls out by name.
+  Both Neon (production) and `@electric-sql/pglite`'s bundled vector extension (tests)
+  speak the same pgvector SQL, so the schema and every query against it run unmodified in
+  both — verified directly (`CREATE INDEX ... USING hnsw`, the `<=>` operator, and text
+  literal insertion into a `vector` column all confirmed against PGlite before writing
+  any application code, not assumed to work).
+- **`lib/dedup/embedding.ts`**: the actual "inference" a static model performs — `meanPool`
+  (weighted average, `null` for an empty or zero-weight input rather than a fabricated
+  zero vector), `cosineSimilarity` (0 for a zero-vector input rather than a NaN from
+  dividing by zero), and pgvector's `[0.1,0.2,...]` text-literal round-trip. No model, no
+  network, no numpy — "there is no neural network at inference" for a real static
+  embedding, and this module is exactly that arithmetic.
+- **`lib/dedup/embedding-index.ts`**: `embeddingIndexStatements` (per-item, DELETE then
+  re-INSERT the same way `blockingIndexStatements` does, since an edit can turn a
+  computable embedding into an uncomputable one) and `backfillEmbeddingIndex`, gated by
+  its own `embeddings_indexed_at` flag — deliberately **not** sharing
+  `artifacts_indexed_at`. E1's own bug was two indices that both need to run for
+  *correctness*, coupled to one flag, so the second silently found nothing left to do.
+  Embeddings are different: `token_vectors` being empty is the expected steady state
+  until real weights are loaded, and an item with no embedding costs the system nothing
+  — the other two retrievers still work fully via RRF fusion — so coupling a
+  permanently-needed index's completion to an optional one's would have been the
+  mistake, not a simplification. `retrieveByEmbedding` is the retriever itself: skipped
+  entirely, zero extra queries, for any proposal whose tokens have no `token_vectors`
+  rows — which in this environment is every proposal, making the whole tier's presence
+  in `retrieveCandidates` a true no-op today, not a slow one.
+- **Fused into E1's blocking**, not built alongside it: `lib/dedup/blocking.ts`'s
+  `retrieveCandidates` now runs three retrievers through the same RRF fusion
+  (`fuseRankings`) instead of two, with an `includeEmbeddings` toggle (default on) that
+  exists *only* so the ablation harness can measure with/without over the identical
+  candidate pool — a real caller never needs it.
+- **`lib/dedup/embedding-eval.ts`**: `measureEmbeddingAblation`, §8's discipline applied
+  directly. A "paraphrase pair" is defined precisely as a same-labelled pair where E1's
+  own two retrievers have *zero* signal (no shared artifact, no shared object token) —
+  every other same-labelled pair is excluded, since E1 already finds those and whether
+  embeddings also happen to would prove nothing about the tier's own contribution.
+  `scripts/reconcile-eval.mjs` now prints this measurement, unambiguously labelled
+  "PROVEN" or "NOT YET PROVEN," alongside E0/E1/E3's own numbers — and on any golden set
+  gathered in this environment, it reads NOT YET PROVEN, correctly, because
+  `token_vectors` has nothing real in it to prove anything with.
+
+26 new tests: `tests/embedding.test.mjs` (13 — the pure vector math, including the
+zero-weight/zero-vector edge cases that would otherwise produce `NaN`/`Infinity`),
+`tests/embedding-index.test.mjs` (9, DB-backed — indexing, backfill with its own flag,
+ANN ranking by cosine distance, and the two-sided inertness invariant: identical
+`retrieveCandidates` behavior with an empty `token_vectors` table, and a real semantic
+retrieval once synthetic vectors are loaded), `tests/embedding-eval.test.mjs` (4 — the
+ablation harness itself, proving it correctly isolates a true paraphrase case from one
+E1 already catches, and that recall-with equals recall-without when `token_vectors` is
+empty). Full regression suite (585 tests), typecheck, lint, and build all green — zero
+regressions in E1's existing retrieval, confirmed by a dedicated test that
+`retrieveCandidates`' output is byte-for-byte the same as before E5 whenever
+`token_vectors` is empty.
+
+**E6 shipped — Tier A end to end: the question, the answer, and the audit.** §9's
+recommended tier needed no protocol feature and no model of our own, exactly as it says:
+a proposal landing in the ambiguous `possible` band now gets a precise, evidence-bearing
+question instead of only the passive "resembles" note it got before, answering it
+requires a real justification (rejected otherwise, before touching the database), and
+every answer becomes a label in E0's own golden set — auditable against whatever a human
+later decides about the same pair, per provider.
+
+- **`db/setup.ts`**: `reconciliation_judgment_requests` (one open question per new-item/
+  candidate pair, `UNIQUE(project_id, left_item_id, right_item_id)` so a retried batch
+  can't ask twice) and a `provider_family` column on `reconciliation_labels`, needed to
+  group §9's own audit rule by provider rather than only in aggregate.
+- **`lib/dedup/judgments.ts`**: the question-raising half — `buildJudgmentQuestion`
+  (names the specific candidate, matching §9's own example verbatim), `isAcceptableJustification`
+  (§9's honesty check: "'They're different' is rejected"), and `judgmentRequestStatement`
+  (a plain statement builder, no `organizationFor`). Kept free of any `lib/store.ts`
+  import specifically so `lib/store.ts` can call it directly while creating the
+  proposal — the same reasoning that keeps `lib/planning/decisions.ts`'s
+  `raiseConflictDecisions` on the other side of that boundary. `isAcceptableJustification`
+  is explicitly documented as a heuristic, not a verifier: there is no way to confirm a
+  justification's *content* is true or even relevant without the repository access the
+  agent has, only to reject the laziest non-answers.
+- **`lib/planning/judgments.ts`**: `submitJudgment`, the answering half — needs
+  `organizationFor` from `lib/store.ts`, so it lives above that module instead, exactly
+  mirroring `decisions.ts`'s own layering. Idempotent on a repeated identical answer,
+  a hard conflict on a *different* one, matching `resolveDecision`'s established shape.
+  Deliberately inert beyond capturing the label: no merge, no edge, no write to the
+  graph — §9 frames the incentive problem explicitly ("the proposing agent has a mild
+  incentive to answer different so its task gets created"), and automatically acting on
+  the answer would extend exactly the trust this milestone exists to withhold.
+- **Wired into `resolve.ts`/`store.ts`**: only a `possible`-verdict match raises a
+  judgment (`conflict` already has a decisive structural signal and gets a decision
+  instead — E4; `duplicate` never creates a second item to ask about). The tool result
+  mirrors §9's own JSON shape, `{ results, needsJudgment }`, with a `pairId` on each
+  entry an agent can pass straight to the new `submit_reconciliation_judgment` tool.
+- **`lib/dedup/provider-agreement.ts`**: `measureProviderAgreement`, §9's audit rule,
+  grouped by `pair_hash` — a judgment label compared against the *most recent*
+  human-sourced label (merge/split/dismissal) for the same pair, recency rather than a
+  fixed source-priority order, since a later split correcting an earlier merge is the
+  more current truth about that pair, not the merge.
+- **`lib/dedup/judgments.ts`'s `measureEscalationRate`**: §13's own gate, "escalation
+  rate < 5% of proposals," measured honestly against what this product actually counts —
+  "proposals received" isn't logged anywhere on its own (a proposal either collapses
+  into an existing item and is never counted as "created," becomes a plain create, or
+  becomes a create-plus-judgment), so judgment requests over non-archived items created
+  is the documented, defensible proxy. `scripts/reconcile-eval.mjs` now fails the same
+  way E1's blocking-recall gate does when this crosses 5%.
+
+35 new tests: `tests/judgment.test.mjs` (13 — the question builder, the justification
+honesty check including the doc's own trivial/real examples verbatim, and the
+provider-agreement math including the recency-over-priority rule and the "no human label
+yet" / "no judgment yet" no-op cases) and `tests/judgment-integration.test.mjs` (9,
+DB-backed — a possible-band match raises `needsJudgment` at both the entry and top
+level, a conflict match does *not* duplicate E4's own decision mechanism, a trivial
+justification is rejected before any write, a real one captures a label without
+merging or adding a further edge beyond whatever E4 already linked, idempotent replay,
+conflicting re-answer rejection, a 404 for an unknown pairId, and the escalation-rate
+query itself). Full regression suite (607 tests), typecheck, lint, and build all green.
+
+**E7 shipped, scoped to TypeScript/JavaScript** — a deliberate, user-confirmed narrowing
+of §7's general multi-language claim to the one language pair this codebase (and most of
+what a coding agent using Planbraid will be working in) actually needs, not a silent
+partial implementation. Real tree-sitter parsing, not a stub: verified end to end against
+this repository's own source files before any server-side code was written, and every
+test in `tests/bridge-symbols.test.mjs` and `tests/bridge-hook.test.mjs`'s E7 cases runs
+real WASM parsing, not a mock.
+
+- **The bridge gains an *optional* dependency, not a required one.** `integrations/bridge`
+  had zero dependencies and needed no `npm install` step at all before this milestone —
+  a real, working property this milestone does not break. `integrations/bridge/package.json`
+  (new) declares `web-tree-sitter` and `tree-sitter-wasms`, pinned to the *exact* versions
+  `0.25.10`/`0.1.13` rather than a caret range: confirmed directly, before writing any
+  parsing code, that `web-tree-sitter@0.26.x` fails to load `tree-sitter-wasms`' prebuilt
+  grammars at all (an emscripten/dylink metadata mismatch between the two packages'
+  independent release cadences) while `0.25.10` parses correctly — an unpinned range could
+  silently reintroduce that break on a routine `npm install`. `symbols.mjs`'s
+  `extractSymbols` is entirely best-effort: a missing install, an unreadable file, or a
+  parse error all degrade to fewer symbols, never a blocked turn, matching every other
+  optional piece of this bridge's own established philosophy.
+- **What leaves the machine stays inside the bridge's own existing privacy guarantee.**
+  `integrations/README.md` already commits to "never file contents or diffs" for
+  `report_repo_state`; this milestone reads file contents locally to parse them but reports
+  only identifier names, kinds, and file:line — the same class of information as a changed
+  file path, one level more granular, never the source text itself. Wired into
+  `report_repo_state` at the exact point `changed_paths` is already computed, with its own
+  opt-out (`PLANBRAID_DISABLE_SYMBOLS=1`) independent of `PLANBRAID_DISABLE_REPO_STATE`.
+- **`db/setup.ts`**: `repo_symbols(project_id, file, symbol, kind, line, ...)`, a symbol
+  *table* keyed on `(project_id, file, symbol)` — upserted on every report, not a log —
+  so a repeated parse of an unchanged function is a no-op and a removed function
+  disappears on the next report of that same file. A file reported as deleted has its
+  symbols cleared even when the same commit reports no new symbols at all.
+- **`lib/evidence/ingest.ts`**: symbol storage rides inside `ingestRepoObservation`'s
+  existing idempotent-replay handling — reported once per real (non-replayed) commit,
+  the same guarantee `report_repo_state`'s evidence-attachment already has.
+- **f4 wired to real resolution, not just extended with a new context slot.**
+  `lib/dedup/features.ts`'s f4 (symbol overlap) used to have three levels, all
+  approximate — "spelled the same," never verified. It now splits its top bucket into
+  `high-resolved` (the shared name is confirmed in `repo_symbols`) and
+  `high-unresolved` (spelled the same, unconfirmed), and `SEED_WEIGHTS` in
+  `fellegi-sunter.ts` gives `high-resolved` the strongest weight of any level in the
+  whole seed table — §7's own claim, "the highest-precision feature the scorer has,"
+  made a real, differently-weighted case instead of folded into the same bucket as a
+  coincidental spelling match.
+- **`lib/dedup/symbol-eval.ts`**: `measureSymbolResolutionAblation`, E7's own gate
+  ("symbol-resolved artifacts measurably lift precision") applied honestly. Reuses E0's
+  `evaluateReconciliation` directly rather than parallel scoring infrastructure, scoped
+  to exactly the population resolution can move — same-or-different-labelled pairs
+  sharing a symbol-classified artifact — comparing FS precision/recall with the real
+  `repo_symbols` table supplied against not supplying one. `scripts/reconcile-eval.mjs`
+  prints this next to E0/E1/E3/E5's own numbers, labelled PROVEN or NOT YET PROVEN. On
+  any golden set gathered in this sandbox it reads NOT YET PROVEN, honestly — there are
+  no real merge/split labels on pairs sharing a real, tree-sitter-confirmed symbol yet,
+  the same class of limitation E1/E3/E5 already documented rather than glossed over.
+- **Deliberately not built in this pass: the subsystem prefix-tree refinement** §7
+  describes ("falls out of Level 1 for free... cut at the level where the branching
+  factor is highest"). `deriveSubsystem` (signature.ts, E2) still uses its original,
+  narrower heuristic — the top two path segments of *an item's own* mentioned file
+  artifacts, not a real directory tree built from every file `repo_symbols` now knows
+  about for a project. Building that tree correctly (choosing a principled branching-
+  factor cut, handling repositories with wildly different directory shapes) is a real
+  algorithm in its own right, not a small addition to what shipped here, and rushing it
+  in the same pass as the parsing infrastructure risked exactly the kind of undertested
+  heuristic this document has otherwise refused to ship. A reasonable, low-risk follow-up
+  once `repo_symbols` has accumulated real file coverage for a project — stated as a
+  scope decision, not discovered as a gap later.
+
+47 new tests: `tests/bridge-symbols.test.mjs` (9, real tree-sitter parsing — class+method,
+interface+type+enum, arrow-function-const-vs-plain-value, `.tsx`/JSX, and every
+degradation path: unsupported extension, missing file, one bad file among several,
+oversized file, empty input), 3 new E7 cases in `tests/bridge-hook.test.mjs` (a real
+function parsed and reported through the actual subprocess hook, no `symbols` field for a
+file with no declarations, `PLANBRAID_DISABLE_SYMBOLS=1` honored), `tests/repo-symbols.test.mjs`
+(8, DB-backed — storage, upsert-not-duplicate, symbol removal on re-report, cleanup on
+file deletion, idempotent replay, project isolation, malformed-entry skipping), 3 new f4
+cases in `tests/fellegi-sunter.test.mjs` (resolved vs. unresolved vs. an unrelated
+resolved set), and `tests/symbol-eval.test.mjs` (5 — population scoping, and that
+supplying real resolution never scores worse than not supplying it). Every test asserting
+real parsing skips cleanly, not falsely, when `integrations/bridge`'s optional
+dependencies aren't installed (gitignored `node_modules`, a separate opt-in step) — the
+same degrade-don't-fail contract the feature itself has, verified in the tests about it
+too. Full regression suite (634 tests), typecheck, lint, and build all green.
+
+**E8 shipped — one module, two of its three real callers unified onto it, and the third
+deliberately, honestly kept separate after testing proved unification would regress it.**
+§10's gate ("one scorer, one weight file, one evaluation harness") is met by construction
+rather than by a new consolidation pass: `match.ts`'s `THRESHOLDS` was already the single
+weight source every stage reads, and E0's `evaluateReconciliation` was already the single
+harness — this milestone's actual work was closing the real, concrete duplication that
+existed *around* those, at the call sites.
+
+- **`lib/dedup/relate.ts`** (new): `relate(A, B) → { verdict, relation, score, reason,
+  explanation }`, §10's own signature realized. Wraps `checkVetoes` → `adjudicate` (the
+  collapse decision) and `classifyRelation` (the typed edge) behind one call, taking raw
+  title/description rather than requiring the caller to pre-build a real async SHA-256
+  fingerprint — `.normalized` stands in for equality comparison, the identical, already-
+  verified-safe shortcut `labels.ts`'s `snapshotAdjudication` and `fellegi-sunter.ts`'s
+  `snapshotAdjudicationFs` already use. Accepts a pre-built signature on either side
+  specifically so a caller scanning many pairs can memoize it across comparisons, rather
+  than "unifying" away the memoization Simplify already did by hand.
+- **`lib/simplify/analyze.ts` unified onto it**, closing the literal gap §10 names
+  ("which it partially does today, via `analyze.ts` calling `adjudicate` with
+  `fingerprintValue: ""`"): both `findDuplicates` and `findRedundantAgainstDone` now call
+  `relate()` once instead of each hand-rolling the "identical-normalized-string ? fake
+  duplicate-adjudication : adjudicate-with-a-placeholder-fingerprint" pattern
+  independently. A real, pre-existing gap surfaced while making this change: the
+  `conflicting_work` finding kind (E4) had no test coverage in `tests/simplify.test.mjs`
+  at all — added as part of verifying the refactor didn't silently break it, not
+  discovered separately.
+- **Planning context (`lib/planning/context.ts`) deliberately NOT unified onto the strict
+  cascade** — tested, not assumed. Routing its `relevance()`/`isRelevant()` scoring
+  through `relate()`'s vetoes broke a real, already-passing test:
+  `tests/planning-context.test.mjs`'s "a shared concrete artifact is relevant even with
+  completely different wording" case uses an objective and an item sharing one exact file
+  artifact but incompatible verbs ("update" the handler vs. "investigate" why it breaks)
+  — precisely the pair `checkVetoes`' action-compatibility gate exists to reject for
+  *duplicate detection*, correctly so there, but exactly the kind of prior-investigation
+  background a person planning next work should still see. Planning context answers a
+  broader question than "is this the same work," and needs a correspondingly more
+  permissive scorer — forcing the strict gate onto it would have been a regression dressed
+  up as unification, the opposite of what §10 is for. `relevance()`/`isRelevant()` are
+  therefore kept, unchanged, with the reasoning stated directly in the module comment so
+  a future reader doesn't mistake the separation for undone work.
+  - **What DID get unified additively**: among work already judged relevant by the
+    existing (permissive) gate, planned items now get checked with `relate()` for a
+    `CONFLICT` relation specifically — the one place a narrow, decisive signal is exactly
+    right, layered on top of the broad gate rather than replacing it. A conflicting
+    planned item now carries a real `reason` and a new guidance line
+    ("`#N` conflicts with this: ... Resolve the conflict before planning both."), where
+    before a planning-time conflict with existing work was invisible to this tool
+    entirely.
+- **`lib/planning/collision.ts` and `lib/dedup/labels.ts` deliberately left untouched.**
+  `checkCollisions` answers a different question (who is *actively* holding a live lease
+  on a shared artifact right now, a hard SQL equality match, no scoring) from "how related
+  are these two items" — its own module comment already calls the two "complementary, not
+  redundant," and nothing about this milestone's audit changes that. `labels.ts`'s
+  `snapshotAdjudication` already calls `adjudicate()` directly for E0's narrow golden-set
+  snapshot need; it never had a second implementation to unify away.
+- **"Plan merge" (`PLAN_VERSION_CONTROL.md`), §10's fourth named caller, is out of
+  scope**: a distinct, unbuilt feature (how two divergent plan branches combine), not
+  something this milestone's callers touch.
+
+9 new tests: `tests/relate.test.mjs` (6 — confirms `relate()` agrees with the cascade it
+wraps rather than being a second implementation, for a duplicate, a conflict, an
+unrelated pair, and a subset relationship; that `reason` and `explanation` are the right
+two different strings; that a pre-built signature is genuinely reused, not silently
+recomputed), 1 new case in `tests/simplify.test.mjs` (the previously-uncovered
+`conflicting_work` path, now exercised through the refactored code), and 2 new cases in
+`tests/planning-context.test.mjs` (a real conflict flagged additively without disturbing
+any other bucket, and a merely-related planned item correctly carrying no conflict
+reason). Full regression suite (643 tests), typecheck, lint, and build all green — the
+existing planning-context relevance tests passing unchanged is the actual proof the
+broader-question scoring was correctly left alone, not an incidental side effect.
+
+E0 through E8 — every stage RECONCILIATION_ARCHITECTURE.md's build order lays out — are
+now shipped. §13's own gates are each addressed honestly: several remain **NOT YET
+PROVEN** (E3 beating the cascade baseline, E5's and E7's precision-lift claims) because
+they need real production labels and real distilled weights this development sandbox
+cannot produce — stated plainly at each stage rather than glossed over, with the
+measurement harness (`npm run reconcile:eval`) already wired to report a real answer the
+moment that data exists.
+
 ## 13. Build order
 
 Evaluation before features, always. Each step is releasable and measurable.

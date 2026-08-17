@@ -15,6 +15,11 @@ import { principal, setupProject, createItem } from "./support/fixtures.mjs";
 import { executeCommand, organizationFor, registerSourceSession, updateSourceHeartbeat } from "@/lib/store.ts";
 import { getPlanningContext } from "@/lib/planning/context.ts";
 
+// A browser principal creates items at 'accepted' maturity directly (lib/store.ts's own
+// isHumanPrincipal-gated default) — needed to land an item in the `planned` bucket rather
+// than `openProposals`, which the default agent-like `principal` fixture always produces.
+const browser = { ...principal, authentication: "browser" };
+
 async function transition(db, projectId, itemId, status, key, extra = {}) {
   const row = await db.prepare("SELECT version FROM work_items WHERE id = ?").bind(itemId).first();
   return executeCommand(db, principal, { action: "transition_item", projectId, itemId, expectedVersion: row.version, status, idempotencyKey: key, ...extra });
@@ -53,6 +58,33 @@ test("a rejected approach surfaces with its reason, so the same idea does not ge
   assert.equal(result.rejected[0].resolution, "rejected");
   assert.equal(result.rejected[0].resolutionReason, "breaks service isolation");
   assert.ok(result.guidance.some((line) => line.includes("breaks service isolation")));
+});
+
+test("E8: a planned item in direct structural conflict with the objective is flagged, additively, without changing what else surfaces", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  const created = await executeCommand(db, browser, { action: "create_item", projectId, title: "Add lib/auth/middleware.ts", idempotencyKey: "conflict1" });
+  const itemId = created.itemId;
+  await transition(db, projectId, itemId, "planned", "c1");
+
+  const result = await context(db, projectId, "Remove lib/auth/middleware.ts");
+  assert.equal(result.planned.length, 1);
+  assert.equal(result.planned[0].itemKey, "#1");
+  assert.match(result.planned[0].reason, /middleware\.ts/);
+  assert.ok(result.guidance.some((line) => line.includes("#1") && line.includes("conflict")), `guidance must flag the conflict: ${JSON.stringify(result.guidance)}`);
+});
+
+test("E8: a planned item that is merely related (no conflict) carries no reason and no conflict guidance line", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  const created = await executeCommand(db, browser, { action: "create_item", projectId, title: "Add lib/auth/middleware.ts", idempotencyKey: "related1" });
+  const itemId = created.itemId;
+  await transition(db, projectId, itemId, "planned", "c2");
+
+  const result = await context(db, projectId, "Fix a bug in lib/auth/middleware.ts");
+  assert.equal(result.planned.length, 1);
+  assert.equal(result.planned[0].reason, undefined);
+  assert.ok(!result.guidance.some((line) => line.includes("conflict")));
 });
 
 test("in-progress work names who is holding it, when a live lease exists", async () => {

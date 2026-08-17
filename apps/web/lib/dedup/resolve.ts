@@ -13,6 +13,7 @@ import type { WorkItem } from "@/lib/contracts";
 import { buildSignature, fingerprint } from "./signature.ts";
 import { bestMatch, explain, type Candidate, type Proposal } from "./match.ts";
 import { classifyRelation, type RelationType } from "./relations.ts";
+import { buildJudgmentQuestion, type JudgmentEvidence } from "./judgments.ts";
 
 export type Outcome = {
   ref?: string;
@@ -41,6 +42,11 @@ export type Outcome = {
    * there is no match at all, or when the match collapsed the proposal into `duplicate`
    * (an item that never gets created has nothing to relate to). */
   relation?: { type: RelationType; reason: string };
+  /** E6 — Tier A: present only for a `possible`-verdict match (the genuinely ambiguous
+   * band). A `conflict` match already has a decisive structural signal and gets a
+   * decision raised instead (E4); a `duplicate` match never creates a second item to ask
+   * about at all. */
+  judgment?: { question: string; evidence: JudgmentEvidence };
   /** Content the proposal carried that the matched item does not already say. */
   delta: string[];
 };
@@ -110,6 +116,20 @@ export async function resolveProposals(
         if (!match.candidate.id.startsWith("batch:")) {
           const relation = classifyRelation({ signature, fingerprintValue }, match.candidate);
           if (relation.type !== "NEW") outcome.relation = relation;
+
+          // E6 — Tier A: only the genuinely ambiguous band gets a question. `conflict`
+          // already has a decisive structural signal (opposite intent, same artifact —
+          // E4 raises a decision for it directly); asking "is this the same work" would
+          // be a strange question for a pair the vetoes already know isn't.
+          if (match.verdict === "possible") {
+            const left = signature;
+            const right = match.candidate.signature;
+            const sharedArtifacts = left.artifacts.filter((artifact) => right.artifacts.includes(artifact));
+            outcome.judgment = {
+              question: buildJudgmentQuestion(proposal.title, match.candidate),
+              evidence: { sharedArtifacts, reason: match.reason },
+            };
+          }
         }
       }
     }

@@ -13,6 +13,9 @@
  *   PLANBRAID_VERIFY_COMMAND=npm test (run at turn end; only its exit code is reported)
  *   PLANBRAID_REPO_DIR=/path/to/repo (defaults to the hook process's own cwd)
  *   PLANBRAID_DISABLE_REPO_STATE=1 (opt out of M15's repo-state reporting entirely)
+ *   PLANBRAID_DISABLE_SYMBOLS=1 (opt out of E7's symbol extraction; repo-state reporting
+ *     still runs. Automatic no-op anyway unless `npm install` has been run in this
+ *     directory — see symbols.mjs and package.json)
  *
  * RELAYBOARD_* names are read as a fallback for one release if the PLANBRAID_*
  * variant is unset, for anyone who configured this before the rename.
@@ -26,6 +29,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { extractSymbols } from "./symbols.mjs";
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -200,6 +204,13 @@ async function main() {
       const repoState = await gitRepoState(repoDir);
       if (repoState) {
         const verification = await runVerification(repoDir);
+        // E7: best-effort, TS/JS only (RECONCILIATION_ARCHITECTURE.md §7). `extractSymbols`
+        // never throws — a missing optional dependency, an unreadable file, or a parse
+        // error all resolve to fewer symbols, never a blocked turn. Only *changed* paths
+        // are parsed, not the whole repository, keeping this proportional to the turn's
+        // own git-diff work rather than a separate full-repo scan.
+        const symbolsDisabled = ["1", "true", "yes"].includes((env("DISABLE_SYMBOLS") || "").toLowerCase());
+        const symbols = symbolsDisabled ? [] : await extractSymbols(repoDir, repoState.changedPaths).catch(() => []);
         await rpc("report_repo_state", {
           project_id: projectId,
           source_id: sourceId,
@@ -208,6 +219,7 @@ async function main() {
           changed_paths: repoState.changedPaths,
           deleted_paths: repoState.deletedPaths,
           ...(verification ? { verification_command: verification.command, verification_exit_code: verification.exitCode } : {}),
+          ...(symbols.length ? { symbols } : {}),
         }).catch(() => { /* degraded capture, not a turn-blocking failure */ });
       }
     }

@@ -840,7 +840,7 @@ asymmetry is unchanged — a false split is one visible card, a false merge is d
 features they judge. Without them the embedding tier's readmission is an assertion, and
 `§6.1` exists precisely to stop assertions of that shape.
 
-**E0, E1, E2, E3, and E4 are shipped.** See `RECONCILIATION_ARCHITECTURE.md`'s own "Build
+**E0 through E8 — the full build order — are shipped.** See `RECONCILIATION_ARCHITECTURE.md`'s own "Build
 status" section for the full detail. E1's blocking rebuild (artifact + rare-token indices
 fused by RRF, old recency fallback fully removed, its own recall@50 gate and harness) is
 in, with two real bugs caught and fixed along the way: a shared backfill flag that would
@@ -887,8 +887,84 @@ an edge or a decision, never a silent collapse. Fixing F3 also surfaced a real b
 change itself would have introduced: Simplify's own duplicate scan reused the same shared
 cascade, and without a fix would have proposed *merging* two items in direct conflict —
 caught and fixed with a new informational `conflicting_work` finding before this milestone
-shipped, not left for someone to find in production. Continuing to E5 (the static
-embedding tier) next.
+shipped, not left for someone to find in production.
+
+E5's static embedding tier is built exactly to §6.1's spec (pgvector `token_vectors` +
+`work_item_embeddings`, mean-pooling in place of a neural network, HNSW ANN, fused into
+E1's blocking as a third RRF retriever) and fully tested — but its own gate ("ablation
+proves the paraphrase case improves; otherwise delete it") is honestly reported as
+**unmet**, not glossed over: the real ~8 MB `potion-base-8M` distilled weight table
+cannot be downloaded or fabricated in this development sandbox, so `token_vectors` ships
+empty and the tier is a genuine no-op in every environment that hasn't loaded real
+weights — verified by a dedicated test that `retrieveCandidates`'s output is unchanged
+from E1 alone whenever the table is empty. The user was asked directly, given how large
+that caveat is, and confirmed building the full pipeline against synthetic vectors rather
+than skipping the milestone. `npm run reconcile:eval` now prints the ablation result
+labelled "PROVEN" or "NOT YET PROVEN" next to E0/E1/E3's own numbers, so the gate gets a
+real answer the moment a real distilled table is loaded, instead of a claim.
+
+E6 builds §9's recommended Tier A exactly as specified: free, because the judging model
+is already on the connection. A `possible`-verdict match now returns a precise question
+(`needsJudgment`, matching §9's own JSON shape) instead of only a passive note, a new
+`submit_reconciliation_judgment` tool records the answer, and answering requires a real
+justification — a bare "different" is rejected before the database is even touched,
+§9's own honesty rule word for word. Every answer becomes a label in E0's own golden
+set rather than a special-purpose store, which is what makes the audit rule ("track
+judgment-vs-later-human-split agreement per provider; if a provider's judgments
+disagree with humans, down-weight them") a query over existing data instead of new
+infrastructure. Deliberately inert beyond capturing that label: no automatic merge, no
+automatic edge — §9 itself names the incentive problem ("the proposing agent has a mild
+incentive to answer different so its task gets created"), and this milestone declines to
+extend that trust any further than recording the evidence. `npm run reconcile:eval` now
+reports the escalation rate against its own 5% gate and the provider-agreement audit
+next to every earlier stage's numbers.
+
+E7 grounds artifacts in real code, scoped to TypeScript/JavaScript — a user-confirmed
+narrowing of §7's general multi-language claim after weighing the real tradeoff directly:
+building it meant giving the bridge (previously a genuinely zero-dependency script) an
+*optional* tree-sitter dependency and having it read file contents locally to parse them,
+where before it only ever read file paths. Both are handled the way this codebase handles
+every such tradeoff — opt-in (`npm install` in `integrations/bridge`, a separate step;
+the bridge still needs nothing at all without it) and scoped (names, kinds, and file:line
+leave the machine, never source text, keeping faith with the bridge's existing "never file
+contents or diffs" guarantee). Verified against this repository's own source before any
+server-side code existed, not assumed to work: the exact `web-tree-sitter`/
+`tree-sitter-wasms` version pairing that actually parses correctly was confirmed directly
+first, after a newer default combination silently failed to load at all. f4 (symbol
+overlap, E3's scorer) now distinguishes a name confirmed against real code from one that's
+merely spelled the same, with the confirmed case carrying the strongest weight in the
+whole seed table — §7's "highest-precision feature" claim, made real rather than
+aspirational. The subsystem prefix-tree refinement §7 also describes is explicitly not
+built in this pass: a real algorithm in its own right, not a small addition, and better
+built once `repo_symbols` has accumulated real coverage than rushed alongside the parsing
+infrastructure.
+
+E8 closes the loop §10 opens: one `relate(A, B)` module (`lib/dedup/relate.ts`),
+`create_work_items` (already, via `resolve.ts`'s `bestMatch`/`classifyRelation`) and
+Simplify (now, replacing the `adjudicate(..., fingerprintValue: "")` workaround §10 calls
+out by name) both routed through it. Planning context is the one deliberate exception,
+and the reasoning is worth stating plainly because it looks at first like unfinished
+work rather than what it is: forcing its relevance ranking through the same vetoed
+cascade broke a real, already-passing test — an objective and an existing item sharing
+one exact file but using incompatible verbs ("update" vs. "investigate"), which
+`checkVetoes` correctly rejects for *duplicate detection* but which is exactly the kind
+of background a person planning next work should still see. Planning context answers a
+broader question than the other three callers, and keeping its scorer more permissive
+is the correct outcome of applying §10's own discipline, not an exception to it. What
+did unify: planned items now get checked for a `CONFLICT` relation specifically, on top
+of the existing broad relevance gate, so a genuine planning-time conflict is no longer
+invisible to this tool. `lib/planning/collision.ts` (a different question — live-lease
+collision, not relatedness) and `lib/dedup/labels.ts` (already routed through
+`adjudicate()` directly) needed no changes at all. "Plan merge," §10's fourth named
+caller, remains unbuilt and out of scope.
+
+With E8 shipped, every stage of `RECONCILIATION_ARCHITECTURE.md`'s build order — E0
+through E8 — exists in the codebase, tested, with each stage's own gate addressed
+honestly: several (E3's cascade-beating claim, E5's and E7's precision-lift claims)
+remain measured as **not yet proven**, because proving them needs real production
+labels and real distilled weights this development environment cannot produce — stated
+plainly at each stage, with `npm run reconcile:eval` already wired to report a real
+verdict the moment that data exists, rather than left as a claim.
 
 #### M11 — Pre-planning intelligence (M) — *feature 3. The one to build if only one gets built.*
 

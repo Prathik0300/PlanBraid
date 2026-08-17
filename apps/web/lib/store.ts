@@ -4,7 +4,9 @@ import { AGENT_WRITABLE_MATURITIES, MATURITIES, RESOLUTIONS, type Authority, typ
 import type { Proposal } from "@/lib/dedup/match.ts";
 import { aliasStatement, resolveProposals } from "@/lib/dedup/resolve.ts";
 import { edgeTypeForRelation } from "@/lib/dedup/relations.ts";
+import { judgmentId, judgmentRequestStatement } from "@/lib/dedup/judgments.ts";
 import { backfillBlockingIndex, blockingIndexStatements, retrieveCandidates } from "@/lib/dedup/blocking.ts";
+import { backfillEmbeddingIndex } from "@/lib/dedup/embedding-index.ts";
 import { captureLabelStatement, snapshotAdjudication } from "@/lib/dedup/labels.ts";
 import { appendPlanOp, type AuthorKind } from "@/lib/ops/log.ts";
 import { opPayloadFrom } from "@/lib/ops/hash.ts";
@@ -1201,11 +1203,20 @@ export async function createWorkItemsDeduplicated(
   // per call; a large project converges over a few writes and degrades to the old behaviour
   // meanwhile rather than to a wrong one.
   await backfillBlockingIndex(db, organizationId, input.projectId);
+  // E5: same bounded-backfill shape as the line above, kept as a separate call (not
+  // merged into one function) because it has its own flag and its own failure mode — see
+  // embeddings_indexed_at's schema comment for why coupling the two would be a mistake,
+  // not a simplification.
+  await backfillEmbeddingIndex(db, organizationId, input.projectId);
   const existingItems = await retrieveCandidates(db, organizationId, input.projectId, input.proposals);
   const outcomes = await resolveProposals({ proposals: input.proposals, existingItems });
 
   const results: Record<string, unknown>[] = [];
   const annotations: PgD1PreparedStatement[] = [];
+  // E6 — Tier A: mirrors §9's own example shape, `{ results, needsJudgment }`, so an
+  // agent can act on every open question from this one call without re-scanning
+  // `results` for entries that happen to carry a `needsJudgment` field.
+  const needsJudgment: Array<{ pairId: string; question: string; evidence: unknown; answerWith: string }> = [];
   const createdByIndex = new Map<number, { itemId: string; itemKey: string }>();
   // Every outcome's final target (its own new item, or the canonical item it matched
   // into), keyed by batch index. Built for the depends_on resolution pass below, which
@@ -1256,6 +1267,21 @@ export async function createWorkItemsDeduplicated(
           type: outcome.relation.type, reason: outcome.relation.reason,
           workItemId: outcome.match!.workItemId, itemKey: outcome.match!.itemKey,
         };
+      }
+
+      // E6 — Tier A: the genuinely ambiguous band gets a standing question instead of
+      // just the passive `resembles` note above. A plain INSERT, not an `executeCommand`
+      // — there is no `Command` variant for it and none is needed, since answering it
+      // (`submitJudgment`, lib/planning/judgments.ts) never mutates the graph on its own.
+      if (outcome.judgment) {
+        const pairId = judgmentId();
+        annotations.push(judgmentRequestStatement(db, {
+          id: pairId, organizationId, projectId: input.projectId, leftItemId: record.itemId, rightItemId: outcome.match!.workItemId,
+          question: outcome.judgment.question, evidence: outcome.judgment.evidence, sourceId: input.sourceId,
+        }));
+        const judgment = { pairId, question: outcome.judgment.question, evidence: outcome.judgment.evidence, answerWith: "submit_reconciliation_judgment" };
+        entry.needsJudgment = judgment;
+        needsJudgment.push(judgment);
       }
       results.push(entry);
       continue;
@@ -1348,7 +1374,7 @@ export async function createWorkItemsDeduplicated(
     await completeImportRequest(db, organizationId, input.projectId, input.sourceId, input.importRequestId, created + matched, actor);
   }
 
-  return { results, summary: { created, matched } };
+  return { results, summary: { created, matched }, needsJudgment };
 }
 
 const PRIORITY_RANK: Record<WorkItem["priority"], number> = { urgent: 4, high: 3, normal: 2, low: 1, none: 0 };

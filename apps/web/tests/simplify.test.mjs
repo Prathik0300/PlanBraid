@@ -60,6 +60,21 @@ test("similar wording about different things is left alone", () => {
   assert.equal(findDuplicates([item({ title: "Add rate limiting" }), item({ title: "Test rate limiting" })]).length, 0);
 });
 
+test("E4/E8: opposite intent on the SAME concrete artifact is reported as conflicting_work, never proposed as a merge", () => {
+  // Fixes F3, routed through the E8 relate() refactor: a conflict must never fall into
+  // the possible_duplicate branch and propose merge_items — that would be actively wrong,
+  // not merely imprecise, for two items in direct structural conflict.
+  const findings = findDuplicates([
+    item({ title: "Add lib/auth/middleware.ts" }),
+    item({ title: "Remove lib/auth/middleware.ts" }),
+  ]);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "conflicting_work");
+  assert.equal(findings[0].verdict, "informational");
+  assert.equal(findings[0].proposedCommand, undefined, "a conflict must never carry a mergeable command");
+  assert.match(findings[0].detail, /middleware\.ts/);
+});
+
 test("a three-way pile-up merges into one survivor, never into an item being archived", () => {
   const a = item({ title: "Write onboarding docs" });
   const b = item({ title: "write onboarding docs" });

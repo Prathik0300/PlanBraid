@@ -15,10 +15,14 @@
  * reaches the scorer is invisible forever — so **never filter by status**: done and
  * cancelled items are candidates by design, and age plays no part in retrieval at all.
  *
- * Two retrievers, not the full five-retriever design the architecture document's Stage 1
- * diagram lays out. BM25F full-text, vector ANN, and structural (objective/dependency)
- * retrievers are later stages (E2 onward per §13's build order); adding them here would be
- * building ahead of the milestone that's actually scoped to need them.
+ * Two retrievers here, a third (vector ANN, E5 — `lib/dedup/embedding-index.ts`) fused in
+ * below. Not the full five-retriever design the architecture document's Stage 1 diagram
+ * lays out: BM25F full-text and the structural (objective/dependency) retrievers are
+ * later stages (E6 onward per §13's build order); adding them here would be building
+ * ahead of the milestone that's actually scoped to need them. The embedding retriever is
+ * a genuine no-op — contributes nothing to fusion, costs one skipped query, not a slow
+ * one — for as long as `token_vectors` stays empty, so its presence here changes nothing
+ * about E1's own measured behavior until real distilled weights are loaded.
  */
 import type { PgD1, PgD1PreparedStatement } from "@/db/pg-d1";
 import type { WorkItem } from "@/lib/contracts";
@@ -26,6 +30,7 @@ import { mapItem, text, type Row } from "@/lib/read/rows.ts";
 import { buildSignature } from "./signature.ts";
 import { artifactsOf, classifyArtifact } from "./artifacts.ts";
 import { tokensOf } from "./tokens.ts";
+import { retrieveByEmbedding } from "./embedding-index.ts";
 
 /** How many unindexed items one call will backfill. Bounded so importing a large project
  * spreads its indexing over several writes instead of stalling one of them. */
@@ -201,13 +206,21 @@ export async function retrieveCandidates(
   organizationId: string,
   projectId: string,
   proposals: Array<{ title: string; description?: string }>,
+  options: { includeEmbeddings?: boolean } = {},
 ): Promise<WorkItem[]> {
+  // `includeEmbeddings` defaults to on — every real caller wants it, since it is a
+  // genuine no-op (see the module comment) rather than an expensive optional extra. It
+  // exists purely for `measureEmbeddingAblation` (embedding-eval.ts), which has to run
+  // retrieval twice, with and without the third retriever, over the identical candidate
+  // pool to measure what it alone contributes — the whole point of §8's ablation
+  // discipline: "prove it, or delete it," which needs a true before/after to prove.
+  const includeEmbeddings = options.includeEmbeddings !== false;
   const signatures = proposals.map((proposal) => buildSignature(proposal.title, proposal.description ?? ""));
   const allArtifacts = [...new Set(signatures.flatMap((signature) => signature.artifacts))].slice(0, 400);
   const allTokens = [...new Set(signatures.flatMap((signature) => signature.objectTokens))].slice(0, 400);
   if (!allArtifacts.length && !allTokens.length) return [];
 
-  const [artifactRows, tokenRows, dfRows, totalRow] = await Promise.all([
+  const [artifactRows, tokenRows, dfRows, totalRow, embeddingRankings] = await Promise.all([
     allArtifacts.length
       ? db.prepare("SELECT work_item_id, artifact FROM work_item_artifacts WHERE project_id = ? AND artifact = ANY(?::text[])").bind(projectId, allArtifacts).all<Row>()
       : Promise.resolve({ results: [] as Row[] }),
@@ -218,6 +231,7 @@ export async function retrieveCandidates(
       ? db.prepare("SELECT token, COUNT(DISTINCT work_item_id)::int AS df FROM work_item_tokens WHERE project_id = ? AND token = ANY(?::text[]) GROUP BY token").bind(projectId, allTokens).all<Row>()
       : Promise.resolve({ results: [] as Row[] }),
     db.prepare("SELECT COUNT(*)::int AS total FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL").bind(projectId, organizationId).all<Row>(),
+    includeEmbeddings ? retrieveByEmbedding(db, projectId, signatures.map((signature) => signature.objectTokens), TOP_N) : Promise.resolve(signatures.map(() => [] as string[])),
   ]);
 
   const artifactsByItem = groupToMap(artifactRows.results, "work_item_id", "artifact");
@@ -227,12 +241,12 @@ export async function retrieveCandidates(
   const idf = computeIdf(documentFrequency, totalDocuments);
 
   const unionIds = new Set<string>();
-  for (const signature of signatures) {
+  signatures.forEach((signature, index) => {
     const artifactRanking = rankByArtifactOverlap(signature.artifacts, artifactsByItem);
     const tokenRanking = rankByRareTokens(signature.objectTokens, tokensByItem, idf);
-    const fused = fuseRankings([artifactRanking, tokenRanking]).slice(0, TOP_N);
+    const fused = fuseRankings([artifactRanking, tokenRanking, embeddingRankings[index]]).slice(0, TOP_N);
     for (const entry of fused) unionIds.add(entry.workItemId);
-  }
+  });
   if (!unionIds.size) return [];
 
   const rows = await db.prepare("SELECT * FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL AND id = ANY(?::text[])")

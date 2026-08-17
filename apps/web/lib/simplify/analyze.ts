@@ -11,7 +11,7 @@
  */
 
 import type { Command, WorkItem, DashboardState } from "@/lib/contracts";
-import { adjudicate, explain, type Candidate } from "@/lib/dedup/match.ts";
+import { relate } from "@/lib/dedup/relate.ts";
 import { buildSignature, type TaskSignature } from "@/lib/dedup/signature.ts";
 import { DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
 import { isStartedWhileBlocked } from "@/lib/graph/column.ts";
@@ -72,11 +72,11 @@ function signatureOf(item: WorkItem): TaskSignature {
   return buildSignature(item.title, item.description);
 }
 
-function toCandidate(item: WorkItem, signature: TaskSignature): Candidate {
-  // fingerprintValue is null on purpose: fingerprint() is async (WebCrypto) and the
-  // identical-signature case is already covered by comparing `normalized` directly
-  // below, which keeps this whole module synchronous and trivially testable.
-  return { id: item.id, itemKey: item.itemKey, title: item.title, status: item.status, updatedAt: item.updatedAt, signature, fingerprintValue: null };
+/** `relate()` (E8) takes a `RelateCandidate` shape — the fields it needs from a
+ * `WorkItem` plus the signature this module already memoized in `signatures`, so the
+ * O(n²) scans below never recompute a signature they already have. */
+function toRelateCandidate(item: WorkItem, signature: TaskSignature) {
+  return { id: item.id, itemKey: item.itemKey, title: item.title, status: item.status, updatedAt: item.updatedAt, signature };
 }
 
 /** Deterministic ordering so the same project always yields the same winner. Older
@@ -119,10 +119,7 @@ export function findDuplicates(items: WorkItem[]): Finding[] {
       if (merged.has(loser.id) || merged.has(winner.id)) continue;
       const left = signatures.get(loser.id)!;
       const right = signatures.get(winner.id)!;
-      const identical = left.normalized === right.normalized;
-      const decision = identical
-        ? { verdict: "duplicate" as const, score: 1, method: "fingerprint" as const, reason: "Identical normalized task signature" }
-        : adjudicate({ signature: left, fingerprintValue: "" }, toCandidate(winner, right));
+      const decision = relate({ title: loser.title, signature: left }, toRelateCandidate(winner, right));
       if (decision.verdict === "distinct") continue;
 
       // A conflict is emphatically not a duplicate — proposing `merge_items` for opposite
@@ -137,7 +134,7 @@ export function findDuplicates(items: WorkItem[]): Finding[] {
           relatedWorkItemId: winner.id,
           verdict: "informational",
           reason: `${loser.itemKey} conflicts with ${winner.itemKey}`,
-          detail: explain({ ...decision, candidate: toCandidate(winner, right) }),
+          detail: decision.explanation,
         });
         continue;
       }
@@ -153,7 +150,7 @@ export function findDuplicates(items: WorkItem[]): Finding[] {
         reason: certain
           ? `${loser.itemKey} restates ${winner.itemKey}`
           : `${loser.itemKey} may restate ${winner.itemKey}`,
-        detail: explain({ ...decision, candidate: toCandidate(winner, right) }),
+        detail: decision.explanation,
         proposedCommand: {
           action: "merge_items", projectId: loser.projectId, winnerItemId: winner.id, loserItemId: loser.id,
           reason: `${decision.reason} as ${winner.itemKey}`, idempotencyKey: `simplify-merge-${loser.id}`,
@@ -179,9 +176,7 @@ export function findRedundantAgainstDone(items: WorkItem[]): Finding[] {
     for (const finished of resolved) {
       const left = signatures.get(item.id)!;
       const right = signatures.get(finished.id)!;
-      const decision = left.normalized === right.normalized
-        ? { verdict: "duplicate" as const, score: 1, method: "fingerprint" as const, reason: "Identical normalized task signature" }
-        : adjudicate({ signature: left, fingerprintValue: "" }, toCandidate(finished, right));
+      const decision = relate({ title: item.title, signature: left }, toRelateCandidate(finished, right));
       if (decision.verdict !== "duplicate") continue;
       findings.push({
         kind: "redundant_done",
@@ -190,7 +185,7 @@ export function findRedundantAgainstDone(items: WorkItem[]): Finding[] {
         relatedWorkItemId: finished.id,
         verdict: "possible",
         reason: `${item.itemKey} repeats ${finished.itemKey}, which is already ${finished.status}`,
-        detail: explain({ ...decision, candidate: toCandidate(finished, right) }),
+        detail: decision.explanation,
         proposedCommand: {
           action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version,
           status: "cancelled", reason: `Already covered by ${finished.itemKey}`, idempotencyKey: `simplify-cancel-${item.id}`,

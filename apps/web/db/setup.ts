@@ -141,6 +141,17 @@ export const SCHEMA_STATEMENTS = [
   // order-independent so a merge and a later split of the same two items don't collide.
   `CREATE TABLE IF NOT EXISTS reconciliation_labels (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, pair_hash TEXT NOT NULL, left_item_id TEXT NOT NULL, right_item_id TEXT NOT NULL, verdict TEXT NOT NULL, confidence TEXT NOT NULL DEFAULT 'high', label_source TEXT NOT NULL, features TEXT NOT NULL DEFAULT '{}', justification TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (project_id, pair_hash, label_source))`,
   `CREATE INDEX IF NOT EXISTS idx_reconciliation_labels_project ON reconciliation_labels(project_id, created_at)`,
+  // E6 — Tier A, the connected-agent judgment tier (RECONCILIATION_ARCHITECTURE.md §9).
+  // A pending question raised when Stage 2 lands a proposal in the ambiguous band
+  // (verdict 'possible'): the item is still created either way (§9 doesn't change the
+  // asymmetric-error rule — an unresolved judgment is never grounds to withhold a task),
+  // but the agent is handed a precise question about the specific candidate instead of
+  // just a passive "resembles" note. `UNIQUE(project_id, left_item_id, right_item_id)`
+  // is deliberately ordered, not pair-hashed like reconciliation_labels: a judgment
+  // request always names a real "new item" and a real "existing candidate," a direction
+  // that matters for the question's own wording, unlike a label which is about the pair.
+  `CREATE TABLE IF NOT EXISTS reconciliation_judgment_requests (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, left_item_id TEXT NOT NULL, right_item_id TEXT NOT NULL, question TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'open', requested_by_source_id TEXT, answered_verdict TEXT, answered_justification TEXT, answered_by_source_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), answered_at TIMESTAMPTZ, UNIQUE (project_id, left_item_id, right_item_id))`,
+  `CREATE INDEX IF NOT EXISTS idx_judgment_requests_project_status ON reconciliation_judgment_requests(project_id, status)`,
   // The plan operation log (PLAN_VERSION_CONTROL.md M25). Additive and observational: the
   // existing tables above remain the source of truth and the only thing any read path in
   // the product actually depends on today. This is the append-only history layer beside
@@ -206,6 +217,16 @@ export const SCHEMA_STATEMENTS = [
   // apart from a plain path list.
   `CREATE TABLE IF NOT EXISTS repo_observations (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, source_id TEXT, head_sha TEXT NOT NULL, branch TEXT, changed_paths TEXT NOT NULL DEFAULT '[]', deleted_paths TEXT NOT NULL DEFAULT '[]', verification_command TEXT, verification_exit_code INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (project_id, head_sha))`,
   `CREATE INDEX IF NOT EXISTS idx_repo_observations_project ON repo_observations(project_id, created_at DESC)`,
+  // E7 — repository grounding, Level 1 (RECONCILIATION_ARCHITECTURE.md §7), scoped to
+  // TypeScript/JavaScript: the bridge's own optional tree-sitter parse
+  // (integrations/bridge/symbols.mjs), reported alongside repo_observations at the same
+  // turn boundary. One row per (project, file, symbol name) — a symbol table, not a log —
+  // so a repeated report of the same file naturally upserts (`ON CONFLICT` in the
+  // ingestion statement) rather than accumulating stale duplicates of a function that
+  // hasn't moved. `line` is best-effort location, not a stable identity: it drifts as a
+  // file is edited above the symbol, and the primary key deliberately does not include it.
+  `CREATE TABLE IF NOT EXISTS repo_symbols (organization_id TEXT NOT NULL, project_id TEXT NOT NULL, file TEXT NOT NULL, symbol TEXT NOT NULL, kind TEXT NOT NULL, line INTEGER NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (project_id, file, symbol))`,
+  `CREATE INDEX IF NOT EXISTS idx_repo_symbols_project_symbol ON repo_symbols(project_id, symbol)`,
 ] as const;
 
 /**
@@ -239,6 +260,25 @@ export const MIGRATION_STATEMENTS = [
   // are backfilled lazily from the dedup read path (lib/dedup/artifacts.ts); the column
   // is what keeps an item with genuinely zero artifacts from being rescanned forever.
   `ALTER TABLE work_items ADD COLUMN IF NOT EXISTS artifacts_indexed_at TIMESTAMPTZ`,
+  // E5's own "already indexed" flag, deliberately separate from artifacts_indexed_at
+  // rather than reusing it. E1's own bug (see blocking.ts) was two passes that both need
+  // to run for *correctness*, coupled to one flag, so the second silently found nothing
+  // left to do. Embeddings are different: `token_vectors` is empty in this environment
+  // (see its own schema comment) and possibly always empty in a deployment that never
+  // loads the real distilled table, so an item that never gets an embedding is the
+  // expected steady state, not starvation — the artifact/token retrievers still work
+  // fully via RRF fusion either way. Giving this its own flag keeps a permanently-needed
+  // index (artifacts/tokens) from ever being coupled to an optional one's completion.
+  `ALTER TABLE work_items ADD COLUMN IF NOT EXISTS embeddings_indexed_at TIMESTAMPTZ`,
+  // E6: which provider family answered a Tier A judgment, nullable since the merge/
+  // split/dismissal label sources this column also applies to (retroactively, if ever
+  // backfilled) don't carry one today. §9's own audit rule — "track judgment-vs-later-
+  // human-split agreement per provider; if a provider's judgments disagree with humans,
+  // down-weight them" — needs to group by this, so it has to live on the label row
+  // itself rather than be re-derived by joining through sources at query time (a
+  // judgment's source may itself be deleted or renamed long after the label is what
+  // matters).
+  `ALTER TABLE reconciliation_labels ADD COLUMN IF NOT EXISTS provider_family TEXT`,
   // Planning maturity, orthogonal to status. `status` says how far along the work is;
   // `maturity` says whether it is work at all yet or still something an agent said out
   // loud. Existing rows default to 'accepted' on purpose: they predate the distinction

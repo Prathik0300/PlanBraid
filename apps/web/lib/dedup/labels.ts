@@ -13,6 +13,13 @@
  *   - dismissing a Simplify duplicate/possible_duplicate/redundant_done finding is a
  *     negative label at lower confidence — "keep both" is a real signal, but weaker than
  *     an explicit split, since a dismissal can also mean "not worth my time right now".
+ *   - E6's Tier A judgment (RECONCILIATION_ARCHITECTURE.md §9) is the one source here
+ *     that isn't a person: a connected agent, with the repository open, answering a
+ *     precise question about a specific ambiguous pair. Weaker evidence than a human
+ *     action — the proposing agent has "a mild incentive to answer different so its task
+ *     gets created," §9's own words — which is exactly why `provider_family` exists on
+ *     this table: to audit judgment-sourced labels against later human ones per provider,
+ *     not to trust them at face value.
  */
 import type { PgD1, PgD1PreparedStatement } from "@/db/pg-d1";
 import { buildSignature } from "./signature.ts";
@@ -20,7 +27,7 @@ import { adjudicate, type Adjudication } from "./match.ts";
 
 export type LabelVerdict = "same" | "different";
 export type LabelConfidence = "high" | "medium" | "weak";
-export type LabelSource = "merge" | "split" | "dismissal";
+export type LabelSource = "merge" | "split" | "dismissal" | "judgment";
 
 function labelId() {
   return `lbl_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -55,8 +62,17 @@ export type CaptureLabelInput = {
   verdict: LabelVerdict;
   confidence: LabelConfidence;
   source: LabelSource;
-  adjudication: Adjudication;
+  /** Frozen into the label's `features` JSON at capture time. Typed structurally rather
+   * than as `Adjudication` specifically: every merge/split/dismissal caller already has a
+   * real `Adjudication` in hand and it satisfies this shape as-is, but E6's judgment
+   * labels (`source: "judgment"`) were never scored by the matcher at all — a plain
+   * object literal describing the judgment itself is the honest thing to freeze there,
+   * not a fabricated `Adjudication` pretending a structural method decided it. */
+  adjudication: { verdict: string; score: number; method: string; reason: string };
   justification?: string;
+  /** Which provider family answered, for `source: "judgment"` labels — §9's own audit
+   * needs this to group agreement rates by provider. Absent for the human-sourced kinds. */
+  providerFamily?: string;
 };
 
 /**
@@ -78,11 +94,11 @@ export function captureLabelStatement(db: PgD1, input: CaptureLabelInput): PgD1P
     reason: input.adjudication.reason,
   };
   return db.prepare(
-    "INSERT INTO reconciliation_labels (id, organization_id, project_id, pair_hash, left_item_id, right_item_id, verdict, confidence, label_source, features, justification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project_id, pair_hash, label_source) DO NOTHING",
+    "INSERT INTO reconciliation_labels (id, organization_id, project_id, pair_hash, left_item_id, right_item_id, verdict, confidence, label_source, features, justification, provider_family) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project_id, pair_hash, label_source) DO NOTHING",
   ).bind(
     labelId(), input.organizationId, input.projectId, pairHash(input.leftItemId, input.rightItemId),
     input.leftItemId, input.rightItemId, input.verdict, input.confidence, input.source,
-    JSON.stringify(features), input.justification?.slice(0, 1000) ?? null,
+    JSON.stringify(features), input.justification?.slice(0, 1000) ?? null, input.providerFamily ?? null,
   );
 }
 
@@ -139,7 +155,11 @@ function ratio(numerator: number, denominator: number) {
 export function evaluateReconciliation(
   labels: GoldenLabel[],
   itemsById: Map<string, { title: string; description?: string }>,
-  adjudicator: (left: { title: string; description?: string }, right: { title: string; description?: string }) => Adjudication,
+  // Structural, not `Adjudication` specifically: this function only ever reads
+  // `result.verdict` below, and callers scoring E3's Fellegi-Sunter path
+  // (`snapshotAdjudicationFs`, whose `FsAdjudication` carries `probability` rather than
+  // `score`) need to pass exactly this and nothing more.
+  adjudicator: (left: { title: string; description?: string }, right: { title: string; description?: string }) => { verdict: string },
 ): EvaluationReport {
   const usable = labels.filter((label) => itemsById.has(label.leftItemId) && itemsById.has(label.rightItemId));
   const bySourceCounts = new Map<LabelSource, { total: number; caught: number }>();
@@ -174,7 +194,7 @@ export function evaluateReconciliation(
   }
 
   const bySource = {} as EvaluationReport["bySource"];
-  for (const source of ["merge", "split", "dismissal"] as const) {
+  for (const source of ["merge", "split", "dismissal", "judgment"] as const) {
     const bucket = bySourceCounts.get(source) ?? { total: 0, caught: 0 };
     bySource[source] = { total: bucket.total, recall: ratio(bucket.caught, bucket.total) };
   }

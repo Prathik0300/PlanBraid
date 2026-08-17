@@ -20,6 +20,24 @@ import http from "node:http";
 
 const execFileAsync = promisify(execFile);
 const hookPath = fileURLToPath(new URL("../../../integrations/bridge/planbraid-hook.mjs", import.meta.url));
+const symbolsPath = fileURLToPath(new URL("../../../integrations/bridge/symbols.mjs", import.meta.url));
+
+// E7's tree-sitter dependencies are optional and gitignored (integrations/bridge's own
+// package.json — `npm install` there is a separate opt-in step, not part of this repo's
+// checkout). The one test below that asserts a *real* parsed symbol skips cleanly when
+// they aren't installed, the same "degrade, don't fail" contract symbols.mjs itself has.
+const symbolExtractionAvailable = await (async () => {
+  const { extractSymbols } = await import(symbolsPath);
+  const dir = await mkdtemp(join(tmpdir(), "planbraid-symbols-probe-"));
+  try {
+    await writeFile(join(dir, "probe.ts"), "export function probeFn() {}\n");
+    const symbols = await extractSymbols(dir, ["probe.ts"]);
+    return symbols.some((s) => s.name === "probeFn");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+})();
+const skipWithoutSymbols = symbolExtractionAvailable ? false : "integrations/bridge's optional tree-sitter dependencies aren't installed in this environment";
 
 async function initGitRepo() {
   const dir = await mkdtemp(join(tmpdir(), "planbraid-bridge-"));
@@ -158,6 +176,70 @@ test("M17: a modified (not deleted) file never appears in deleted_paths", async 
     assert.ok(reported);
     assert.ok(reported.params.arguments.changed_paths.includes("a.ts"));
     assert.deepEqual(reported.params.arguments.deleted_paths, []);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("E7: a changed .ts file with a real function is parsed and reported as a symbol", { skip: skipWithoutSymbols }, async () => {
+  const dir = await initGitRepo();
+  const { server, calls, url } = await startStubServer();
+  try {
+    await writeFile(join(dir, "widget.ts"), "export function computeWidgetTotal(a, b) {\n  return a + b;\n}\n");
+    await execFileAsync("git", ["add", "widget.ts"], { cwd: dir });
+
+    await runHook(
+      { hook_event_name: "Stop", session_id: "sess-7", last_assistant_message: "done" },
+      { PLANBRAID_MCP_URL: url, PLANBRAID_PROJECT_ID: "prj_test", PLANBRAID_PROVIDER: "claude", PLANBRAID_REPO_DIR: dir, PLANBRAID_STATE_DIR: dir },
+    );
+
+    const reported = calls.find((call) => call.params?.name === "report_repo_state");
+    assert.ok(reported);
+    const symbols = reported.params.arguments.symbols;
+    assert.ok(Array.isArray(symbols), "expected a real symbols array from the actual tree-sitter parse");
+    assert.ok(symbols.some((s) => s.name === "computeWidgetTotal" && s.kind === "function" && s.file === "widget.ts" && s.line === 1), `expected computeWidgetTotal among ${JSON.stringify(symbols)}`);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("E7: a changed file with no declarations reports no symbols field at all", async () => {
+  const dir = await initGitRepo();
+  const { server, calls, url } = await startStubServer();
+  try {
+    await writeFile(join(dir, "a.ts"), "export const a = 2;\n");
+
+    await runHook(
+      { hook_event_name: "Stop", session_id: "sess-8", last_assistant_message: "done" },
+      { PLANBRAID_MCP_URL: url, PLANBRAID_PROJECT_ID: "prj_test", PLANBRAID_PROVIDER: "claude", PLANBRAID_REPO_DIR: dir, PLANBRAID_STATE_DIR: dir },
+    );
+
+    const reported = calls.find((call) => call.params?.name === "report_repo_state");
+    assert.ok(reported);
+    assert.equal(reported.params.arguments.symbols, undefined, "an empty symbol set should not add a symbols field at all");
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("E7: PLANBRAID_DISABLE_SYMBOLS=1 skips symbol extraction even when a real function changed", async () => {
+  const dir = await initGitRepo();
+  const { server, calls, url } = await startStubServer();
+  try {
+    await writeFile(join(dir, "widget.ts"), "export function computeWidgetTotal(a, b) {\n  return a + b;\n}\n");
+    await execFileAsync("git", ["add", "widget.ts"], { cwd: dir });
+
+    await runHook(
+      { hook_event_name: "Stop", session_id: "sess-9", last_assistant_message: "done" },
+      { PLANBRAID_MCP_URL: url, PLANBRAID_PROJECT_ID: "prj_test", PLANBRAID_PROVIDER: "claude", PLANBRAID_REPO_DIR: dir, PLANBRAID_STATE_DIR: dir, PLANBRAID_DISABLE_SYMBOLS: "1" },
+    );
+
+    const reported = calls.find((call) => call.params?.name === "report_repo_state");
+    assert.ok(reported);
+    assert.equal(reported.params.arguments.symbols, undefined);
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });

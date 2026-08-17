@@ -6,6 +6,7 @@
  * prepare/bind/batch semantics a second time.
  */
 import { PGlite } from "@electric-sql/pglite";
+import { vector } from "@electric-sql/pglite/vector";
 import { PgD1 } from "../../db/pg-d1.ts";
 
 /** Adapts pglite's single embedded connection to the PgPoolClient shape PgD1 expects
@@ -43,7 +44,11 @@ let shared;
 /** Fresh database state with the production schema, bypassing ensureSchema's process-wide singleton guard. */
 export async function createTestDb() {
   const { SCHEMA_STATEMENTS, MIGRATION_STATEMENTS } = await import("../../db/setup.ts");
-  shared ??= new PGlite();
+  // E5's token_vectors/work_item_embeddings tables need `CREATE EXTENSION vector`, which
+  // PGlite (unlike a real Postgres) only understands once its bundled vector extension is
+  // loaded into the instance at construction time — a real pg.Pool needs no such step,
+  // since production Postgres (Neon) has pgvector available server-side already.
+  shared ??= new PGlite({ extensions: { vector } });
   // Dropping and recreating `public` is what makes this a *fresh* database rather than a
   // reused one: every table, sequence and index in it goes, so no test can see another's
   // rows or leftover identity counters.

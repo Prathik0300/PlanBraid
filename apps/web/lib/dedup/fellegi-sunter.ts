@@ -58,7 +58,15 @@ export const SEED_WEIGHTS: WeightTable = {
       high: { m: 0.65, u: 0.02 }, medium: { m: 0.2, u: 0.08 },
       low: { m: 0.1, u: 0.2 }, none: { m: 0.05, u: 0.7 },
     },
-    f4_symbolOverlap: { high: { m: 0.5, u: 0.03 }, low: { m: 0.2, u: 0.17 }, none: { m: 0.3, u: 0.8 } },
+    // E7: split from a single "high" bucket now that a shared symbol name can be
+    // confirmed against a real symbol table (repo_symbols) instead of only spelled the
+    // same. `high-resolved` carries the strongest weight in this whole table on purpose
+    // — §7 calls a resolved artifact "the highest-precision feature the scorer has" — a
+    // guessed match that happens to share a name is real but weaker evidence.
+    f4_symbolOverlap: {
+      "high-resolved": { m: 0.35, u: 0.01 }, "high-unresolved": { m: 0.3, u: 0.05 },
+      low: { m: 0.2, u: 0.17 }, none: { m: 0.15, u: 0.77 },
+    },
     f5_subsystem: {
       same: { m: 0.75, u: 0.15 }, adjacent: { m: 0.15, u: 0.35 }, different: { m: 0.1, u: 0.5 },
     },
@@ -225,6 +233,7 @@ export function snapshotAdjudicationFs(
   left: { title: string; description?: string },
   right: { title: string; description?: string },
   table: WeightTable = SEED_WEIGHTS,
+  context?: FeatureContext,
 ): FsAdjudication {
   const leftSignature = buildSignature(left.title, left.description ?? "");
   const rightSignature = buildSignature(right.title, right.description ?? "");
@@ -232,5 +241,6 @@ export function snapshotAdjudicationFs(
     { signature: leftSignature, fingerprintValue: leftSignature.normalized },
     { id: "candidate", itemKey: "", title: right.title, status: "", signature: rightSignature, fingerprintValue: rightSignature.normalized },
     table,
+    context,
   );
 }

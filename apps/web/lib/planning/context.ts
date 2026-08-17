@@ -4,18 +4,26 @@
  * question: what does the *next* agent need to know before it plans, so it improves on
  * what the project already knows instead of rediscovering it.
  *
- * Deliberately not a new retrieval engine. The full multi-signal reconciliation pipeline
- * (`RECONCILIATION_ARCHITECTURE.md`, E1–E7) doesn't exist yet; this reuses exactly the
- * signature and thresholds the shipped dedup matcher already trusts
- * (`lib/dedup/signature.ts`, `lib/dedup/match.ts`'s `THRESHOLDS.lexicalFloor`), so
- * "relevant to this objective" means the same thing here as it means when two proposals
- * are compared for being the same task. When the reconciliation engine's real retrieval
- * (blocking, RRF, embeddings) ships, this module is the natural place to swap the scoring
- * function without touching the bucketing or guidance logic below it.
+ * `relevance()`/`isRelevant()` below reuse the same signature and lexical floor the
+ * shipped matcher trusts (`lib/dedup/signature.ts`, `lib/dedup/match.ts`'s
+ * `THRESHOLDS.lexicalFloor`) but deliberately do NOT route through
+ * `lib/dedup/relate.ts`'s vetoed cascade (E8, RECONCILIATION_ARCHITECTURE.md §10) the way
+ * Simplify and `create_work_items` do. This was tested, not assumed: a real case in this
+ * project's own test suite — an objective and an existing item sharing one exact file
+ * artifact but using incompatible verbs ("update" vs. "investigate") — is exactly the
+ * kind of pair `checkVetoes`' action-compatibility gate exists to reject for duplicate
+ * detection, and correctly so there; but it is precisely the kind of background a person
+ * planning next work *should* see ("here's prior investigation into this file"), not
+ * something a merge-safety veto should silently hide. Planning context asks a broader
+ * question than duplicate detection, and needs a correspondingly more permissive answer.
+ * `relate()` is still reused, additively, for the one place a narrow, decisive signal
+ * *is* exactly right: flagging a `CONFLICT` relation among already-relevant planned work,
+ * below.
  */
 import type { DashboardState, Source, WorkItem } from "@/lib/contracts";
 import { buildSignature, jaccard, type TaskSignature } from "@/lib/dedup/signature.ts";
 import { THRESHOLDS } from "@/lib/dedup/match.ts";
+import { relate } from "@/lib/dedup/relate.ts";
 import { findBlockedChains } from "@/lib/simplify/analyze.ts";
 import { providerFamily } from "@/lib/providers.ts";
 import type { PgD1 } from "@/db/pg-d1";
@@ -130,7 +138,13 @@ export async function getPlanningContext(db: PgD1, organizationId: string, input
       // is left out rather than misfiled into either.
       continue;
     } else if (planned.length < MAX_PER_BUCKET) {
-      planned.push({ itemKey: item.itemKey, workItemId: item.id, title: item.title });
+      // E8: a narrow, additive use of the strict cascade — among work already judged
+      // broadly relevant above, is any of it in direct structural conflict (opposite
+      // intent, same concrete artifact) with the stated objective? This is exactly the
+      // decisive signal `relate()`'s vetoes exist to produce, unlike the broad relevance
+      // gate itself, which deliberately stays outside them (see the module comment).
+      const conflict = relate({ title: input.objective, signature: objectiveSignature }, { id: item.id, itemKey: item.itemKey, title: item.title, status: item.status });
+      planned.push({ itemKey: item.itemKey, workItemId: item.id, title: item.title, reason: conflict.relation === "CONFLICT" ? conflict.reason : undefined });
     }
   }
 
@@ -155,7 +169,7 @@ export async function getPlanningContext(db: PgD1, organizationId: string, input
   return {
     objective: input.objective,
     alreadyDone, inProgress, planned, blocked, rejected, openProposals, collisions,
-    guidance: buildGuidance({ alreadyDone, inProgress, blocked, rejected, openProposals, collisions }),
+    guidance: buildGuidance({ alreadyDone, inProgress, planned, blocked, rejected, openProposals, collisions }),
     consideredCount: ranked.length,
   };
 }
@@ -201,7 +215,7 @@ function corroboratingProviders(item: WorkItem, aliases: Aliases, sources: Sourc
  * has nothing to say is worse than one that stays quiet, because the agent reading it has
  * no way to tell a true "nothing found" from a template firing on empty data.
  */
-function buildGuidance(buckets: Pick<PlanningContext, "alreadyDone" | "inProgress" | "blocked" | "rejected" | "openProposals" | "collisions">): string[] {
+function buildGuidance(buckets: Pick<PlanningContext, "alreadyDone" | "inProgress" | "planned" | "blocked" | "rejected" | "openProposals" | "collisions">): string[] {
   const lines: string[] = [];
   if (buckets.alreadyDone.length) {
     lines.push(`Do not re-propose: ${buckets.alreadyDone.map((entry) => entry.itemKey).join(", ")} already covers this.`);
@@ -210,6 +224,13 @@ function buildGuidance(buckets: Pick<PlanningContext, "alreadyDone" | "inProgres
     lines.push(entry.heldBy
       ? `${entry.itemKey} is already in progress, held by ${entry.heldBy}. Coordinate before starting overlapping work.`
       : `${entry.itemKey} is already in progress. Coordinate before starting overlapping work.`);
+  }
+  // E8: `reason` on a planned item is populated only for a real CONFLICT relation (see
+  // where `planned` is built above) — every other planned item has no reason at all and
+  // produces no line here, matching every other bucket's "silence unless there is
+  // something true to say" rule.
+  for (const entry of buckets.planned) {
+    if (entry.reason) lines.push(`${entry.itemKey} conflicts with this: ${entry.reason}. Resolve the conflict before planning both.`);
   }
   for (const entry of buckets.collisions) {
     lines.push(`${entry.itemKey} shares ${entry.sharedArtifacts.join(", ")} with what you're about to do${entry.heldBy ? `, and ${entry.heldBy} is actively holding it` : ""}. Check before touching the same scope.`);

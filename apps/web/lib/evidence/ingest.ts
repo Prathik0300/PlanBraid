@@ -18,11 +18,13 @@
  */
 import { executeCommand, organizationFor, type Principal } from "@/lib/store.ts";
 import { text, nullable, number, parseJson, type Row } from "@/lib/read/rows.ts";
-import type { PgD1 } from "@/db/pg-d1";
+import type { PgD1, PgD1PreparedStatement } from "@/db/pg-d1";
 
 function id(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
 }
+
+export type RepoSymbolInput = { name: string; kind: string; file: string; line: number };
 
 export type RepoObservationInput = {
   projectId: string;
@@ -36,6 +38,11 @@ export type RepoObservationInput = {
   deletedPaths?: string[];
   verificationCommand?: string;
   verificationExitCode?: number;
+  /** E7 — the bridge's optional tree-sitter parse of the changed TS/JS files
+   * (integrations/bridge/symbols.mjs). Absent when the bridge's optional dependency isn't
+   * installed, disabled via PLANBRAID_DISABLE_SYMBOLS, or no changed file parsed to any
+   * declaration — all three are the same "nothing to report," not an error. */
+  symbols?: RepoSymbolInput[];
 };
 
 export type RepoObservationResult = {
@@ -82,6 +89,33 @@ export async function ingestRepoObservation(db: PgD1, principal: Principal, inpu
     const existing = await db.prepare("SELECT id FROM repo_observations WHERE project_id = ? AND head_sha = ?").bind(input.projectId, headSha).first<{ id: string }>();
     return { observationId: existing?.id ?? "", matchedItemIds: [], idempotentReplay: true };
   }
+
+  // E7: the symbol table is kept current regardless of whether this commit also produces
+  // evidence-matchable work-item touches below — a repository-grounding fact, not tied to
+  // any one work item. Deleted files' stale symbols are cleared even when the bridge sent
+  // no new symbols at all (a commit that only deletes files still needs its old symbols
+  // for those files removed).
+  const symbolStatements: PgD1PreparedStatement[] = [];
+  if (deletedPaths.length) {
+    symbolStatements.push(db.prepare("DELETE FROM repo_symbols WHERE project_id = ? AND file = ANY(?::text[])").bind(input.projectId, deletedPaths));
+  }
+  if (input.symbols?.length) {
+    const reportedFiles = [...new Set(input.symbols.map((symbol) => symbol.file.trim()).filter(Boolean))].slice(0, 200);
+    symbolStatements.push(db.prepare("DELETE FROM repo_symbols WHERE project_id = ? AND file = ANY(?::text[])").bind(input.projectId, reportedFiles));
+    const now = new Date().toISOString();
+    for (const symbol of input.symbols.slice(0, 2000)) {
+      const file = symbol.file.trim().slice(0, 500);
+      const name = symbol.name.trim().slice(0, 200);
+      if (!file || !name) continue;
+      symbolStatements.push(
+        db.prepare(
+          "INSERT INTO repo_symbols (organization_id, project_id, file, symbol, kind, line, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT (project_id, file, symbol) DO UPDATE SET kind = EXCLUDED.kind, line = EXCLUDED.line, updated_at = EXCLUDED.updated_at",
+        ).bind(organizationId, input.projectId, file, name, symbol.kind.trim().slice(0, 50) || "other", Math.max(1, Math.trunc(symbol.line) || 1), now),
+      );
+    }
+  }
+  if (symbolStatements.length) await db.batch(symbolStatements);
 
   // A deleted path is not positive evidence of anything — it is the opposite signal, and
   // M17's evidence_removed finding depends on being able to tell "confirmed present as of

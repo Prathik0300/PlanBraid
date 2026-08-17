@@ -80,10 +80,24 @@ test("features: f4 symbol overlap — missing when neither side names a symbol",
   assert.equal(computeFeatures(a, b).f4_symbolOverlap, null);
 });
 
-test("features: f4 symbol overlap — high when both sides name the same function", async () => {
+test("features: f4 symbol overlap — high-unresolved when both sides name the same function but no symbol table is supplied (E7)", async () => {
   const a = await proposalOf("Fix refreshAccessToken to handle expiry");
   const b = await candidateOf("Cover refreshAccessToken with a test");
-  assert.equal(computeFeatures(a, b).f4_symbolOverlap.level, "high");
+  assert.equal(computeFeatures(a, b).f4_symbolOverlap.level, "high-unresolved");
+});
+
+test("features: f4 symbol overlap — high-resolved when the shared name is confirmed against a real symbol table (E7)", async () => {
+  const a = await proposalOf("Fix refreshAccessToken to handle expiry");
+  const b = await candidateOf("Cover refreshAccessToken with a test");
+  const resolved = computeFeatures(a, b, { resolvedSymbols: new Set(["refreshaccesstoken"]) });
+  assert.equal(resolved.f4_symbolOverlap.level, "high-resolved");
+});
+
+test("features: f4 symbol overlap — an unrelated resolved-symbol set still reads as high-unresolved (the shared name itself isn't confirmed)", async () => {
+  const a = await proposalOf("Fix refreshAccessToken to handle expiry");
+  const b = await candidateOf("Cover refreshAccessToken with a test");
+  const resolved = computeFeatures(a, b, { resolvedSymbols: new Set(["someUnrelatedSymbol"]) });
+  assert.equal(resolved.f4_symbolOverlap.level, "high-unresolved");
 });
 
 test("features: f5 subsystem — unknown becomes a missing feature, not a level", async () => {

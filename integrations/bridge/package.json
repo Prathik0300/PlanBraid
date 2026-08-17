@@ -1,0 +1,9 @@
+{
+  "name": "planbraid-bridge-symbols",
+  "private": true,
+  "description": "Optional dependency install for the bridge's E7 symbol extraction (symbols.mjs). The bridge itself (planbraid-hook.mjs) has zero required dependencies and works with no npm install at all; run `npm install` in this directory only if you want repository symbol grounding (RECONCILIATION_ARCHITECTURE.md §7). Without it, symbols.mjs degrades to reporting no symbols, silently.",
+  "dependencies": {
+    "web-tree-sitter": "0.25.10",
+    "tree-sitter-wasms": "0.1.13"
+  }
+}

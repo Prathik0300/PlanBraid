@@ -64,15 +64,26 @@ function f3(left: TaskSignature, right: TaskSignature): FeatureObservation {
   return { level: bucket4(shared / Math.min(left.artifacts.length, right.artifacts.length)) };
 }
 
-/** Approximate: Jaccard over artifacts `classifyArtifact` already calls "symbol" —
- * unresolved names (`refreshAccessToken`), not resolved against a real symbol table.
- * Three levels, not four: an approximation this coarse doesn't earn a finer scale. */
-function f4(left: TaskSignature, right: TaskSignature): FeatureObservation {
+/**
+ * Jaccard over artifacts `classifyArtifact` already calls "symbol" — by default just
+ * unresolved names (`refreshAccessToken`), a guess from spelling alone. E7
+ * (RECONCILIATION_ARCHITECTURE.md §7, TS/JS only) grounds that guess: when `context`
+ * carries a real symbol table for this project (`repo_symbols`, populated by the
+ * bridge's optional tree-sitter parse), a high-overlap match where the shared name is
+ * *confirmed* against actual code splits into its own level from one that's merely
+ * spelled the same. This is the doc's own claim made concrete — "the highest-precision
+ * feature the scorer has" only once it's actually resolved, not before — so the two
+ * cases get different weights in `SEED_WEIGHTS` rather than being folded together.
+ */
+function f4(left: TaskSignature, right: TaskSignature, resolvedSymbols?: ReadonlySet<string>): FeatureObservation {
   const leftSymbols = left.artifacts.filter((artifact) => classifyArtifact(artifact) === "symbol");
   const rightSymbols = right.artifacts.filter((artifact) => classifyArtifact(artifact) === "symbol");
   if (!leftSymbols.length && !rightSymbols.length) return null;
   const score = jaccard(leftSymbols, rightSymbols);
-  return { level: score >= 0.5 ? "high" : score > 0 ? "low" : "none" };
+  if (score < 0.5) return { level: score > 0 ? "low" : "none" };
+  const shared = leftSymbols.filter((symbol) => rightSymbols.includes(symbol));
+  const resolved = resolvedSymbols != null && shared.some((symbol) => resolvedSymbols.has(symbol));
+  return { level: resolved ? "high-resolved" : "high-unresolved" };
 }
 
 function f5(left: TaskSignature, right: TaskSignature): FeatureObservation {
@@ -145,6 +156,11 @@ export type FeatureContext = {
   /** Fraction of evidence-attached files shared between the two items, 0..1 — needs M15's
    * repo_observations/evidence data, fetched by the caller. */
   implementationOverlap?: number;
+  /** E7 — every symbol name tree-sitter has actually confirmed exists in this project's
+   * code (`repo_symbols`), fetched by the caller. Absent or empty both leave f4 at
+   * `high-unresolved` rather than `high-resolved` — there is nothing to confirm against
+   * either way, so the two cases are handled identically on purpose, not distinguished. */
+  resolvedSymbols?: ReadonlySet<string>;
   candidateStatus?: string;
   candidateUpdatedAt?: string;
   now?: number;
@@ -168,7 +184,7 @@ export function computeFeatures(
     f1_fingerprint: f1(proposal.fingerprintValue, candidate.fingerprintValue),
     f2_artifactJaccard: f2(left, right),
     f3_artifactContainment: f3(left, right),
-    f4_symbolOverlap: f4(left, right),
+    f4_symbolOverlap: f4(left, right, context.resolvedSymbols),
     f5_subsystem: f5(left, right),
     f6_action: f6(left, right),
     f7_lexical: f7(left, right),
