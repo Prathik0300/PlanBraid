@@ -153,9 +153,13 @@ supersedes the losing side: every losing option's related item transitions to
 `cancelled`/`superseded` and gets a `supersedes` edge back to the decision, which is what
 makes it surface in M11's `rejected` bucket, with its reason, the next time an agent's
 `get_planning_context` objective resembles it. `get_project_brief` gained a
-`decisionsOpen` field; wiring the same into `get_planning_context` is deferred, matching
-the original scope note. The web UI got a "Decisions" tab mirroring the Proposals queue,
-listing each open decision's options with a one-click "Choose."
+`decisionsOpen` field at the time; wiring the same into `get_planning_context` was
+deferred then, and has since shipped — `decisionsOpen` is unconditional (not
+relevance-ranked against the objective, matching `get_project_brief`'s own field exactly),
+excludes `type='decision'` items from the ordinary relevance-ranked buckets so a decision
+never doubles up in `planned`/`inProgress`, and adds its own guidance line. The web UI got
+a "Decisions" tab mirroring the Proposals queue, listing each open decision's options with
+a one-click "Choose."
 
 One real bug caught before shipping: closing a decision item straight from its initial
 `proposed` status to `done` isn't a legal transition (`ALLOWED_TRANSITIONS` only permits a
@@ -750,6 +754,7 @@ New tools and changed contracts, all in `app/mcp/route.ts` over `lib/`.
 | `open_plan_revision` / `close_plan_revision` | **new, M20** | Mirrors `begin_interaction`/`sync_interaction`, which agents already follow. |
 | `get_project_brief` | **extended, M11** | Gains the decision queue and open leases. |
 | `report_repo_state` | **new, M15** | Bridge-facing: commit sha, branch, changed files, test outcomes. |
+| `cancel_work` | **new** | A real, previously-missing gap: `transition_item` could always move any item to `cancelled` (no authority restriction — cancelling isn't accepting), but no MCP tool ever exposed it; an agent had no way to reject its own proposal or mark something no-longer-needed at all. Open to either an agent or a person, the same reasoning `record_decision` already uses. Strongly urges a real `resolution` (`rejected`/`superseded`/`duplicate`/`abandoned`/`obsolete`) rather than the `unspecified` default, since only a recognized resolution reaches `get_planning_context`'s `rejected` bucket. |
 
 One rule for all of them, learned from `get_ready_work`: **the tool description is the
 product.** An agent picks between `list_work_items` and `get_ready_work` on prose alone.

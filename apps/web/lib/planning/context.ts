@@ -29,6 +29,7 @@ import { providerFamily } from "@/lib/providers.ts";
 import type { PgD1 } from "@/db/pg-d1";
 import { loadProjectView } from "@/lib/read/project-view.ts";
 import { checkCollisions } from "@/lib/planning/collision.ts";
+import { listOpenDecisions } from "@/lib/planning/decisions.ts";
 
 type Aliases = DashboardState["aliases"];
 type Sources = DashboardState["sources"];
@@ -73,6 +74,7 @@ export type PlanningContextInProgressItem = PlanningContextItem & { heldBy: stri
 export type PlanningContextRejectedItem = PlanningContextItem & { resolution: string; resolutionReason: string | null };
 export type PlanningContextProposalItem = PlanningContextItem & { proposedBy: string[]; timesProposed: number };
 export type PlanningContextCollision = PlanningContextItem & { heldBy: string | null; sharedArtifacts: string[] };
+export type PlanningContextDecision = { itemKey: string; workItemId: string; question: string };
 
 export type PlanningContext = {
   objective: string;
@@ -86,6 +88,14 @@ export type PlanningContext = {
    * symbol) with the objective, regardless of whether its title reads as related at all.
    * Distinct from `inProgress`, which is relevance-ranked by wording. */
   collisions: PlanningContextCollision[];
+  /** Every open decision in the project, unconditionally — not relevance-ranked against
+   * the objective, matching `get_project_brief`'s own `decisionsOpen` field exactly (same
+   * data, same shape) rather than a second, narrower notion of "relevant decision." This
+   * was in M11's own original response-shape example from the start; M19 wired it into
+   * `get_project_brief` but not here, deferred at the time rather than dropped. A decision
+   * is genuinely project-wide context — "is REST or GraphQL still contested" matters to
+   * planning even when the objective's wording has nothing to do with either. */
+  decisionsOpen: PlanningContextDecision[];
   /** Plain sentences generated from the buckets above — never a template that fires when
    * a bucket happens to be empty. The part of this response an agent that reads three
    * lines and moves on will actually see, so every line here has to be literally true. */
@@ -99,6 +109,13 @@ export async function getPlanningContext(db: PgD1, organizationId: string, input
 
   const ranked: Ranked[] = [];
   for (const item of view.workItems) {
+    // A decision is an ordinary work_item (type='decision', M19) so it would otherwise
+    // flow through this same relevance ranking and land in whatever status bucket its
+    // own status happens to be — normally 'in_progress' the moment it's raised — mixed in
+    // with regular work rather than called out as a decision. `decisionsOpen` below is
+    // its own, unconditional surface for exactly that reason; excluded here so it never
+    // shows up twice.
+    if (item.type === "decision") continue;
     const score = relevance(objectiveSignature, buildSignature(item.title, item.description));
     // Every open proposal is worth surfacing regardless of relevance score — a low-scoring
     // proposal is exactly the kind of thing a planning loop is made of (M21), and this
@@ -166,10 +183,20 @@ export async function getPlanningContext(db: PgD1, organizationId: string, input
     sharedArtifacts: match.sharedArtifacts,
   }));
 
+  // M11's original response-shape example included this from the start;
+  // `get_project_brief` got it when M19 shipped, this tool didn't. Unconditional, not
+  // capped to MAX_PER_BUCKET or relevance-ranked — a project realistically has very few
+  // decisions open at once (each one requires a person to act), so there is no dump to
+  // guard against the way the other buckets need one.
+  const openDecisions = await listOpenDecisions(db, organizationId, input.projectId);
+  const decisionsOpen: PlanningContextDecision[] = openDecisions.map((decision) => ({
+    itemKey: decision.itemKey, workItemId: decision.workItemId, question: decision.question,
+  }));
+
   return {
     objective: input.objective,
-    alreadyDone, inProgress, planned, blocked, rejected, openProposals, collisions,
-    guidance: buildGuidance({ alreadyDone, inProgress, planned, blocked, rejected, openProposals, collisions }),
+    alreadyDone, inProgress, planned, blocked, rejected, openProposals, collisions, decisionsOpen,
+    guidance: buildGuidance({ alreadyDone, inProgress, planned, blocked, rejected, openProposals, collisions, decisionsOpen }),
     consideredCount: ranked.length,
   };
 }
@@ -215,10 +242,13 @@ function corroboratingProviders(item: WorkItem, aliases: Aliases, sources: Sourc
  * has nothing to say is worse than one that stays quiet, because the agent reading it has
  * no way to tell a true "nothing found" from a template firing on empty data.
  */
-function buildGuidance(buckets: Pick<PlanningContext, "alreadyDone" | "inProgress" | "planned" | "blocked" | "rejected" | "openProposals" | "collisions">): string[] {
+function buildGuidance(buckets: Pick<PlanningContext, "alreadyDone" | "inProgress" | "planned" | "blocked" | "rejected" | "openProposals" | "collisions" | "decisionsOpen">): string[] {
   const lines: string[] = [];
   if (buckets.alreadyDone.length) {
     lines.push(`Do not re-propose: ${buckets.alreadyDone.map((entry) => entry.itemKey).join(", ")} already covers this.`);
+  }
+  for (const entry of buckets.decisionsOpen) {
+    lines.push(`${entry.itemKey} is an open decision — "${entry.question}" — still needs someone to choose. Check it before planning around either option.`);
   }
   for (const entry of buckets.inProgress) {
     lines.push(entry.heldBy

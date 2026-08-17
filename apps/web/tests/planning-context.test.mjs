@@ -14,6 +14,7 @@ import { createTestDb } from "./support/local-pg.mjs";
 import { principal, setupProject, createItem } from "./support/fixtures.mjs";
 import { executeCommand, organizationFor, registerSourceSession, updateSourceHeartbeat } from "@/lib/store.ts";
 import { getPlanningContext } from "@/lib/planning/context.ts";
+import { recordDecision } from "@/lib/planning/decisions.ts";
 
 // A browser principal creates items at 'accepted' maturity directly (lib/store.ts's own
 // isHumanPrincipal-gated default) — needed to land an item in the `planned` bucket rather
@@ -85,6 +86,49 @@ test("E8: a planned item that is merely related (no conflict) carries no reason 
   assert.equal(result.planned.length, 1);
   assert.equal(result.planned[0].reason, undefined);
   assert.ok(!result.guidance.some((line) => line.includes("conflict")));
+});
+
+test("decisionsOpen: an open decision surfaces unconditionally, with a guidance line, and never doubles up in another bucket", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  const optionA = await createItem(db, projectId, "REST for the public API", "opt-a");
+  const optionB = await createItem(db, projectId, "GraphQL for the public API", "opt-b");
+  const decision = await recordDecision(db, principal, {
+    projectId, question: "REST or GraphQL for the public API?",
+    options: [{ label: "REST", relatedWorkItemId: optionA }, { label: "GraphQL", relatedWorkItemId: optionB }],
+    idempotencyKey: "pc-decision-1",
+  });
+
+  // An objective completely unrelated to the decision's wording — proving this bucket is
+  // genuinely unconditional, not relevance-filtered like every other bucket here.
+  const result = await context(db, projectId, "improve onboarding copy");
+  assert.equal(result.decisionsOpen.length, 1);
+  assert.equal(result.decisionsOpen[0].itemKey, decision.itemKey);
+  assert.equal(result.decisionsOpen[0].question, "REST or GraphQL for the public API?");
+  assert.ok(result.guidance.some((line) => line.includes(decision.itemKey) && line.includes("open decision")));
+
+  // The decision work item itself must not also appear in planned/inProgress/etc.
+  const allItemIds = [...result.alreadyDone, ...result.inProgress, ...result.planned, ...result.blocked, ...result.rejected, ...result.openProposals].map((entry) => entry.workItemId);
+  assert.ok(!allItemIds.includes(decision.workItemId), "a decision must not double up in a status bucket");
+});
+
+test("decisionsOpen: a resolved decision does not surface, and no guidance line is generated", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  const optionA = await createItem(db, projectId, "REST for the public API", "opt-c");
+  const optionB = await createItem(db, projectId, "GraphQL for the public API", "opt-d");
+  const decision = await recordDecision(db, principal, {
+    projectId, question: "REST or GraphQL, take two?",
+    options: [{ label: "REST", relatedWorkItemId: optionA }, { label: "GraphQL", relatedWorkItemId: optionB }],
+    idempotencyKey: "pc-decision-2",
+  });
+  const browserPrincipal = { ...principal, authentication: "browser" };
+  const { resolveDecision } = await import("@/lib/planning/decisions.ts");
+  await resolveDecision(db, browserPrincipal, { projectId, decisionWorkItemId: decision.workItemId, winningOptionId: decision.options[0].id });
+
+  const result = await context(db, projectId, "improve onboarding copy");
+  assert.equal(result.decisionsOpen.length, 0);
+  assert.ok(!result.guidance.some((line) => line.includes("open decision")));
 });
 
 test("in-progress work names who is holding it, when a live lease exists", async () => {
