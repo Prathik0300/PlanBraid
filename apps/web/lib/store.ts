@@ -1111,12 +1111,46 @@ export async function requestImport(db: PgD1, principal: Principal, input: { pro
   }
 }
 
+/**
+ * A compact "here is what already exists" briefing, structural rather than prose, handed
+ * back the moment an agent registers — before it has had any chance to propose something
+ * that duplicates or contradicts a plan already in progress. Deliberately not the full
+ * `get_planning_context`/`get_handoff_package` payload: those need either a stated
+ * objective or are expensive enough to ask for explicitly, while this has to be cheap
+ * enough to compute on every single registration, including reconnects.
+ *
+ * `null` for a genuinely empty project — an agent has nothing to read yet, and a caller
+ * checking `existingWork` for truthiness is simpler than a caller checking an empty array
+ * plus a zero count.
+ */
+async function existingWorkSummary(db: PgD1, organizationId: string, projectId: string) {
+  const [totalRow, recentRows] = await Promise.all([
+    db.prepare("SELECT COUNT(*)::int AS count FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL AND status NOT IN ('done', 'cancelled')").bind(projectId, organizationId).first<{ count: number }>(),
+    db.prepare("SELECT item_key, title, status, maturity FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL AND status NOT IN ('done', 'cancelled') ORDER BY updated_at DESC LIMIT 8").bind(projectId, organizationId).all<{ item_key: string; title: string; status: string; maturity: string }>(),
+  ]);
+  const openItemCount = Number(totalRow?.count ?? 0);
+  if (!openItemCount) return null;
+  return {
+    openItemCount,
+    recent: recentRows.results.map((row) => ({ itemKey: row.item_key, title: row.title, status: row.status, maturity: row.maturity })),
+    note: "This project already has open work — read it before proposing anything. Call get_planning_context with your objective (or get_handoff_package for a full cold-start briefing) before create_work_items, so you build on this plan instead of duplicating or contradicting it.",
+  };
+}
+
 export async function registerSourceSession(db: PgD1, principal: Principal, input: { projectId: string; provider: string; externalId: string; title?: string; model?: string; codingSpaceId?: string; assurance?: string; accountLabel?: string }) {
   const organizationId = await organizationFor(db, principal);
   await ownedProject(db, organizationId, input.projectId);
   const provider = input.provider.trim().slice(0, 80);
   const requestedExternalId = input.externalId.trim().slice(0, 240);
   if (!provider || !requestedExternalId) throw domainError("VALIDATION_FAILED", "Provider and external session ID are required");
+  // "By default, an agent should read the existing plan before amending it" — the whole
+  // point of the product — cannot rely on the agent choosing to call get_planning_context
+  // first, since that is only a prose instruction. Registration is the one call every
+  // agent makes before doing anything else, so this is where a project's existing state
+  // gets handed over structurally, not just described in the server's own instructions
+  // string. `null` when the project is genuinely empty: nothing to read yet, and no
+  // client-side branching needed to tell "empty" apart from "field omitted."
+  const existingWork = await existingWorkSummary(db, organizationId, input.projectId);
   // Precedence: the credential (and any ?agent= marker) the request authenticated with
   // outranks anything the model declares, since only the former is something the owner
   // configured. An agent-declared label is the last resort, for connections that carry
@@ -1135,13 +1169,13 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
       externalId = `${requestedExternalId}::${accountId}`.slice(0, 240);
     } else {
       await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountId, accountLabel, existing.id).run();
-      return { sourceId: existing.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, existing.id) };
+      return { sourceId: existing.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, existing.id), existingWork };
     }
   }
   const forked = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
   if (forked) {
     await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountLabel, forked.id).run();
-    return { sourceId: forked.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, forked.id) };
+    return { sourceId: forked.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, forked.id), existingWork };
   }
   const sourceId = id("src");
   // Two concurrent register_agent_session calls for the same (project, provider,
@@ -1151,9 +1185,9 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
   // re-select on conflict rather than assume this insert is the row that landed.
   const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance, agent_account_id, agent_account_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
     .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed", accountId, accountLabel).first<{ id: string }>();
-  if (inserted) return { sourceId: inserted.id, idempotentReplay: false, pendingImportRequest: await pendingImportForSource(db, input.projectId, inserted.id) };
+  if (inserted) return { sourceId: inserted.id, idempotentReplay: false, pendingImportRequest: await pendingImportForSource(db, input.projectId, inserted.id), existingWork };
   const winner = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
-  return { sourceId: winner!.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, winner!.id) };
+  return { sourceId: winner!.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, winner!.id), existingWork };
 }
 
 /**

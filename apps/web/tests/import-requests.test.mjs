@@ -12,7 +12,7 @@ import test from "node:test";
 
 import { createWorkItemsDeduplicated, organizationFor, registerSourceSession, requestImport } from "@/lib/store.ts";
 import { createTestDb } from "./support/local-pg.mjs";
-import { principal, setupProject } from "./support/fixtures.mjs";
+import { principal, setupProject, createItem } from "./support/fixtures.mjs";
 
 const otherPrincipal = { userId: "u_intruder", email: "intruder@planbraid.local", displayName: "Someone Else" };
 
@@ -46,6 +46,49 @@ test("registerSourceSession surfaces a pending request for that exact source, an
 
   const claudeAgain = await registerSourceSession(db, principal, { projectId, provider: "claude", externalId: "conv-2" });
   assert.equal(claudeAgain.pendingImportRequest, null);
+});
+
+test("registerSourceSession: a genuinely empty project reports existingWork as null, not an empty summary", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  const result = await registerSourceSession(db, principal, { projectId, provider: "codex", externalId: "conv-empty" });
+  assert.equal(result.existingWork, null);
+});
+
+test("registerSourceSession: a project with open work hands back a compact summary — the 'read the plan first' mechanism", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  await createItem(db, projectId, "Add rate limiting to the login endpoint", "pre-existing-1");
+  await createItem(db, projectId, "Fix the flaky CI job", "pre-existing-2");
+
+  const result = await registerSourceSession(db, principal, { projectId, provider: "codex", externalId: "conv-1" });
+  assert.equal(result.existingWork.openItemCount, 2);
+  assert.equal(result.existingWork.recent.length, 2);
+  assert.ok(result.existingWork.recent.some((entry) => entry.title === "Add rate limiting to the login endpoint"));
+  assert.match(result.existingWork.note, /read/i);
+});
+
+test("registerSourceSession: existingWork excludes done/cancelled work and only counts what's still open", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  const doneId = await createItem(db, projectId, "Already finished this one", "pre-existing-done");
+  await createItem(db, projectId, "Still open", "pre-existing-open");
+  await db.prepare("UPDATE work_items SET status = 'done' WHERE id = ?").bind(doneId).run();
+
+  const result = await registerSourceSession(db, principal, { projectId, provider: "codex", externalId: "conv-2" });
+  assert.equal(result.existingWork.openItemCount, 1);
+  assert.ok(!result.existingWork.recent.some((entry) => entry.title === "Already finished this one"));
+});
+
+test("registerSourceSession: existingWork is present again on a reconnect (idempotent replay), not only on first registration", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  await createItem(db, projectId, "Pre-existing work", "pre-existing-3");
+  await registerSourceSession(db, principal, { projectId, provider: "codex", externalId: "conv-3" });
+
+  const reconnect = await registerSourceSession(db, principal, { projectId, provider: "codex", externalId: "conv-3" });
+  assert.equal(reconnect.idempotentReplay, true);
+  assert.equal(reconnect.existingWork.openItemCount, 1);
 });
 
 test("create_work_items naming the request completes it with the reported count", async () => {

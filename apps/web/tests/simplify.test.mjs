@@ -99,6 +99,40 @@ test("a blocked item names every hop it is waiting on", () => {
   assert.equal(chain.proposedCommand, undefined);
 });
 
+test("analyzeProject groups blocked items by root blocker instead of reporting one line per blocked item", () => {
+  const root = item({ title: "Run the migration" });
+  const a = item({ title: "Deploy the service", blockingCount: 1 });
+  const b = item({ title: "Announce the release", blockingCount: 1 });
+  const c = item({ title: "Update the docs site", blockingCount: 1 });
+  const findings = analyzeProject({
+    items: [root, a, b, c],
+    dependencies: [edge(root.id, a.id), edge(root.id, b.id), edge(root.id, c.id)],
+  });
+
+  const blockedFindings = findings.filter((finding) => finding.kind === "blocked_chain");
+  assert.equal(blockedFindings.length, 1, "three items blocked by the same root must be one finding, not three");
+  assert.equal(blockedFindings[0].workItemId, root.id);
+  assert.match(blockedFindings[0].reason, /blocking 3 other items/);
+  for (const blocked of [a, b, c]) assert.match(blockedFindings[0].detail, new RegExp(blocked.itemKey));
+});
+
+test("analyzeProject: separate blocked chains with different roots stay separate findings, ranked by how much each blocks", () => {
+  const rootA = item({ title: "Provision the database" });
+  const blockedByA1 = item({ title: "Run migrations", blockingCount: 1 });
+  const blockedByA2 = item({ title: "Seed test data", blockingCount: 1 });
+  const rootB = item({ title: "Set up CI" });
+  const blockedByB1 = item({ title: "Add the release workflow", blockingCount: 1 });
+  const findings = analyzeProject({
+    items: [rootA, blockedByA1, blockedByA2, rootB, blockedByB1],
+    dependencies: [edge(rootA.id, blockedByA1.id), edge(rootA.id, blockedByA2.id), edge(rootB.id, blockedByB1.id)],
+  });
+
+  const blockedFindings = findings.filter((finding) => finding.kind === "blocked_chain");
+  assert.equal(blockedFindings.length, 2);
+  assert.equal(blockedFindings[0].workItemId, rootA.id, "the root blocking more items should be listed first");
+  assert.equal(blockedFindings[1].workItemId, rootB.id);
+});
+
 test("a stale blocking_count with no surviving edge reports nothing", () => {
   // Guards against the panel inventing a chain for an item whose blocker was resolved
   // or merged away, which would read as a bug in the board.

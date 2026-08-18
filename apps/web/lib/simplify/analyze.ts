@@ -256,6 +256,45 @@ export function findBlockedChains(items: WorkItem[], dependencies: Dependencies)
 }
 
 /**
+ * The structural pass's own listing of blocked work — grouped by root blocker, not
+ * reported once per blocked item the way `findBlockedChains` itself is. Five items all
+ * waiting on the same missing prerequisite is one thing to fix, not five lines with
+ * nothing to click; M23's "blocking_release" saved view (lib/planning/views.ts) already
+ * groups this same way for the same reason, and this is that idea applied to Simplify's
+ * own review pass instead of being confined to one saved view.
+ *
+ * `findBlockedChains` itself is left untouched and still per-item on purpose:
+ * `get_planning_context`, `explain_work_item`, and `get_handoff_package` all need to
+ * answer "why is *this specific* item blocked," which only the per-item shape can do —
+ * grouping is the right call for a review pass surfacing what to fix, wrong for those.
+ */
+function summarizeBlockedChains(items: WorkItem[], dependencies: Dependencies): Finding[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const byRoot = new Map<string, string[]>();
+  for (const chain of findBlockedChains(items, dependencies)) {
+    const rootId = chain.relatedWorkItemId ?? chain.workItemId;
+    byRoot.set(rootId, [...(byRoot.get(rootId) ?? []), chain.workItemId]);
+  }
+  return [...byRoot.entries()]
+    .map(([rootId, blockedIds]) => {
+      const root = byId.get(rootId);
+      if (!root) return null;
+      const blockedKeys = blockedIds.map((id) => byId.get(id)?.itemKey).filter((key): key is string => Boolean(key));
+      return { rootId, root, blockedKeys };
+    })
+    .filter((entry): entry is { rootId: string; root: WorkItem; blockedKeys: string[] } => entry != null)
+    .sort((a, b) => b.blockedKeys.length - a.blockedKeys.length)
+    .map(({ rootId, root, blockedKeys }) => ({
+      kind: "blocked_chain" as const,
+      dedupeKey: `blocked_chain:${rootId}`,
+      workItemId: rootId,
+      verdict: "informational" as const,
+      reason: `${root.itemKey} is blocking ${blockedKeys.length} other item${blockedKeys.length === 1 ? "" : "s"} from proceeding`,
+      detail: `${listOf(blockedKeys)} ${blockedKeys.length === 1 ? "is" : "are"} waiting on it. Start here: nothing downstream can move until it does.`,
+    }));
+}
+
+/**
  * Ordering cycles among stored edges. add_dependency refuses to create one, but edges
  * predating that check, or created either side of a merge, can still form one - and a
  * cycle means every item in it is permanently blocked with no root to start from.
@@ -447,7 +486,7 @@ export function analyzeProject(input: { items: WorkItem[]; dependencies: Depende
     ...findDuplicates(items),
     ...findRedundantAgainstDone(items),
     ...findCycles(items, input.dependencies),
-    ...findBlockedChains(items, input.dependencies),
+    ...summarizeBlockedChains(items, input.dependencies),
     ...findAnomalies(items),
     ...findStale(items, now),
     ...findPossiblyImplemented(items, input.evidence ?? []),
