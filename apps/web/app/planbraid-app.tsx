@@ -425,7 +425,7 @@ export function PlanbraidApp() {
           {project && view === "decisions" && <Decisions decisions={decisions} loading={decisionsLoading} items={projectItems} resolvingOptionId={resolvingDecision} onResolve={resolveDecisionChoice} onItem={setSelectedItemId} />}
           {project && view === "list" && <ListView items={filteredItems} sources={sources} aliases={data?.aliases ?? []} onItem={setSelectedItemId} />}
           {project && view === "inbox" && <Inbox notifications={data!.notifications.filter((entry) => entry.projectId === projectId)} onOpen={(notification) => { if (notification.workItemId) setSelectedItemId(notification.workItemId); void command({ action: "mark_notification", notificationId: notification.id, read: true, idempotencyKey: requestId("read") }, "Notification marked read"); }} onResolve={(notification) => void command({ action: "mark_notification", notificationId: notification.id, read: true, resolved: true, idempotencyKey: requestId("resolve") }, "Action resolved")} />}
-          {project && view === "agents" && <Agents sources={sources} items={projectItems} claims={data?.claims ?? []} />}
+          {project && view === "agents" && <Agents sources={sources} items={projectItems} claims={data?.claims ?? []} onSetup={() => setSetupOpen(true)} />}
         </div>
         {project && view !== "inbox" && view !== "agents" && view !== "proposals" && <Composer project={project} sources={sources} busy={mutating} onCreate={(title, source) => void command({ action: "create_item", projectId, title, sourceId: source || undefined, status: "proposed", idempotencyKey: requestId("create") }, "Task added to the unified plan")} />}
       </section>
@@ -554,7 +554,7 @@ function AgentsManageDialog({ project, sources, busy, command, close, onOpenAcco
         {sources.length ? sources.map((source) => <div className="agent-manage-row" key={source.id}>
           {renamingId === source.id
             ? <form className="connection-rename" onSubmit={(event) => { event.preventDefault(); void saveRename(source); }}><input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} maxLength={120} aria-label={`Rename ${source.title}`} /><button type="submit">Save</button><button type="button" onClick={() => setRenamingId(null)}>Cancel</button></form>
-            : <><span><ProviderIcon provider={source.provider} /> <strong>{sourceName(source, ambiguousFamilies)}</strong><small>{source.title} · {source.accessBlocked ? "Blocked from this project" : `Last seen ${relative(source.lastSeenAt)}`}</small></span>
+            : <><ProviderIcon provider={source.provider} /><span><strong>{sourceName(source, ambiguousFamilies)}</strong><small>{source.title} · {source.accessBlocked ? "Blocked from this project" : `Last seen ${relative(source.lastSeenAt)}`}</small></span>
               <button onClick={() => startRename(source)}>Rename</button>
               <button
                 disabled={busy || !source.credentialId}
@@ -1022,11 +1022,18 @@ function Inbox({ notifications, onOpen, onResolve }: { notifications: Notificati
 /** M14: "who holds what, and for how long" - read from live work_claims leases (F1), not
  * from sourceId (who originally proposed an item). A session can hold work someone else
  * created, and conflating the two would show the wrong agent as the active holder. */
-function Agents({ sources, items, claims }: { sources: Source[]; items: WorkItem[]; claims: DashboardState["claims"] }) {
+function Agents({ sources, items, claims, onSetup }: { sources: Source[]; items: WorkItem[]; claims: DashboardState["claims"]; onSetup: () => void }) {
   const agentAmbiguousFamilies = ambiguousFamiliesOf(sources);
   return <div className="agents-view"><div className="inbox-heading"><span><h2>Connected agents</h2><p>Sessions, coding spaces, capture assurance, and current work.</p></span></div><div className="agent-grid">{sources.map((source) => {
     const held = claims.filter((claim) => claim.sourceId === source.id).map((claim) => ({ claim, item: items.find((entry) => entry.id === claim.workItemId) })).filter((entry): entry is { claim: DashboardState["claims"][number]; item: WorkItem } => entry.item != null);
-    return <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{sourceName(source, agentAmbiguousFamilies)}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{held.length ? held.map(({ claim, item }) => <span key={claim.id}><b>{item.itemKey}</b> {item.title} <small>holds for {expiresIn(claim.leaseExpiresAt)}</small></span>) : <span className="muted">Holding nothing right now</span>}</div></article>;
+    return <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{sourceName(source, agentAmbiguousFamilies)}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{held.length ? held.map(({ claim, item }) => <span key={claim.id}><b>{item.itemKey}</b> {item.title} <small>holds for {expiresIn(claim.leaseExpiresAt)}</small></span>) : <span className="muted">Holding nothing right now</span>}</div>
+      {/* Planbraid cannot itself re-open a dropped MCP connection: there is no
+          server-to-client channel, only the agent's own next request. This button is
+          honest about that, and takes you to the same connection instructions
+          "Connect agent" already shows, to paste back into this specific agent, rather
+          than silently marking the card active while nothing has actually reconnected. */}
+      {source.status !== "active" && <button className="agent-reconnect" onClick={onSetup}>Reconnect {sourceName(source, agentAmbiguousFamilies)}</button>}
+    </article>;
   })}</div></div>;
 }
 
