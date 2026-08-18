@@ -167,7 +167,7 @@ export async function loadWorkItemDetail(db: PgD1, organizationId: string, workI
 
 /** Every project the caller owns. `resolve_project` needs the list and nothing else. */
 export async function listProjects(db: PgD1, organizationId: string): Promise<Project[]> {
-  const rows = await db.prepare("SELECT * FROM projects WHERE organization_id = ? ORDER BY updated_at DESC").bind(organizationId).all<Row>();
+  const rows = await db.prepare("SELECT * FROM projects WHERE organization_id = ? AND status <> 'archived' ORDER BY updated_at DESC").bind(organizationId).all<Row>();
   return rows.results.map(mapProject);
 }
 

@@ -68,6 +68,21 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .project-row { width: 100%; border: 0; background: transparent; min-height: 58px; padding: 7px; margin: 1px 0; border-radius: 8px; display: flex; align-items: flex-start; gap: 9px; text-align: left; }
 .project-row:hover, .project-row.selected { background: var(--hover); }.project-row.selected { box-shadow: inset 2px 0 var(--blue); }
 .chevron { color: var(--faint); width: 10px; font-size: 15px; }
+.project-row-wrap { display: flex; align-items: center; border-radius: 8px; margin: 1px 0; }
+.project-row-wrap:hover, .project-row-wrap.selected { background: var(--hover); }
+.project-row-wrap.selected { box-shadow: inset 2px 0 var(--blue); }
+.project-row-wrap .project-row { flex: 1; min-width: 0; width: auto; margin: 0; }
+.project-rename { align-items: center; }
+.project-rename input { flex: 1; min-width: 0; height: 30px; border: 1px solid var(--line); background: var(--panel-3); color: var(--text); border-radius: 5px; padding: 0 8px; font-size: 13px; outline: 0; }
+.project-rename input:focus { border-color: #536b9d; }
+.project-menu-wrap { position: relative; flex: 0 0 auto; padding-right: 5px; }
+.project-menu-button { width: 24px; height: 24px; border-radius: 6px; border: 0; background: transparent; color: var(--faint); font-size: 14px; line-height: 1; display: grid; place-items: center; }
+.project-menu-button:hover, .project-menu-button[aria-expanded="true"] { background: var(--panel-3); color: var(--text); }
+.project-menu { position: absolute; z-index: 40; top: calc(100% + 4px); right: 0; min-width: 190px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 16px 44px #0009; padding: 6px; display: flex; flex-direction: column; gap: 2px; animation: pop-in .12s ease-out; }
+.project-menu button { width: 100%; min-height: 34px; border: 0; border-radius: 7px; background: transparent; padding: 5px 9px; text-align: left; color: var(--text); font-size: 12px; }
+.project-menu button:hover { background: var(--hover); }
+.project-menu-danger { color: var(--red); }
+.project-menu-danger:hover { background: #29191c; }
 .project-glyph { flex: 0 0 auto; width: 25px; height: 25px; border-radius: 6px; background: #252a33; border: 1px solid #353b46; display: inline-grid; place-items: center; font-size: 12px; font-weight: 700; color: #c7cbd3; }
 .project-glyph.large { width: 32px; height: 32px; border-radius: 8px; font-size: 13px; }
 .project-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
@@ -547,6 +562,20 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .handoff-dialog > header p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .handoff-text { flex: 1; min-height: 320px; margin: 14px 18px; padding: 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text); font: 12px var(--font-geist-mono); line-height: 1.5; resize: vertical; }
 .handoff-footer { padding: 12px 18px; border-top: 1px solid var(--line); background: var(--panel-2); display: flex; justify-content: flex-end; }
+.agents-manage-dialog { position: relative; z-index: 31; margin: auto; width: min(560px, 94vw); max-height: 80vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 24px 70px #0009; overflow: hidden; }
+.agents-manage-dialog > header { display: flex; align-items: start; gap: 10px; padding: 18px 18px 14px; border-bottom: 1px solid var(--line); }
+.agents-manage-dialog > header > div { flex: 1; }
+.agents-manage-dialog h2 { margin: 4px 0 6px; font-size: 18px; }
+.agents-manage-dialog > header p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.agents-manage-list { padding: 4px 18px; overflow-y: auto; }
+.agents-manage-list .oauth-help { padding: 14px 0; }
+.agents-manage-dialog > p.oauth-help { padding: 10px 18px 18px; margin: 0; border-top: 1px solid var(--line-soft); }
+.agent-manage-row { min-height: 43px; display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line-soft); }
+.agent-manage-row > span { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.agent-manage-row strong { font-size: 12px; }
+.agent-manage-row small { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-manage-row button { border: 1px solid var(--line); background: var(--panel-3); color: var(--text); border-radius: 5px; min-height: 25px; padding: 0 7px; font-size: 12px; }
+.link-button { display: inline; border: 0; background: transparent; padding: 0; color: var(--blue); text-decoration: underline; font: inherit; cursor: pointer; }
 .health-button { height: 30px; padding: 0 12px; border-radius: 7px; font-size: 12px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); white-space: nowrap; }
 .health-dialog { position: relative; z-index: 31; margin: auto; width: min(680px, 94vw); max-height: 86vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 24px 70px #0009; overflow: hidden; }
 .health-dialog > header { display: flex; align-items: start; gap: 10px; padding: 18px 18px 14px; border-bottom: 1px solid var(--line); }

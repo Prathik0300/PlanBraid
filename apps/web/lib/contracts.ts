@@ -77,6 +77,14 @@ export type Source = {
    * sessions registered before agent accounts existed. */
   agentAccountId: string | null;
   agentAccountLabel: string | null;
+  /** The same id the Setup dialog's connection list shows and revokes (mcp_tokens.id or
+   * the oauth token family id) — the real access-control boundary for set_project_access.
+   * Null for sessions registered before this column existed; those can't be blocked until
+   * they reconnect. */
+  credentialId: string | null;
+  /** Whether set_project_access has blocked credentialId from this project. Always false
+   * when credentialId is null. */
+  accessBlocked: boolean;
 };
 
 export type WorkItem = {
@@ -174,6 +182,18 @@ export type DashboardState = {
 export type Command =
   | { action: "create_project"; name: string; directory?: string; description?: string; gitRemote?: string; idempotencyKey: string }
   | { action: "update_project"; projectId: string; name?: string; description?: string; directory?: string; gitRemote?: string; gateProposals?: boolean; idempotencyKey: string }
+  /** Soft-delete: sets status to 'archived' rather than removing rows. Every project-scoped
+   * table (work_items, sources, decisions, evidence, ...) has no ON DELETE CASCADE, so a
+   * hard delete would need to touch two dozen tables correctly or leave orphans; archiving
+   * is what findMatchingProject and listProjects already treat as gone. */
+  | { action: "delete_project"; projectId: string; idempotencyKey: string }
+  /** Renames how a source displays for this project. Cosmetic only — see
+   * set_project_access for the real per-project access boundary. */
+  | { action: "update_source"; projectId: string; sourceId: string; title: string; idempotencyKey: string }
+  /** The real access boundary update_source can't provide: blocks (or unblocks) the
+   * credential behind a source from this one project, enforced server-side on every MCP
+   * call, and unaffected by that credential reconnecting under a new session or marker. */
+  | { action: "set_project_access"; projectId: string; credentialId: string; blocked: boolean; idempotencyKey: string }
   | { action: "create_item"; projectId: string; title: string; description?: string; status?: WorkStatus; maturity?: Maturity; priority?: WorkItem["priority"]; sourceId?: string; contentFingerprint?: string; type?: string; idempotencyKey: string }
   | { action: "update_item"; projectId: string; itemId: string; expectedVersion: number; title?: string; description?: string; priority?: WorkItem["priority"]; assignee?: string | null; sourceId?: string; idempotencyKey: string }
   | { action: "transition_item"; projectId: string; itemId: string; expectedVersion: number; status: WorkStatus; reason?: string; resolution?: Resolution; resolutionReason?: string; deferredUntil?: string | null; sourceId?: string; idempotencyKey: string }

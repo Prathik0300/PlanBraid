@@ -27,7 +27,7 @@ export function mapProject(row: Row): Project {
 }
 
 export function mapSource(row: Row): Source {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), codingSpaceId: nullable(row, "coding_space_id"), provider: text(row, "provider") as Source["provider"], externalId: text(row, "external_id"), title: text(row, "title"), model: nullable(row, "model"), status: text(row, "status"), assurance: text(row, "assurance") as Source["assurance"], currentTaskIds: parseJson(text(row, "current_task_ids"), []), lastSeenAt: text(row, "last_seen_at"), agentAccountId: nullable(row, "agent_account_id"), agentAccountLabel: nullable(row, "agent_account_label") };
+  return { id: text(row, "id"), projectId: text(row, "project_id"), codingSpaceId: nullable(row, "coding_space_id"), provider: text(row, "provider") as Source["provider"], externalId: text(row, "external_id"), title: text(row, "title"), model: nullable(row, "model"), status: text(row, "status"), assurance: text(row, "assurance") as Source["assurance"], currentTaskIds: parseJson(text(row, "current_task_ids"), []), lastSeenAt: text(row, "last_seen_at"), agentAccountId: nullable(row, "agent_account_id"), agentAccountLabel: nullable(row, "agent_account_label"), credentialId: nullable(row, "credential_id"), accessBlocked: Boolean(row.access_blocked) };
 }
 
 export function mapItem(row: Row): WorkItem {

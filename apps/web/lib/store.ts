@@ -186,7 +186,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
   const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows, claimRows] = await db.batch([
     db.prepare("SELECT * FROM projects WHERE organization_id = ? ORDER BY updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM coding_spaces WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
-    db.prepare("SELECT * FROM sources WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
+    db.prepare("SELECT sources.*, (pab.credential_id IS NOT NULL) AS access_blocked FROM sources LEFT JOIN project_access_blocks pab ON pab.project_id = sources.project_id AND pab.credential_id = sources.credential_id WHERE sources.organization_id = ? ORDER BY sources.last_seen_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM work_items WHERE organization_id = ? AND archived_at IS NULL ORDER BY updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM work_events WHERE organization_id = ? ORDER BY created_at DESC, project_revision DESC LIMIT 250").bind(organizationId),
     db.prepare("SELECT * FROM notifications WHERE organization_id = ? AND recipient_user_id = ? ORDER BY created_at DESC LIMIT 100").bind(organizationId, principal.userId),
@@ -219,6 +219,18 @@ async function ownedProject(db: PgD1, organizationId: string, projectId: string)
   const project = await db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ?").bind(projectId, organizationId).first<Row>();
   if (!project) throw domainError("NOT_FOUND", "Project not found", 404);
   return project;
+}
+
+/**
+ * The actual enforcement point for set_project_access: called from the MCP route before
+ * dispatching any tool call that names a project, for every principal that authenticated
+ * with a real credential (browser/local principals have no credentialId and are never
+ * blockable — a block is something the project owner does to an agent, not to themself).
+ */
+export async function assertProjectAccess(db: PgD1, projectId: string, principal: Principal) {
+  if (!principal.credentialId) return;
+  const blocked = await db.prepare("SELECT 1 FROM project_access_blocks WHERE project_id = ? AND credential_id = ?").bind(projectId, principal.credentialId).first();
+  if (blocked) throw domainError("PROJECT_ACCESS_BLOCKED", "This connection's access to this project has been revoked", 403);
 }
 
 /**
@@ -395,6 +407,47 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
         .bind(cleanName ?? null, command.description?.trim().slice(0, 2000) ?? null, directory ?? null, gitRemote ?? null, settings, nextRevision, now, command.projectId, organizationId, currentRevision),
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'project.updated', ?, ?)")
         .bind(id("evt"), organizationId, command.projectId, nextRevision, principal.displayName, `${principal.displayName} updated ${changed}`, now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    return response;
+  }
+
+  if (command.action === "delete_project") {
+    const response = { projectId: command.projectId, projectRevision: nextRevision };
+    await commitMutation(db, [
+      db.prepare("UPDATE projects SET status = 'archived', revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?")
+        .bind(nextRevision, now, command.projectId, organizationId, currentRevision),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'project.archived', ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, nextRevision, principal.displayName, `${principal.displayName} deleted ${text(project, "name")}`, now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    return response;
+  }
+
+  if (command.action === "update_source") {
+    const cleanTitle = command.title?.trim().slice(0, 120);
+    if (!cleanTitle) throw domainError("VALIDATION_FAILED", "Agent name cannot be empty");
+    const response = { sourceId: command.sourceId };
+    await commitMutation(db, [
+      db.prepare("UPDATE sources SET title = ?, updated_at = ? WHERE id = ? AND project_id = ? AND organization_id = ?")
+        .bind(cleanTitle, now, command.sourceId, command.projectId, organizationId),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'source.updated', ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, currentRevision, principal.displayName, `${principal.displayName} renamed an agent connection`, now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    return response;
+  }
+
+  if (command.action === "set_project_access") {
+    const response = { projectId: command.projectId, credentialId: command.credentialId, blocked: command.blocked };
+    await commitMutation(db, [
+      command.blocked
+        ? db.prepare("INSERT INTO project_access_blocks (project_id, credential_id, organization_id, blocked_by) VALUES (?, ?, ?, ?) ON CONFLICT (project_id, credential_id) DO NOTHING")
+          .bind(command.projectId, command.credentialId, organizationId, principal.displayName)
+        : db.prepare("DELETE FROM project_access_blocks WHERE project_id = ? AND credential_id = ? AND organization_id = ?")
+          .bind(command.projectId, command.credentialId, organizationId),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'source.access_changed', ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, currentRevision, principal.displayName, `${principal.displayName} ${command.blocked ? "blocked" : "unblocked"} an agent connection for this project`, now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
     return response;
@@ -1168,13 +1221,13 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
     if (accountId && existing.agent_account_id && existing.agent_account_id !== accountId) {
       externalId = `${requestedExternalId}::${accountId}`.slice(0, 240);
     } else {
-      await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountId, accountLabel, existing.id).run();
+      await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label), credential_id = COALESCE(?, credential_id) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountId, accountLabel, principal.credentialId ?? null, existing.id).run();
       return { sourceId: existing.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, existing.id), existingWork };
     }
   }
   const forked = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
   if (forked) {
-    await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_label = COALESCE(?, agent_account_label) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountLabel, forked.id).run();
+    await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_label = COALESCE(?, agent_account_label), credential_id = COALESCE(?, credential_id) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountLabel, principal.credentialId ?? null, forked.id).run();
     return { sourceId: forked.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, forked.id), existingWork };
   }
   const sourceId = id("src");
@@ -1183,8 +1236,8 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
   // them in true parallel, unlike D1 which serialized every query). The losing insert
   // hits sources' UNIQUE(project_id, provider, external_id), not the id primary key, so
   // re-select on conflict rather than assume this insert is the row that landed.
-  const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance, agent_account_id, agent_account_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
-    .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed", accountId, accountLabel).first<{ id: string }>();
+  const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance, agent_account_id, agent_account_label, credential_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
+    .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed", accountId, accountLabel, principal.credentialId ?? null).first<{ id: string }>();
   if (inserted) return { sourceId: inserted.id, idempotentReplay: false, pendingImportRequest: await pendingImportForSource(db, input.projectId, inserted.id), existingWork };
   const winner = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
   return { sourceId: winner!.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, winner!.id), existingWork };

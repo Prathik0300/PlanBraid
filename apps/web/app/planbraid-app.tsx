@@ -404,7 +404,7 @@ export function PlanbraidApp() {
 
   return (
     <main className={`app-shell ${sidebarOpen ? "sidebar-open" : ""}`}>
-      <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} />
+      <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} command={command} busy={mutating} onOpenAccountSetup={() => setSetupOpen(true)} />
       <section className="workspace" aria-label="Unified project workspace">
         <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} proposalCount={proposals.length} decisionCount={decisions?.length ?? 0} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
         {project && view !== "inbox" && view !== "agents" && view !== "proposals" && view !== "decisions" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} onHandoff={() => void runHandoff()} handoffLoading={handoffLoading} onHealth={() => void runHealth()} healthLoading={healthLoading} onViews={() => setViewsOpen(true)} project={project} sources={sources} importRequests={data?.importRequests ?? []} onSetup={() => setSetupOpen(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
@@ -457,8 +457,20 @@ export function PlanbraidApp() {
 function LoadingShell() { return <div className="loading-screen"><div className="brand-mark graphic" aria-hidden="true" /><div><strong>Planbraid</strong><span>Braiding your project work…</span></div></div>; }
 function ErrorState({ message, retry }: { message: string; retry: () => void }) { return <div className="error-screen"><div className="brand-mark graphic" aria-hidden="true" /><h1>Couldn’t open Planbraid</h1><p>{message}</p><button onClick={retry}>Try again</button></div>; }
 
-function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSelect, onSource, open, toggle, onNew, onProfile }: { data: DashboardState; avatarUrl: string | null; selected: string; selectedSource: string | null; sources: Source[]; onSelect: (id: string) => void; onSource: (id: string | null) => void; open: boolean; toggle: () => void; onNew: () => void; onProfile: () => void }) {
+function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSelect, onSource, open, toggle, onNew, onProfile, command, busy, onOpenAccountSetup }: { data: DashboardState; avatarUrl: string | null; selected: string; selectedSource: string | null; sources: Source[]; onSelect: (id: string) => void; onSource: (id: string | null) => void; open: boolean; toggle: () => void; onNew: () => void; onProfile: () => void; command: (command: Command, success: string | ((result: CommandResult) => string)) => Promise<CommandResult>; busy: boolean; onOpenAccountSetup: () => void }) {
   const railAmbiguousFamilies = ambiguousFamiliesOf(sources);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [managingProject, setManagingProject] = useState<Project | null>(null);
+
+  function startRename(project: Project) { setRenamingId(project.id); setRenameDraft(project.name); }
+  async function saveRename(project: Project) {
+    const name = renameDraft.trim();
+    setRenamingId(null);
+    if (!name || name === project.name) return;
+    await command({ action: "update_project", projectId: project.id, name, idempotencyKey: requestId("rename-project") }, `Renamed to "${name}"`);
+  }
+
   return <aside className={`project-rail ${open ? "open" : "collapsed"}`} aria-label="Projects and agent conversations">
     <div className="rail-brand">
       <span className="planbraid-logo" aria-hidden="true" />
@@ -471,13 +483,87 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
     <div className="project-list">{data.projects.map((project) => {
       const taskCount = data.workItems.filter((item) => item.projectId === project.id).length;
       const activeCount = data.sources.filter((source) => source.projectId === project.id && source.status === "active").length;
-      return <button key={project.id} className={`project-row ${selected === project.id ? "selected" : ""}`} onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1)}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>;
+      if (renamingId === project.id) {
+        return <form key={project.id} className="project-row project-rename" onSubmit={(event) => { event.preventDefault(); void saveRename(project); }}>
+          <span className="project-glyph">{project.name.slice(0, 1)}</span>
+          <input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} onBlur={() => void saveRename(project)} onKeyDown={(event) => { if (event.key === "Escape") setRenamingId(null); }} maxLength={120} aria-label={`Rename ${project.name}`} />
+        </form>;
+      }
+      return <div key={project.id} className={`project-row-wrap ${selected === project.id ? "selected" : ""}`}>
+        <button className="project-row" onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1)}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>
+        <ProjectMenu project={project} busy={busy} onRename={() => startRename(project)} onManageAgents={() => setManagingProject(project)} onDelete={() => void command({ action: "delete_project", projectId: project.id, idempotencyKey: requestId("delete-project") }, `Deleted "${project.name}"`)} />
+      </div>;
     })}</div>
     <div className="rail-divider" />
     <div className="rail-label">Chats & agents</div>
     <div className="agent-list"><button className={`source-row all-sources ${selectedSource === null ? "active" : ""}`} onClick={() => onSource(null)}><span className="all-agent-icon">◎</span><span><strong>All activity</strong><small>Every connected conversation</small></span></button>{sources.map((source) => <button key={source.id} className={`source-row ${selectedSource === source.id ? "active" : ""}`} onClick={() => onSource(source.id)}><ProviderIcon provider={source.provider} /><span><strong>{sourceName(source, railAmbiguousFamilies)}</strong><small>{source.title}</small></span><span className={`presence ${source.status}`} title={source.status} /></button>)}</div>
     <button className="rail-footer" onClick={onProfile}><span className="avatar">{avatarUrl ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(avatarUrl)})` }} aria-hidden="true" /> : data.viewer.name.slice(0, 1).toUpperCase()}</span><span><strong>{data.viewer.name}</strong><small>Account &amp; profile</small></span><b aria-hidden="true">›</b></button></>}
+    {managingProject && <AgentsManageDialog project={managingProject} sources={data.sources.filter((source) => source.projectId === managingProject.id)} busy={busy} command={command} close={() => setManagingProject(null)} onOpenAccountSetup={() => { setManagingProject(null); onOpenAccountSetup(); }} />}
   </aside>;
+}
+
+function ProjectMenu({ project, busy, onRename, onManageAgents, onDelete }: { project: Project; busy: boolean; onRename: () => void; onManageAgents: () => void; onDelete: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!open) { setConfirmingDelete(false); return; }
+    const onPointerDown = (event: MouseEvent) => {
+      if (menuRef.current?.contains(event.target as Node) || triggerRef.current?.contains(event.target as Node)) return;
+      setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onPointerDown); window.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  return <div className="project-menu-wrap">
+    <button ref={triggerRef} type="button" className="project-menu-button" onClick={(event) => { event.stopPropagation(); setOpen((value) => !value); }} aria-haspopup="menu" aria-expanded={open} aria-label={`More actions for ${project.name}`} title="More actions">⋯</button>
+    {open && <div ref={menuRef} className="project-menu" role="menu">
+      <button role="menuitem" onClick={() => { setOpen(false); onRename(); }}>Rename</button>
+      <button role="menuitem" onClick={() => { setOpen(false); onManageAgents(); }}>Manage connected agents</button>
+      {confirmingDelete
+        ? <button role="menuitem" className="project-menu-danger" disabled={busy} onClick={() => { setOpen(false); onDelete(); }}>Confirm delete?</button>
+        : <button role="menuitem" className="project-menu-danger" onClick={() => setConfirmingDelete(true)}>Delete project</button>}
+    </div>}
+  </div>;
+}
+
+function AgentsManageDialog({ project, sources, busy, command, close, onOpenAccountSetup }: { project: Project; sources: Source[]; busy: boolean; command: (command: Command, success: string | ((result: CommandResult) => string)) => Promise<CommandResult>; close: () => void; onOpenAccountSetup: () => void }) {
+  const ambiguousFamilies = ambiguousFamiliesOf(sources);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+
+  function startRename(source: Source) { setRenamingId(source.id); setRenameDraft(source.title); }
+  async function saveRename(source: Source) {
+    const title = renameDraft.trim();
+    setRenamingId(null);
+    if (!title || title === source.title) return;
+    await command({ action: "update_source", projectId: project.id, sourceId: source.id, title, idempotencyKey: requestId("rename-source") }, "Agent connection renamed");
+  }
+
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
+    <section className="agents-manage-dialog" role="dialog" aria-modal="true" aria-labelledby="agents-manage-title">
+      <header><div><span className="eyebrow">AGENTS</span><h2 id="agents-manage-title">Connected agents for {project.name}</h2><p>Rename how an agent shows up here, or block it from this project specifically.</p></div><button className="icon-button" onClick={close} aria-label="Close">×</button></header>
+      <div className="agents-manage-list">
+        {sources.length ? sources.map((source) => <div className="agent-manage-row" key={source.id}>
+          {renamingId === source.id
+            ? <form className="connection-rename" onSubmit={(event) => { event.preventDefault(); void saveRename(source); }}><input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} maxLength={120} aria-label={`Rename ${source.title}`} /><button type="submit">Save</button><button type="button" onClick={() => setRenamingId(null)}>Cancel</button></form>
+            : <><span><ProviderIcon provider={source.provider} /> <strong>{sourceName(source, ambiguousFamilies)}</strong><small>{source.title} · {source.accessBlocked ? "Blocked from this project" : `Last seen ${relative(source.lastSeenAt)}`}</small></span>
+              <button onClick={() => startRename(source)}>Rename</button>
+              <button
+                disabled={busy || !source.credentialId}
+                title={source.credentialId ? undefined : "This session connected before blocking existed here; it needs to reconnect once before it can be blocked"}
+                onClick={() => void command({ action: "set_project_access", projectId: project.id, credentialId: source.credentialId!, blocked: !source.accessBlocked, idempotencyKey: requestId("project-access") }, source.accessBlocked ? "Agent unblocked from this project" : "Agent blocked from this project")}
+              >{source.accessBlocked ? "Unblock" : "Block from this project"}</button></>}
+        </div>) : <p className="oauth-help">No agents have connected to this project yet.</p>}
+      </div>
+      <p className="oauth-help">Blocking is enforced on every call this connection makes for this project, and survives it reconnecting, though it can still use the same token or OAuth connection for your other projects. To cut off a connection everywhere, revoke it entirely in <button className="link-button" onClick={onOpenAccountSetup}>Setup → Connected apps</button>.</p>
+    </section>
+  </div>;
 }
 
 function Header({ project, itemCount, sources, unread, proposalCount, decisionCount, view, setView, query, setQuery, theme, toggleTheme, onSetup, viewer, avatarUrl, onProfile }: { project: Project | null; itemCount: number; sources: Source[]; unread: number; proposalCount: number; decisionCount: number; view: View; setView: (view: View) => void; query: string; setQuery: (query: string) => void; theme: Theme; toggleTheme: () => void; onSetup: () => void; viewer: DashboardState["viewer"]; avatarUrl: string | null; onProfile: () => void }) {
@@ -1109,9 +1195,8 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  function copy(key: string, text: string, message: string) {
+  function copy(key: string, text: string) {
     void navigator.clipboard.writeText(text);
-    toast(message);
     setCopiedKey(key);
     if (copyTimer.current) clearTimeout(copyTimer.current);
     copyTimer.current = setTimeout(() => setCopiedKey(null), 5000);
@@ -1236,8 +1321,8 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       {mode === "oauth" ? <section className="oauth-setup-card connection-panel" role="tabpanel">
         <header><span><span className="oauth-lock">✓</span><strong>Automatic OAuth access</strong></span></header>
         <ol><li>Open your client&apos;s <strong>MCP servers</strong> or <strong>Connectors</strong> settings.</li><li>Add a remote HTTP server and paste the Planbraid URL below.</li><li>Your client opens Planbraid in a browser. Sign in and approve read/write access.</li></ol>
-        <div className="endpoint-box"><small>Remote MCP server URL</small><code>{endpoint}</code><button onClick={() => copy("endpoint", endpoint, "MCP URL copied")}>{copiedKey === "endpoint" ? "Copied" : "Copy URL"}</button></div>
-        {markerField}<div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("oauthConfig", oauthConfig, "OAuth MCP config copied")}>{copiedKey === "oauthConfig" ? "Copied" : "Copy config"}</button></span><pre>{oauthConfig}</pre></div>
+        <div className="endpoint-box"><small>Remote MCP server URL</small><code>{endpoint}</code><button onClick={() => copy("endpoint", endpoint)}>{copiedKey === "endpoint" ? "Copied" : "Copy URL"}</button></div>
+        {markerField}<div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("oauthConfig", oauthConfig)}>{copiedKey === "oauthConfig" ? "Copied" : "Copy config"}</button></span><pre>{oauthConfig}</pre></div>
         <p className="oauth-help">Planbraid uses standard MCP and OAuth discovery. The connected client identifies its own provider, session, and optional model when it begins reporting work.</p>
         <div className="connection-list"><h3>Connected apps <span>{oauthConnections.length}</span></h3>{oauthConnections.length ? oauthConnections.map((entry) => <div className="connection-row" key={entry.id}>{renamingId === entry.id
           ? <form className="connection-rename" onSubmit={(event) => { event.preventDefault(); void renameOAuth(entry.id, renameDraft); }}><input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} maxLength={60} aria-label={`Rename ${entry.name}`} /><button type="submit">Save</button><button type="button" onClick={() => setRenamingId(null)}>Cancel</button></form>
@@ -1245,7 +1330,7 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       </section> : <section className="token-setup-card connection-panel" role="tabpanel">
         <header><span><span className="token-key">⌁</span><strong>Bearer token access</strong></span></header>
         <p>For clients without OAuth, create a personal token and send it in the <code>Authorization</code> header. The secret is shown only once.</p>
-        {token ? <><div className="token-box"><small>New token - copy it now</small><code>{token}</code><button onClick={() => copy("token", token, "Token copied")}>{copiedKey === "token" ? "Copied" : "Copy"}</button></div><div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("tokenConfig", tokenConfig, "Token MCP config copied")}>{copiedKey === "tokenConfig" ? "Copied" : "Copy config"}</button></span><pre>{tokenConfig}</pre></div></> : <><label className="agent-marker"><span>Name this connection <span className="label-optional">optional</span></span><input value={tokenName} onChange={(event) => setTokenName(event.target.value)} placeholder={`${project?.name ?? "Project"} coding agents`} maxLength={60} /><small>This name is what Planbraid shows against everything the connection records.</small></label>{markerField}<button className="primary-wide" onClick={() => void generate()} disabled={busy}>{busy ? "Generating…" : `Generate access token for ${project?.name ?? "Planbraid"}`}</button></>}
+        {token ? <><div className="token-box"><small>New token - copy it now</small><code>{token}</code><button onClick={() => copy("token", token)}>{copiedKey === "token" ? "Copied" : "Copy"}</button></div><div className="config-box"><span><small>Common MCP JSON configuration</small><button onClick={() => copy("tokenConfig", tokenConfig)}>{copiedKey === "tokenConfig" ? "Copied" : "Copy config"}</button></span><pre>{tokenConfig}</pre></div></> : <><label className="agent-marker"><span>Name this connection <span className="label-optional">optional</span></span><input value={tokenName} onChange={(event) => setTokenName(event.target.value)} placeholder={`${project?.name ?? "Project"} coding agents`} maxLength={60} /><small>This name is what Planbraid shows against everything the connection records.</small></label>{markerField}<button className="primary-wide" onClick={() => void generate()} disabled={busy}>{busy ? "Generating…" : `Generate access token for ${project?.name ?? "Planbraid"}`}</button></>}
         <div className="connection-list"><h3>Active token connections <span>{connections.length}</span></h3>{connections.length ? connections.map((entry) => <div className="connection-row" key={entry.id}><span><strong>{entry.name}</strong><small>{entry.lastUsedAt ? `Last used ${relative(entry.lastUsedAt)}` : "Not used yet"} · {entry.scopes.join(", ")}</small></span><button onClick={() => void revoke(entry.id)} disabled={revokingId === entry.id}>{revokingId === entry.id ? "Revoking…" : "Revoke"}</button></div>) : <p className="oauth-help">No active bearer-token connections.</p>}</div>
       </section>}
       <div className="access-note"><strong>Network access required</strong><span>The MCP URL must be reachable by the agent without a hosting-level sign-in wall. Planbraid still protects every project request with OAuth or a bearer token.</span></div>

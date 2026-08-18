@@ -310,6 +310,23 @@ export const MIGRATION_STATEMENTS = [
   // INSERT or UPDATE anywhere in the codebase's history ever set this column — it is NULL
   // for every row that exists, in every deployment, so nothing is lost.
   `ALTER TABLE work_items DROP COLUMN IF EXISTS parent_id`,
+  // The credential (mcp_tokens.id or the oauth token family id — the same id
+  // principalFromBearer already derives agentAccountId from, and the same id the Setup
+  // dialog's connection list renames/revokes) that registered this source. Enforcing
+  // project access has to bind to this, not to agent_account_id: the ?agent= marker
+  // folded into agent_account_id is caller-supplied text with nothing behind it, so a
+  // block keyed on the marker alone is bypassable just by connecting again under a
+  // different marker with the same underlying credential. Nullable: sessions registered
+  // before this column existed have no recorded credential and can't be blocked until
+  // they reconnect.
+  `ALTER TABLE sources ADD COLUMN IF NOT EXISTS credential_id TEXT`,
+  `CREATE INDEX IF NOT EXISTS idx_sources_credential ON sources(credential_id)`,
+  // A real per-project access boundary, separate from sources.status. sources.status is
+  // just bookkeeping an agent's own heartbeat overwrites on every register_agent_session
+  // call; this table is what apps/web/app/mcp/route.ts actually checks before letting a
+  // credential touch a project, so it survives that agent simply reconnecting.
+  `CREATE TABLE IF NOT EXISTS project_access_blocks (project_id TEXT NOT NULL, credential_id TEXT NOT NULL, organization_id TEXT NOT NULL, blocked_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (project_id, credential_id))`,
+  `CREATE INDEX IF NOT EXISTS idx_project_access_blocks_credential ON project_access_blocks(credential_id)`,
 ] as const;
 
 let initialized = false;

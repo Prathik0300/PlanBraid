@@ -2,7 +2,7 @@ import { waitUntil } from "@vercel/functions";
 import type { PgD1 } from "@/db/pg-d1";
 import { ensureSchema } from "@/db/setup";
 import type { Resolution, WorkStatus } from "@/lib/contracts";
-import { createWorkItemsDeduplicated, executeCommand, findMatchingProject, getReadyWork, organizationFor, principalFromBearer, recordInteraction, registerSourceSession, startWork, updateSourceHeartbeat, type Principal } from "@/lib/store";
+import { assertProjectAccess, createWorkItemsDeduplicated, executeCommand, findMatchingProject, getReadyWork, organizationFor, principalFromBearer, recordInteraction, registerSourceSession, startWork, updateSourceHeartbeat, type Principal } from "@/lib/store";
 import { itemKeysFor, listProjects, listWorkItems, loadProjectView, loadWorkItemDetail, searchWorkItems, type ProjectView } from "@/lib/read/project-view.ts";
 import { reportSimplificationFinding } from "@/lib/simplify/runs.ts";
 import type { FindingKind } from "@/lib/simplify/analyze.ts";
@@ -126,6 +126,9 @@ async function handleMcp(request: Request, env: Env) {
     if (rpc.method === "tools/call") {
       const name = String(rpc.params?.name ?? "");
       const args = (rpc.params?.arguments ?? {}) as Json;
+      // Covers every tool here except get_work_item, which takes only a work_item_id;
+      // that one checks after loading the item, inside callTool itself.
+      if (typeof args.project_id === "string") await assertProjectAccess(env.DB, args.project_id, principal);
       const result = await callTool(env.DB, principal, name, args);
       if (typeof result.notificationId === "string") {
         waitUntil(dispatchNotification(env.DB, result.notificationId, env));
@@ -142,14 +145,23 @@ async function handleMcp(request: Request, env: Env) {
 async function callTool(db: PgD1, principal: Principal, name: string, args: Json): Promise<Json> {
   if (name === "resolve_project") {
     const organizationId = await organizationFor(db, principal);
-    const projects = await listProjects(db, organizationId);
+    // A block only stops a credential from acting on a project through the other tools;
+    // without also filtering it out of discovery, a blocked agent could still learn the
+    // project exists (its name, directory) by matching on directory/git_remote/query
+    // instead of passing project_id directly, which is the one path the generic
+    // pre-dispatch check in route.ts's handleMcp actually covers.
+    const blockedIds = principal.credentialId
+      ? new Set((await db.prepare("SELECT project_id FROM project_access_blocks WHERE credential_id = ? AND organization_id = ?").bind(principal.credentialId, organizationId).all<{ project_id: string }>()).results.map((row) => row.project_id))
+      : null;
+    const projects = (await listProjects(db, organizationId)).filter((project) => !blockedIds?.has(project.id));
     const explicit = args.project_id ? projects.find((project) => project.id === args.project_id) : null;
     if (explicit) return { project: explicit, confidence: "exact" };
 
     // Identity first: a remote or working directory pins one project exactly, and a
     // bare query string can miss it (".git" suffixes, name casing) and mislead an agent
     // into creating a duplicate.
-    const strong = await findMatchingProject(db, organizationId, { directory: optional(args, "directory"), gitRemote: optional(args, "git_remote") });
+    const strongMatch = await findMatchingProject(db, organizationId, { directory: optional(args, "directory"), gitRemote: optional(args, "git_remote") });
+    const strong = strongMatch && !blockedIds?.has(strongMatch.id) ? strongMatch : null;
     if (strong) {
       const project = projects.find((entry) => entry.id === strong.id);
       if (project) return { project, confidence: "exact", matchedOn: strong.matchedOn };
@@ -183,7 +195,12 @@ async function callTool(db: PgD1, principal: Principal, name: string, args: Json
   }
   if (name === "get_work_item") {
     const organizationId = await organizationFor(db, principal);
-    return loadWorkItemDetail(db, organizationId, required(args, "work_item_id"));
+    const detail = await loadWorkItemDetail(db, organizationId, required(args, "work_item_id"));
+    // The only tool that identifies its target by work_item_id rather than project_id, so
+    // it can't go through route.ts's generic pre-dispatch check; done here instead, after
+    // the project is known.
+    await assertProjectAccess(db, detail.workItem.projectId, principal);
+    return detail;
   }
   if (name === "create_work_items") {
     const items = Array.isArray(args.items) ? args.items as Json[] : [];
