@@ -125,13 +125,15 @@ test("ships the product UI, service worker, and manifest", async () => {
 });
 
 test("keeps primary navigation clear and every visible button actionable", async () => {
-  const [app, css, store, setup, oauth, mcp, contracts] = await Promise.all([
+  const [app, css, store, setup, oauth, mcp, mcpTools, mcpServer, contracts] = await Promise.all([
     readFile(new URL("../app/planbraid-app.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../lib/store.ts", import.meta.url), "utf8"),
     readFile(new URL("../db/setup.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/oauth.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/mcp/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/mcp/tools.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/mcp/server.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/contracts.ts", import.meta.url), "utf8"),
   ]);
   const sidebar = app.slice(app.indexOf("function ProjectRail"), app.indexOf("function Header"));
@@ -235,16 +237,16 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(store, /revokeMcpToken/);
   assert.match(store, /const itemKey = `#\$\{sequence\}`/);
   assert.doesNotMatch(store, /const baseKey|Math\.random\(\).*project|`\$\{baseKey\}/);
-  assert.doesNotMatch(mcp, /project\.key/);
-  assert.match(mcp, /any MCP client, agent, or personal-model session/);
+  assert.doesNotMatch(mcpTools, /project\.key/);
+  assert.match(mcpTools, /any MCP client, agent, or personal-model session/);
   // The empty-state UI tells people to "create the project from your MCP client", so the
   // MCP surface has to actually expose project creation — it silently didn't at first,
   // leaving a connected agent able to see the account but unable to make a project.
-  assert.match(mcp, /name: "create_project"/);
-  assert.match(mcp, /action: "create_project"/);
+  assert.match(mcpTools, /name: "create_project"/);
+  assert.match(mcpServer, /action: "create_project"/);
   assert.match(app, /create the project from your MCP client/);
   // Agents bind their own absolute path, since a browser can never report one.
-  assert.match(mcp, /name: "update_project"/);
+  assert.match(mcpTools, /name: "update_project"/);
   // The create-project dialog silently did nothing when the name was empty, because the
   // name lived in the unlabeled header search box and submit was `name.trim() && ...`.
   // Keep it a real form with a labeled field and a visible error.
@@ -253,7 +255,7 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(projectForm, /<label>Project name/);
   assert.match(projectForm, /className="field-error"/);
   assert.doesNotMatch(projectForm, /Directory or repository/);
-  assert.match(mcp, /Free-form client, agent, or provider name/);
+  assert.match(mcpTools, /Free-form client, agent, or provider name/);
   assert.match(contracts, /export type Provider = string/);
   assert.match(setup, /CREATE TABLE IF NOT EXISTS data_migrations/);
   assert.match(setup, /CREATE TABLE IF NOT EXISTS oauth_clients/);
@@ -264,7 +266,15 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(oauth, /validRedirectUri/);
   assert.match(mcp, /WWW-Authenticate/);
   assert.match(mcp, /principal\.scopes\?\.includes/);
+  // Pinned since the initial commit, when 2026-07-28 was still an unreleased draft
+  // revision — guarding against advertising it before the spec existed. Now the MCP
+  // transport is @modelcontextprotocol/server v2, which legitimately serves that era
+  // (createMcpHandler's default `legacy: 'stateless'` also serves 2025-era clients like
+  // Codex from the same endpoint) — this assertion is satisfied because none of our own
+  // source literally names that revision, not because Planbraid refuses to speak it.
   assert.doesNotMatch(mcp, /2026-07-28/);
+  assert.doesNotMatch(mcpServer, /2026-07-28/);
+  assert.doesNotMatch(mcpTools, /2026-07-28/);
   assert.doesNotMatch(store, /itemSeeds|MCP server implementation|Provider lifecycle plan|Web Push research|Concurrency review|Ember API/);
   for (const match of app.matchAll(/<button\b([^>]*)>/g)) {
     assert.match(match[1], /onClick=|type=|disabled=/, `Button without an action: ${match[0].slice(0, 120)}`);
@@ -347,6 +357,8 @@ test("uses standard hyphens in user-facing website copy", async () => {
     "../app/planbraid-app.tsx",
     "../public/manifest.webmanifest",
     "../app/mcp/route.ts",
+    "../lib/mcp/tools.ts",
+    "../lib/mcp/server.ts",
   ].map((path) => readFile(new URL(path, import.meta.url), "utf8")));
   for (const source of sources) assert.doesNotMatch(source, /[–—]/);
 });
