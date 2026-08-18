@@ -205,10 +205,12 @@ export function PlanbraidApp() {
       if (!response.ok) throw new Error("Planbraid could not load project state");
       const state = await response.json() as DashboardState;
       setData(state);
-      setProjectId((current) => {
-        if (current && state.projects.some((project) => project.id === current)) return current;
-        return [...state.projects].sort((a, b) => state.workItems.filter((item) => item.projectId === b.id).length - state.workItems.filter((item) => item.projectId === a.id).length)[0]?.id ?? "";
-      });
+      // No default project on load, and none re-picked automatically if the selected one
+      // is gone (deleted, or a stale id from a previous session): landing on the welcome
+      // screen with nothing highlighted is the point, not a state to fall back out of.
+      // Still preserves an already-valid selection across a background refresh, so
+      // actually working in a project isn't interrupted by every 15s poll.
+      setProjectId((current) => (current && state.projects.some((project) => project.id === current)) ? current : "");
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Planbraid could not load");
@@ -410,7 +412,7 @@ export function PlanbraidApp() {
         {project && view !== "inbox" && view !== "agents" && view !== "proposals" && view !== "decisions" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} onHandoff={() => void runHandoff()} handoffLoading={handoffLoading} onHealth={() => void runHealth()} healthLoading={healthLoading} onViews={() => setViewsOpen(true)} project={project} sources={sources} importRequests={data?.importRequests ?? []} onSetup={() => setSetupOpen(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
         {newUpdates > 0 && <button className="new-updates" onClick={() => { setNewUpdates(0); window.scrollTo({ top: 0, behavior: "smooth" }); }}>↑ {newUpdates} new {newUpdates === 1 ? "update" : "updates"}</button>}
         <div className="workspace-body">
-          {!project && <Empty title="No projects yet" body="Create a project for organized tracking, or connect an agent now and create the project from your MCP client." action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
+          {!project && <Empty title={`Welcome back, ${data!.viewer.name}`} body={data!.projects.length ? "Pick a project from the sidebar, create a new one, or connect an agent to get started." : "Create a project for organized tracking, or connect an agent now and create the project from your MCP client."} action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
           {project && view === "stream" && <Stream events={events} items={projectItems} sources={sources} onItem={setSelectedItemId} />}
           {project && view === "board" && <Board items={filteredItems} sources={sources} aliases={data?.aliases ?? []} dependencies={data?.dependencies ?? []} onItem={setSelectedItemId} onTransition={(item, status) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status, idempotencyKey: requestId("drag") }, `${item.itemKey} moved to ${statusMeta[status].label}`)} />}
           {project && view === "proposals" && <Proposals

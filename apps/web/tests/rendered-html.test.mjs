@@ -202,7 +202,8 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(app, /<GoogleIcon \/>/);
   assert.match(css, /\.google-outline-icon\s*\{[^}]*background:var\(--text\)[^}]*mask:var\(--google-icon\)/);
   assert.doesNotMatch(css, /\.google-g/);
-  assert.match(app, /No projects yet/);
+  assert.match(app, /Welcome back, \$\{data!\.viewer\.name\}/);
+  assert.match(app, /Create a project for organized tracking/);
   assert.match(app, /secondaryAction="Connect agent"/);
   assert.match(app, /No project required/);
   assert.doesNotMatch(app, /\{project && <button className="setup-button"/);
