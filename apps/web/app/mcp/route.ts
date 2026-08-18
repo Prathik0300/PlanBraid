@@ -99,6 +99,12 @@ async function handleMcp(request: Request, env: Env) {
   try { rpc = await request.json() as RpcRequest; } catch { return rpcError(null, -32700, "Parse error", 400); }
   if (!rpc.method) return rpcError(rpc.id ?? null, -32600, "Invalid request", 400);
 
+  // JSON-RPC notifications (no "id", e.g. notifications/initialized) never get a response
+  // body under the Streamable HTTP transport spec. Sending one back, even a well-formed
+  // {"id":null,...} envelope, is a message the client never asked for; strict clients
+  // (rmcp, used by Codex Desktop) fail to parse it and drop the connection.
+  if (rpc.id === undefined) return new Response(null, { status: 202 });
+
   if (!principal) return rpcError(rpc.id, -32001, "Authentication required", 401, { "WWW-Authenticate": oauthChallenge(request) });
   const requiredScope = rpcScope(rpc);
   if (requiredScope && !principal.scopes?.includes(requiredScope)) return rpcError(rpc.id, -32003, `The ${requiredScope} scope is required`, 403, { "WWW-Authenticate": `${oauthChallenge(request, [...new Set([...(principal.scopes ?? []), requiredScope])].join(" "))}, error="insufficient_scope"` });
@@ -109,7 +115,7 @@ async function handleMcp(request: Request, env: Env) {
     const protocolVersion = PROTOCOL_VERSIONS.includes(requestedVersion) ? requestedVersion : PROTOCOL_VERSIONS[0];
     return rpcResult(rpc.id, { protocolVersion, capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false }, prompts: { listChanged: false } }, serverInfo: { name: "planbraid", title: "Planbraid - One Plan Across Every Agent", version: "0.1.0", description: "Plans, progress, blockers, and completions braided across any MCP-compatible client or model" }, instructions: "Start with resolve_project to find the project for the current repository or directory; if nothing matches, create_project binds a new one to that directory. If a project matches but has no directory bound (created in the web UI), call update_project once with your absolute working directory so later sessions resolve it automatically. Before proposing or planning new work, call get_planning_context with your objective in a sentence: it surfaces what the project already knows that's relevant to it, so you don't re-propose something already done, already rejected, or already being worked on by someone else. Register this client or model with its own free-form identity; which of the user's accounts you are running as is resolved from the connection itself, so do not guess at one. Record accepted work, start/block/progress/completion changes, and sync every interaction. Work you propose is recorded as a proposal, not as an accepted plan: when the user actually agrees to it, call accept_work_items naming who decided. Completion requires evidence or remains in review. Use get_ready_work, not list_work_items, when deciding what to work on next." });
   }
-  if (rpc.method === "notifications/initialized" || rpc.method === "ping") return rpcResult(rpc.id, {});
+  if (rpc.method === "ping") return rpcResult(rpc.id, {});
 
   try {
     if (rpc.method === "tools/list") return rpcResult(rpc.id, { tools, ttlMs: 300000, cacheScope: "private" });
