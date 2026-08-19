@@ -601,7 +601,7 @@ function AgentsManageDialog({ project, sources, busy, command, close, onOpenAcco
                 >{source.accessBlocked ? "Unblock" : "Block from this project"}</button></div></>}
         </div>) : <p className="oauth-help">No agents have connected to this project yet.</p>}
       </div>
-      <p className="oauth-help">Blocking is enforced on every call this connection makes for this project, and survives it reconnecting, though it can still use the same token or OAuth connection for your other projects. To cut off a connection everywhere, revoke it entirely in <button className="link-button" onClick={onOpenAccountSetup}>Setup → Connected apps</button>.</p>
+      <p className="oauth-help">Blocking is enforced on every call this connection makes for this project, and survives it reconnecting, though it can still use the same token or OAuth connection for your other projects. To cut off a connection everywhere, revoke it entirely in <button className="inline-link-button" onClick={onOpenAccountSetup}>Setup → Connected apps</button>.</p>
     </section>
   </div>;
 }
