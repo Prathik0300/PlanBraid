@@ -103,7 +103,16 @@ type ProposingAccount = { provider: string; family: string; accountId: string | 
  * is how they always deduped.
  */
 function accountKeyOf(source: Source) {
-  return `${providerFamily(source.provider)}:${source.agentAccountLabel ?? ""}`;
+  const family = providerFamily(source.provider);
+  // An explicit label still groups by name (unchanged: two credentials the owner named
+  // the same thing read as one account). With no label, every unlabeled account used to
+  // fall into one shared "" bucket for that family, silently merging genuinely distinct
+  // logins into a single display identity - the exact case that made two different
+  // unlabeled Codex connections both render as plain "Codex" with nothing to tell them
+  // apart. agentAccountId (falling back to the source's own id for pre-migration
+  // sessions with neither) gives each one its own key instead.
+  if (source.agentAccountLabel) return `${family}:${source.agentAccountLabel}`;
+  return `${family}:${source.agentAccountId ?? source.id}`;
 }
 
 /**
@@ -127,14 +136,37 @@ function corroboratingProviders(item: WorkItem, aliases: DashboardState["aliases
 }
 
 /** "Claude", or "Claude · work" when more than one account of that model is connected.
- * The qualifier is noise for the overwhelmingly common single-account case. */
-function accountName(account: ProposingAccount, ambiguousFamilies: Set<string>) {
-  return ambiguousFamilies.has(account.family) ? accountDisplayName(account.provider, account.accountLabel) : labelFor(account.provider);
+ * The qualifier is noise for the overwhelmingly common single-account case. `index`, when
+ * given, names an unlabeled ambiguous account "Claude 2" instead of a bare, indistinct
+ * "Claude" - only used when there is no label to disambiguate with instead. */
+function accountName(account: ProposingAccount, ambiguousFamilies: Set<string>, index?: number) {
+  if (!ambiguousFamilies.has(account.family)) return labelFor(account.provider);
+  if (account.accountLabel) return accountDisplayName(account.provider, account.accountLabel);
+  return index ? `${labelFor(account.provider)} ${index}` : labelFor(account.provider);
 }
 
 /** The same rule for a plain Source, which is what most of the UI actually holds. */
-function sourceName(source: Source, ambiguousFamilies: Set<string>) {
-  return accountName({ provider: source.provider, family: providerFamily(source.provider), accountId: source.agentAccountId, accountLabel: source.agentAccountLabel }, ambiguousFamilies);
+function sourceName(source: Source, ambiguousFamilies: Set<string>, accountIndex?: Map<string, number>) {
+  return accountName({ provider: source.provider, family: providerFamily(source.provider), accountId: source.agentAccountId, accountLabel: source.agentAccountLabel }, ambiguousFamilies, accountIndex?.get(accountKeyOf(source)));
+}
+
+/** Stable per-family numbering for accounts with no explicit label to tell them apart:
+ * "Codex 1", "Codex 2", assigned in the order the sources happen to be given. Only
+ * families connected under more than one account need this at all (ambiguousFamilies);
+ * a labeled account never receives a number since accountName prefers its label. */
+function accountIndexOf(sources: Source[], ambiguousFamilies: Set<string>) {
+  const index = new Map<string, number>();
+  const nextByFamily = new Map<string, number>();
+  for (const source of sources) {
+    const family = providerFamily(source.provider);
+    if (!ambiguousFamilies.has(family) || source.agentAccountLabel) continue;
+    const key = accountKeyOf(source);
+    if (index.has(key)) continue;
+    const next = (nextByFamily.get(family) ?? 0) + 1;
+    nextByFamily.set(family, next);
+    index.set(key, next);
+  }
+  return index;
 }
 
 /** Model families the org has connected under more than one account. Computed from all
@@ -717,7 +749,9 @@ function FilterBar({ items, filter, setFilter, source, clearSource, onSimplify, 
   const statuses: Array<WorkStatus | "all"> = ["all", "in_progress", "ready", "blocked", "in_review", "done"];
   // Simplify is the rightmost control, so it owns the margin-left:auto that used to sit
   // on .source-filter; the source chip now just trails the status filters.
-  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div>{source && <button className="source-filter" onClick={clearSource}><ProviderIcon provider={source.provider} /> {source.title} ×</button>}<button className="views-button" onClick={onViews} title="Saved structured views: active, blocking release, keeps getting proposed, no proof, needs a decision">Views</button><button className="health-button" onClick={onHealth} disabled={healthLoading} title="See planning debt: open findings weighted by kind">{healthLoading ? "Checking…" : "Health"}</button><button className="handoff-button" onClick={onHandoff} disabled={handoffLoading} title="Copy a project handoff for another agent">{handoffLoading ? "Preparing…" : "Handoff"}</button><button className="plan-button" onClick={onPlan} disabled={planLoading || !items.length} title="The most efficient order to work through everything open, respecting dependencies">{planLoading ? "Planning…" : "Plan"}</button><button className="simplify-button" onClick={onSimplify} disabled={simplifying || !items.length} title="Find duplicates, blocked chains, and what to do first">{simplifying ? "Reviewing…" : "Simplify"}</button><ImportMenu project={project} sources={sources} importRequests={importRequests} onSetup={onSetup} toast={toast} /></div>;
+  const filterBarAmbiguousFamilies = ambiguousFamiliesOf(sources);
+  const filterBarAccountIndex = accountIndexOf(sources, filterBarAmbiguousFamilies);
+  return <div className="filter-bar"><div className="filter-scroll">{statuses.map((status) => <button key={status} className={filter === status ? "active" : ""} onClick={() => setFilter(status)}>{status === "all" ? "All work" : statusMeta[status].label}<span>{status === "all" ? items.length : items.filter((item) => deriveColumn(item) === status).length}</span></button>)}</div><button className="views-button" onClick={onViews} title="Saved structured views: active, blocking release, keeps getting proposed, no proof, needs a decision">Views</button><button className="health-button" onClick={onHealth} disabled={healthLoading} title="See planning debt: open findings weighted by kind">{healthLoading ? "Checking…" : "Health"}</button><button className="handoff-button" onClick={onHandoff} disabled={handoffLoading} title="Copy a project handoff for another agent">{handoffLoading ? "Preparing…" : "Handoff"}</button><button className="plan-button" onClick={onPlan} disabled={planLoading || !items.length} title="The most efficient order to work through everything open, respecting dependencies">{planLoading ? "Planning…" : "Plan"}</button>{source && <button className="source-filter" onClick={clearSource} title={source.title}><ProviderIcon provider={source.provider} /> {sourceName(source, filterBarAmbiguousFamilies, filterBarAccountIndex)} ×</button>}<button className="simplify-button" onClick={onSimplify} disabled={simplifying || !items.length} title="Find duplicates, blocked chains, and what to do first">{simplifying ? "Reviewing…" : "Simplify"}</button><ImportMenu project={project} sources={sources} importRequests={importRequests} onSetup={onSetup} toast={toast} /></div>;
 }
 
 /**
