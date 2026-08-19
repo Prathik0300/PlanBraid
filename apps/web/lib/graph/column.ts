@@ -14,12 +14,30 @@ import type { WorkItem, WorkStatus } from "@/lib/contracts.ts";
 /** An actor's own claim about its status always wins over topology. */
 const ASSERTION_WINS: ReadonlySet<WorkStatus> = new Set(["cancelled", "done", "in_review", "in_progress", "blocked"]);
 
-export type ColumnInput = Pick<WorkItem, "status" | "blockingCount">;
+/** Work a person has actually agreed to. Only this is ever handed to an agent to start. */
+const RATIFIED: ReadonlySet<WorkItem["maturity"]> = new Set(["accepted", "committed"]);
 
-export function deriveColumn(item: ColumnInput): WorkStatus {
+export type ColumnInput = Pick<WorkItem, "status" | "blockingCount" | "maturity" | "deferredUntil">;
+
+export function deriveColumn(item: ColumnInput, now = Date.now()): WorkStatus {
   if (ASSERTION_WINS.has(item.status)) return item.status;
-  // Not yet started, and topology says something upstream still isn't resolved.
-  if (item.blockingCount > 0) return "blocked";
+
+  // "Blocked" is an exception state, not the resting state of unscheduled work. Only an
+  // item somebody had already scheduled (stored 'ready') and then lost a prerequisite
+  // under belongs in the Blocked column; a proposed item that simply has upstream work
+  // is proposed. Reporting the latter as blocked made it 54 of 58 items on a real
+  // project, which is a column that conveys nothing and reads as a false alarm.
+  if (item.blockingCount > 0) return item.status === "ready" ? "blocked" : item.status;
+
+  // "Not now, revisit later" is not actionable, whatever the graph says.
+  if (item.deferredUntil && Date.parse(item.deferredUntil) > now) return item.status;
+
+  // Ready is derived, not stored, for the same reason blocked is: it is a fact about
+  // current topology plus acceptance, and storing it goes stale. This is also what makes
+  // accepting work mean something mechanically. set_maturity only ever writes `maturity`,
+  // so before this every column was computed from inputs acceptance never touched, and
+  // accepting 56 items provably could not move one card.
+  if (RATIFIED.has(item.maturity)) return "ready";
   return item.status;
 }
 

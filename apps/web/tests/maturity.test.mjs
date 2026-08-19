@@ -187,7 +187,14 @@ test("turning gating on does not wipe other project settings", async () => {
   assert.equal(settings.gateProposals, true);
 });
 
-test("with gating on, unaccepted work is not handed to an agent as ready", async () => {
+test("unaccepted work is never handed to an agent, gate or no gate", async () => {
+  // This used to assert that with gating off an unaccepted item still reached the queue,
+  // because reaching it required a person to transition the item to 'ready' by hand, and
+  // that manual step was itself the ratification. Readiness is now derived from acceptance
+  // instead (nothing ever performed that transition on a real project, so the queue was
+  // permanently empty), which makes acceptance the only gate left. Dropping it here would
+  // hand every unblocked proposal straight to an agent, so it is enforced unconditionally.
+  // `gateProposals` keeps its original job of governing *visibility*, per D1.
   const db = await createTestDb();
   const projectId = await setupProject(db);
   const accepted = await readyItem(db, projectId, "Accepted and ready", "g1");
@@ -195,11 +202,11 @@ test("with gating on, unaccepted work is not handed to an agent as ready", async
   await executeCommand(db, browser, { action: "set_maturity", projectId, itemIds: [unaccepted], maturity: "proposal", idempotencyKey: "g-demote" });
 
   const ungated = await getReadyWork(db, principal, { projectId });
-  assert.equal(ungated.workItems.length, 2, "gating off keeps today's behaviour exactly");
+  assert.deepEqual(ungated.workItems.map((item) => item.id), [accepted], "an agent may propose, only a person may decide");
 
   await executeCommand(db, browser, { action: "update_project", projectId, gateProposals: true, idempotencyKey: "g-on" });
   const gated = await getReadyWork(db, principal, { projectId });
-  assert.deepEqual(gated.workItems.map((item) => item.id), [accepted]);
+  assert.deepEqual(gated.workItems.map((item) => item.id), [accepted], "turning the gate on changes visibility, not actionability");
 });
 
 // ── Resolutions ──────────────────────────────────────────────────────────────────────

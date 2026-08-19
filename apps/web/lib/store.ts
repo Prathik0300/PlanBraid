@@ -37,9 +37,17 @@ export type Principal = {
   agentAccountLabel?: string;
 };
 
+// `ready` is derived from acceptance plus a clear graph (lib/graph/column.ts), not stored,
+// so requiring a stored-'ready' hop before work can start would make everything
+// get_ready_work now hands out un-startable: on a real project every item sits at
+// 'proposed' forever because nothing performs that transition. Starting straight from a
+// pre-execution status is therefore legal. This removes no protection that existed:
+// proposed -> ready -> in_progress was always two permitted calls, so the ladder never
+// gated acceptance, and blocked -> in_progress is likewise long-permitted-and-flagged
+// (see isStartedWhileBlocked) rather than forbidden.
 const ALLOWED_TRANSITIONS: Record<WorkStatus, WorkStatus[]> = {
-  proposed: ["planned", "ready", "cancelled"],
-  planned: ["ready", "blocked", "cancelled"],
+  proposed: ["planned", "ready", "in_progress", "cancelled"],
+  planned: ["ready", "in_progress", "blocked", "cancelled"],
   ready: ["in_progress", "blocked", "cancelled"],
   in_progress: ["blocked", "in_review", "done", "cancelled"],
   blocked: ["ready", "in_progress", "cancelled"],
@@ -1537,18 +1545,25 @@ export async function getReadyWork(
   input: { projectId: string; sourceId?: string; limit?: number; avoidCollisions?: boolean },
 ) {
   const organizationId = await organizationFor(db, principal);
-  const project = await ownedProject(db, organizationId, input.projectId);
+  // Access check only; nothing below reads the row. Work no person has accepted is never
+  // handed to an agent to start, gate or no gate: starting work whose premise nobody
+  // ratified is the unsafe move, and `gateProposals` only ever governed *visibility* (see
+  // PLANNING_INTELLIGENCE_ROADMAP.md D1). It stays a display setting; actionability is not
+  // conditional on it, so this no longer reads project settings at all.
+  await ownedProject(db, organizationId, input.projectId);
   const avoidCollisions = input.avoidCollisions !== false;
   const limit = Math.min(Math.max(Number(input.limit ?? 5), 1), 50);
-  // With gating on, work no person has accepted is not handed to an agent to start. Off by
-  // default so turning the ladder on does not silently empty a working queue.
-  const gateProposals = parseJson<{ gateProposals?: boolean }>(text(project, "settings"), {}).gateProposals === true;
-  const maturityClause = gateProposals ? " AND maturity IN ('accepted', 'committed')" : "";
 
   const [itemRows, sourceRows, aliasRows, claimRows] = await db.batch([
+    // Mirrors deriveColumn's "ready" branch exactly, in the same order: an asserted status
+    // wins (so nothing in_progress/in_review/done/cancelled/blocked is offered), topology
+    // must be clear, a live deferral disqualifies, and the item must be ratified. Ready is
+    // derived rather than read from `status` because nothing in the product ever wrote
+    // 'ready' -- agents create work as 'proposed' and acceptance only moves `maturity` --
+    // so requiring the stored value returned an empty queue on every real project.
     // `deferred_until` is compared in SQL rather than filtered afterwards so a deferral
     // simply expires: the item comes back on its date with no job to run and no write.
-    db.prepare(`SELECT * FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL AND status = 'ready' AND blocking_count = 0 AND (deferred_until IS NULL OR deferred_until <= now())${maturityClause}`).bind(input.projectId, organizationId),
+    db.prepare(`SELECT * FROM work_items WHERE project_id = ? AND organization_id = ? AND archived_at IS NULL AND status NOT IN ('in_progress', 'in_review', 'done', 'cancelled', 'blocked') AND blocking_count = 0 AND (deferred_until IS NULL OR deferred_until <= now()) AND maturity IN ('accepted', 'committed')`).bind(input.projectId, organizationId),
     db.prepare("SELECT * FROM sources WHERE project_id = ? AND organization_id = ?").bind(input.projectId, organizationId),
     db.prepare("SELECT * FROM work_item_aliases WHERE project_id = ? AND organization_id = ?").bind(input.projectId, organizationId),
     // Live leases (finding F1): unlike sources.current_task_ids, a lease expires on its
@@ -1560,7 +1575,8 @@ export async function getReadyWork(
   ]);
   const candidates = itemRows.results.map(mapItem);
   // The SQL predicate above is the same rule deriveColumn applies for a "ready" item, so
-  // this list can never diverge from what the board shows in the Ready column.
+  // this list can never diverge from what the board shows in the Ready column. The two
+  // must be changed together; lib/graph/column.ts is the readable copy of this rule.
   const sources = sourceRows.results.map(mapSource);
   const aliases = aliasRows.results.map(mapAlias);
   const claimed = new Set((claimRows.results as Array<{ id: string }>).map((row) => row.id));

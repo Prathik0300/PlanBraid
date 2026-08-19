@@ -15,10 +15,12 @@ import { createTestDb } from "./support/local-pg.mjs";
 import { principal, setupProject, createItem } from "./support/fixtures.mjs";
 import { executeCommand, getReadyWork, loadDashboard, registerSourceSession, startWork, updateSourceHeartbeat } from "@/lib/store.ts";
 
+/** Actionable the way the product makes work actionable: proposed by an agent, then
+ * accepted by a person. Readiness is derived from acceptance plus a clear graph, so there
+ * is deliberately no transition to 'ready' here. */
 async function readyItem(db, projectId, title, key = crypto.randomUUID()) {
   const id = await createItem(db, projectId, title, key);
-  const record = await db.prepare("SELECT version FROM work_items WHERE id = ?").bind(id).first();
-  await executeCommand(db, principal, { action: "transition_item", projectId, itemId: id, expectedVersion: record.version, status: "ready", idempotencyKey: `ready-${key}` });
+  await executeCommand(db, principal, { action: "set_maturity", projectId, itemIds: [id], maturity: "accepted", statedBy: "Graph Tester", idempotencyKey: `accept-${key}` });
   return id;
 }
 

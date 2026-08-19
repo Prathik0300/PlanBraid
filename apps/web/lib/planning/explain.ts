@@ -46,6 +46,9 @@ export type WhyNotDoneExplanation = {
     resolutionReason?: string | null;
     deferredUntil?: string | null;
     blockedByChain?: string[];
+    /** The subset of blockedByChain nobody has accepted yet: those are waiting on a
+     * decision rather than on work, which is a different thing to go and fix. */
+    unacceptedBlockers?: string[];
     blockerReason?: string | null;
     heldBy?: string | null;
     heldSince?: string | null;
@@ -54,7 +57,9 @@ export type WhyNotDoneExplanation = {
   };
 };
 
-type Chain = { itemKeys: string[]; reason: string };
+/** `unacceptedKeys` is the subset of the chain nobody has accepted yet. Optional so a
+ * caller constructing a Chain by hand (tests) need not supply it. */
+type Chain = { itemKeys: string[]; reason: string; unacceptedKeys?: string[] };
 type Claim = { holderLabel: string; heartbeatAt: string } | null;
 type LastEvent = { summary: string; reason: string | null } | null;
 
@@ -100,8 +105,16 @@ export function explainCause(item: WorkItem, chain: Chain | null, claim: Claim, 
 
   // 3. The graph says it can't start. Named down to the root of the chain, not just a
   // count — "waiting on #4" is actionable, "blocked by 1 thing" is not.
+  // A blocker nobody has accepted is a different problem with a different remedy: the fix
+  // is to decide on it, not to build it. Branch 7 below would say so, but only for items
+  // that are themselves proposals, so an accepted item held down by a proposal used to
+  // report a bare "waiting on #N" and never mention that #N is not even agreed work yet.
   if (item.blockingCount > 0 && chain) {
-    return { cause: "blocked_by_dependency", summary: `${item.itemKey} ${chain.reason}.`, detail: { ...base, blockedByChain: chain.itemKeys } };
+    const unaccepted = chain.unacceptedKeys ?? [];
+    const note = unaccepted.length
+      ? ` ${unaccepted.join(", ")} ${unaccepted.length === 1 ? "is" : "are"} still only a proposal, so this is waiting on a decision, not on work.`
+      : "";
+    return { cause: "blocked_by_dependency", summary: `${item.itemKey} ${chain.reason}.${note}`, detail: { ...base, blockedByChain: chain.itemKeys, unacceptedBlockers: unaccepted } };
   }
 
   // 4. An actor asserted a block that the graph doesn't know about — waiting on a person,
@@ -161,7 +174,12 @@ async function chainFor(db: PgD1, organizationId: string, item: WorkItem): Promi
   if (!finding) return null;
   const match = /waiting on (.+)$/.exec(finding.reason);
   const itemKeys = match ? match[1].split(", then ") : [];
-  return { itemKeys, reason: finding.reason };
+  const byKey = new Map(view.workItems.map((entry) => [entry.itemKey, entry]));
+  const unacceptedKeys = itemKeys.filter((key) => {
+    const blocker = byKey.get(key);
+    return blocker != null && (blocker.maturity === "proposal" || blocker.maturity === "idea");
+  });
+  return { itemKeys, reason: finding.reason, unacceptedKeys };
 }
 
 async function activeClaim(db: PgD1, workItemId: string): Promise<Claim> {

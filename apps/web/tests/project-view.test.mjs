@@ -29,6 +29,12 @@ async function transition(db, projectId, itemId, status, key) {
   return executeCommand(db, principal, { action: "transition_item", projectId, itemId, expectedVersion: row.version, status, idempotencyKey: key });
 }
 
+/** What actually makes work actionable: readiness is derived from acceptance plus a clear
+ * graph, so a transition to 'ready' is not what puts an item in the queue. */
+async function accept(db, projectId, itemId, key) {
+  return executeCommand(db, principal, { action: "set_maturity", projectId, itemIds: [itemId], maturity: "accepted", statedBy: "Graph Tester", idempotencyKey: key });
+}
+
 // ── 1. Scoping ───────────────────────────────────────────────────────────────────────
 
 test("listWorkItems returns only the requested project, even when another project has identical titles", async () => {
@@ -299,10 +305,7 @@ test("unlock counts are correct with no dependencies at all", async () => {
   const projectId = await setupProject(db);
   const a = await createItem(db, projectId, "Standalone one", "n1");
   const b = await createItem(db, projectId, "Standalone two", "n2");
-  for (const [index, id] of [a, b].entries()) {
-    await transition(db, projectId, id, "planned", `np${index}`);
-    await transition(db, projectId, id, "ready", `nr${index}`);
-  }
+  for (const [index, id] of [a, b].entries()) await accept(db, projectId, id, `na${index}`);
 
   const result = await getReadyWork(db, principal, { projectId });
   assert.equal(result.workItems.length, 2);
@@ -318,8 +321,7 @@ test("unlock counts stay per-item across many candidates in one grouped query", 
   const ready = [];
   for (const [index, unlocks] of [2, 1, 0].entries()) {
     const id = await createItem(db, projectId, `Prerequisite ${index}`, `g${index}`);
-    await transition(db, projectId, id, "planned", `gp${index}`);
-    await transition(db, projectId, id, "ready", `gr${index}`);
+    await accept(db, projectId, id, `ga${index}`);
     for (let n = 0; n < unlocks; n += 1) {
       const dependent = await createItem(db, projectId, `Dependent ${index}-${n}`, `gd${index}-${n}`);
       await executeCommand(db, principal, { action: "add_dependency", projectId, fromWorkItemId: id, toWorkItemId: dependent, type: "blocks", idempotencyKey: `ge${index}-${n}` });

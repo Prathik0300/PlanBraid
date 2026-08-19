@@ -38,10 +38,10 @@ type DebtEntry = { findingId: string; kind: string; weight: number; workItemId: 
 type PlanningHealth = { debt: DebtEntry[]; totalWeight: number; score: number; breakdown: Array<{ kind: string; count: number; weight: number }> };
 type SavedViewName = "active" | "blocking_release" | "keeps_getting_proposed" | "no_proof" | "needs_decision";
 type SavedViewItem = { itemKey: string; workItemId: string; title: string; detail: string };
-type PlanStep = WorkItem & { reason: string; corroboration: number };
+type PlanStep = WorkItem & { reason: string; corroboration: number; depth: number; slack: number; critical: boolean };
 type PlanWave = { wave: number; items: PlanStep[] };
 type StuckItem = WorkItem & { reason: string };
-type ExecutionPlan = { waves: PlanWave[]; stuck: StuckItem[] };
+type ExecutionPlan = { waves: PlanWave[]; stuck: StuckItem[]; criticalPath: Array<Pick<WorkItem, "id" | "itemKey" | "title">> };
 const SAVED_VIEW_LABELS: Record<SavedViewName, string> = { active: "Active", blocking_release: "Blocking release", keeps_getting_proposed: "Keeps getting proposed", no_proof: "No proof", needs_decision: "Needs a decision" };
 
 /** GitHub's mark, inlined so the picker needs no network request to render. */
@@ -834,9 +834,13 @@ function TaskCard({ item, source, aliases, sources, ambiguousFamilies, dependenc
   const corroborated = corroboration.length > 1;
   const aliasTitle = aliases.map((alias) => { const aliasSource = sources.find((entry) => entry.id === alias.sourceId); return `${aliasSource ? sourceName(aliasSource, ambiguousFamilies) : "Another agent"} also proposed: "${alias.title}"`; }).join("\n");
   const column = deriveColumn(item);
-  const waitingOn = column === "blocked" && item.status !== "blocked" ? unresolvedBlockers(item, dependencies, allItems) : [];
+  // Keyed off the blockers themselves rather than the derived column: unscheduled work
+  // with prerequisites no longer derives to "blocked" (that column is reserved for real
+  // exceptions now), so gating this on the column would have deleted the only per-card
+  // trace of the dependency graph. An explicitly blocked item shows blockerReason instead.
+  const waitingOn = item.status !== "blocked" ? unresolvedBlockers(item, dependencies, allItems) : [];
   const anomaly = isStartedWhileBlocked(item);
-  return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{isProposal(item) && <span className="proposal-badge" title="Proposed by an agent and not yet accepted by anyone.">proposal</span>}{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.resolution && item.resolution !== "completed" && <p className="resolution-copy">{resolutionLabel[item.resolution] ?? item.resolution}{item.resolutionReason ? `: ${item.resolutionReason}` : ""}</p>}{item.deferredUntil && <p className="blocker-copy">Deferred until {new Date(item.deferredUntil).toLocaleDateString()}</p>}{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="blocker-copy">Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}{/* corroboration already includes the card's own source, so a plural stack replaces
+  return <article className="task-card"><button className="task-card-main" onClick={onClick}><div><span className={`priority ${item.priority}`} /> <b>{item.itemKey}</b>{isProposal(item) && <span className="proposal-badge" title="Proposed by an agent and not yet accepted by anyone.">proposal</span>}{aliases.length > 0 && <span className={`alias-badge ${corroborated ? "corroborated" : ""}`} title={aliasTitle}>+{aliases.length}</span>}{anomaly && <span className="anomaly-badge" title="This is in progress, but a prerequisite is unresolved: either it was reopened, or the dependency was added after work started.">⚠ started while blocked</span>}<small>v{item.version}</small></div><h3>{item.title}</h3>{item.resolution && item.resolution !== "completed" && <p className="resolution-copy">{resolutionLabel[item.resolution] ?? item.resolution}{item.resolutionReason ? `: ${item.resolutionReason}` : ""}</p>}{item.deferredUntil && <p className="blocker-copy">Deferred until {new Date(item.deferredUntil).toLocaleDateString()}</p>}{item.blockerReason && <p className="blocker-copy">{item.blockerReason}</p>}{waitingOn.length > 0 && <p className="waiting-copy" title={waitingOn.map((entry) => `${entry.itemKey} ${entry.title}`).join("\n")}>Waiting on {waitingOn.map((entry) => entry.itemKey).join(", ")}</p>}{/* corroboration already includes the card's own source, so a plural stack replaces
     the single-source label rather than sitting beside a duplicate of itself. */}
           <footer>{corroborated ? <ProviderStack accounts={corroboration} ambiguousFamilies={ambiguousFamilies} /> : source ? <span><ProviderIcon provider={source.provider} /> {sourceName(source, ambiguousFamilies)}</span> : <span>Manual</span>}</footer></button><select aria-label={`Move ${item.itemKey}`} value={item.status} onChange={(event) => onMove(event.target.value as WorkStatus)}>{Object.entries(statusMeta).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></article>;
 }
@@ -955,13 +959,22 @@ function HealthDialog({ health, close, onItem }: { health: PlanningHealth; close
 function PlanDialog({ plan, close, onItem }: { plan: ExecutionPlan; close: () => void; onItem: (workItemId: string) => void }) {
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
     <section className="plan-dialog" role="dialog" aria-modal="true" aria-labelledby="plan-title">
-      <header><div><span className="eyebrow">EXECUTION PLAN</span><h2 id="plan-title">The most efficient order</h2><p>Wave by wave: what to do now, and what each wave unlocks next.</p></div><button className="icon-button" onClick={close} aria-label="Close execution plan">×</button></header>
+      <header><div><span className="eyebrow">EXECUTION PLAN</span><h2 id="plan-title">The most efficient order</h2><p>Ordered by critical path: the longest chain of work sets the finish date, so it goes first. Everything else has float.</p></div><button className="icon-button" onClick={close} aria-label="Close execution plan">×</button></header>
+      {plan.criticalPath.length > 1 && <div className="plan-critical">
+        <h3>Critical path <small>{plan.criticalPath.length} steps, in sequence</small></h3>
+        <p className="muted">However many agents you run, the project cannot finish faster than this chain. Every other task can slip without costing time.</p>
+        <div className="plan-critical-chain">{plan.criticalPath.map((entry, index) => <span key={entry.id}>
+          {index > 0 && <b aria-hidden="true">→</b>}
+          <button onClick={() => onItem(entry.id)} title={entry.title}>{entry.itemKey}</button>
+        </span>)}</div>
+      </div>}
       {plan.waves.length
         ? <div className="plan-waves">{plan.waves.map((wave) => <div className="plan-wave" key={wave.wave}>
             <h3>Wave {wave.wave}<small>{wave.items.length} task{wave.items.length === 1 ? "" : "s"}{wave.wave === 1 ? " · actionable now" : ""}</small></h3>
-            {wave.items.map((item) => <button className="plan-step-row" key={item.id} onClick={() => onItem(item.id)}>
+            {wave.items.map((item) => <button className={`plan-step-row ${item.critical ? "critical" : ""}`} key={item.id} onClick={() => onItem(item.id)}>
               <span className={`priority ${item.priority}`} />
               <span><strong>{item.itemKey} {item.title}</strong><small>{item.reason}{item.corroboration > 1 ? ` · proposed independently by ${item.corroboration} models` : ""}</small></span>
+              {item.critical ? <span className="plan-flag critical" title="On the critical path: delaying this delays the whole project.">critical</span> : <span className="plan-flag" title={`This can start up to ${item.slack} step${item.slack === 1 ? "" : "s"} later without moving the finish date.`}>slack {item.slack}</span>}
             </button>)}
           </div>)}</div>
         : <Empty title="Nothing open" body="Every work item is done or cancelled, so there's no plan to compute." />}

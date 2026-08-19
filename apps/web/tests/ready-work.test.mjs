@@ -9,10 +9,16 @@ import { createTestDb } from "./support/local-pg.mjs";
 import { principal, setupProject, createItem } from "./support/fixtures.mjs";
 import { executeCommand, getReadyWork, organizationFor, registerSourceSession, updateSourceHeartbeat } from "@/lib/store.ts";
 
+/**
+ * Makes an item actionable the way the product actually does it: the agent proposes, a
+ * person accepts. Readiness is derived from acceptance plus clear topology, not stored,
+ * so there is deliberately no transition to 'ready' here. This helper used to transition
+ * instead, which is why the suite passed while `get_ready_work` returned an empty list on
+ * every real project: nothing outside the tests ever wrote that status.
+ */
 async function readyItem(db, projectId, title, key = crypto.randomUUID()) {
   const id = await createItem(db, projectId, title, key);
-  const record = await db.prepare("SELECT version FROM work_items WHERE id = ?").bind(id).first();
-  await executeCommand(db, principal, { action: "transition_item", projectId, itemId: id, expectedVersion: record.version, status: "ready", idempotencyKey: `ready-${key}` });
+  await executeCommand(db, principal, { action: "set_maturity", projectId, itemIds: [id], maturity: "accepted", statedBy: "Graph Tester", idempotencyKey: `accept-${key}` });
   return id;
 }
 
@@ -20,21 +26,21 @@ async function link(db, projectId, fromWorkItemId, toWorkItemId, key) {
   await executeCommand(db, principal, { action: "add_dependency", projectId, fromWorkItemId, toWorkItemId, type: "blocks", idempotencyKey: key });
 }
 
-test("only status=ready with blocking_count=0 is a candidate", async () => {
+test("a candidate is accepted work with a clear graph, whatever its stored status says", async () => {
   const db = await createTestDb();
   const projectId = await setupProject(db);
-  const ready = await readyItem(db, projectId, "Actionable now");
-  const proposed = await createItem(db, projectId, "Not yet triaged");
-  const blocker = await createItem(db, projectId, "Unresolved blocker");
-  const blockedReady = await readyItem(db, projectId, "Marked ready but still blocked");
-  await link(db, projectId, blocker, blockedReady, "l1");
+  const accepted = await readyItem(db, projectId, "Actionable now");
+  const stillAProposal = await createItem(db, projectId, "Nobody has accepted this");
+  const blocker = await readyItem(db, projectId, "Unresolved blocker");
+  const acceptedButBlocked = await readyItem(db, projectId, "Accepted, but waiting on the blocker");
+  await link(db, projectId, blocker, acceptedButBlocked, "l1");
 
   const result = await getReadyWork(db, principal, { projectId });
   const ids = result.workItems.map((item) => item.id);
-  assert.ok(ids.includes(ready));
-  assert.ok(!ids.includes(proposed), "proposed work has not been triaged into ready");
-  assert.ok(!ids.includes(blockedReady), "graph-blocked items are never handed out even if status says ready");
-  assert.ok(!ids.includes(blocker), "the blocker itself is still 'proposed', not a candidate");
+  assert.ok(ids.includes(accepted), "acceptance plus a clear graph is what makes work actionable; stored status is still 'proposed' here");
+  assert.ok(!ids.includes(stillAProposal), "an agent may propose, only a person may decide: unratified work is never handed out");
+  assert.ok(!ids.includes(acceptedButBlocked), "graph-blocked items are never handed out, accepted or not");
+  assert.ok(ids.includes(blocker), "the blocker itself is accepted and unblocked, so it is exactly what should be worked on first");
 });
 
 test("excludes work claimed by another active session, but not the caller's own claims", async () => {
@@ -160,10 +166,10 @@ test("corroboration (independently proposed by more agents) breaks remaining tie
   const codex = await registerSourceSession(db, principal, { projectId, provider: "codex", externalId: "c2" });
 
   const singlyProposed = await createItem(db, projectId, "Only Claude proposed this");
-  await db.prepare("UPDATE work_items SET source_id = ?, status = 'ready', version = version + 1 WHERE id = ?").bind(claude.sourceId, singlyProposed).run();
+  await db.prepare("UPDATE work_items SET source_id = ?, maturity = 'accepted', version = version + 1 WHERE id = ?").bind(claude.sourceId, singlyProposed).run();
 
   const corroborated = await createItem(db, projectId, "Both agents proposed this");
-  await db.prepare("UPDATE work_items SET source_id = ?, status = 'ready', version = version + 1 WHERE id = ?").bind(claude.sourceId, corroborated).run();
+  await db.prepare("UPDATE work_items SET source_id = ?, maturity = 'accepted', version = version + 1 WHERE id = ?").bind(claude.sourceId, corroborated).run();
   await db.prepare("INSERT INTO work_item_aliases (id, organization_id, project_id, work_item_id, title, source_id, match_method) VALUES (?, ?, ?, ?, ?, ?, 'fingerprint')")
     .bind("als_test", org, projectId, corroborated, "Both agents proposed this", codex.sourceId).run();
 

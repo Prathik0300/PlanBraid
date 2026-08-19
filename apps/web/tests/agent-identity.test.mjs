@@ -166,7 +166,7 @@ test("ranking counts two accounts of one model once, but Claude plus Codex twice
 
   async function readyWithAlias(title, ownerSourceId, aliasSourceId, key) {
     const itemId = await createItem(db, projectId, title, key);
-    await db.prepare("UPDATE work_items SET source_id = ?, status = 'ready', version = version + 1 WHERE id = ?").bind(ownerSourceId, itemId).run();
+    await db.prepare("UPDATE work_items SET source_id = ?, maturity = 'accepted', version = version + 1 WHERE id = ?").bind(ownerSourceId, itemId).run();
     await db.prepare("INSERT INTO work_item_aliases (id, organization_id, project_id, work_item_id, title, source_id) VALUES (?, ?, ?, ?, ?, ?)")
       .bind(`als_${key}`, organizationId, projectId, itemId, title, aliasSourceId).run();
     return itemId;
