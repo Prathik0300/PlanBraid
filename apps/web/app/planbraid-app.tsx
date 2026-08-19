@@ -4,6 +4,7 @@
 /* eslint-disable jsx-a11y/no-static-element-interactions, jsx-a11y/no-autofocus */
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { authClient } from "@/lib/auth-client";
 import { firstValidationMessage, passwordSchema } from "@/lib/auth-validation";
 import { GoogleIcon } from "@/app/google-icon";
@@ -510,30 +511,46 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
 function ProjectMenu({ project, busy, onRename, onManageAgents, onDelete }: { project: Project; busy: boolean; onRename: () => void; onManageAgents: () => void; onDelete: () => void }) {
   const [open, setOpen] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
-    if (!open) { setConfirmingDelete(false); return; }
+    if (!open) return;
+    const closeMenu = () => { setOpen(false); setConfirmingDelete(false); };
     const onPointerDown = (event: MouseEvent) => {
       if (menuRef.current?.contains(event.target as Node) || triggerRef.current?.contains(event.target as Node)) return;
-      setOpen(false);
+      closeMenu();
     };
-    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") closeMenu(); };
     document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("scroll", closeMenu, true);
     window.addEventListener("keydown", onKey);
-    return () => { document.removeEventListener("mousedown", onPointerDown); window.removeEventListener("keydown", onKey); };
+    window.addEventListener("resize", closeMenu);
+    return () => { document.removeEventListener("mousedown", onPointerDown); document.removeEventListener("scroll", closeMenu, true); window.removeEventListener("keydown", onKey); window.removeEventListener("resize", closeMenu); };
   }, [open]);
 
   return <div className="project-menu-wrap">
-    <button ref={triggerRef} type="button" className="project-menu-button" onClick={(event) => { event.stopPropagation(); setOpen((value) => !value); }} aria-haspopup="menu" aria-expanded={open} aria-label={`More actions for ${project.name}`} title="More actions">⋯</button>
-    {open && <div ref={menuRef} className="project-menu" role="menu">
-      <button role="menuitem" onClick={() => { setOpen(false); onRename(); }}>Rename</button>
-      <button role="menuitem" onClick={() => { setOpen(false); onManageAgents(); }}>Manage connected agents</button>
+    <button ref={triggerRef} type="button" className="project-menu-button" onClick={(event) => {
+      event.stopPropagation();
+      if (open) { setOpen(false); setConfirmingDelete(false); return; }
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const menuWidth = 190;
+      const menuHeight = 122;
+      const viewportGap = 8;
+      const left = Math.min(Math.max(viewportGap, rect.right - menuWidth), window.innerWidth - menuWidth - viewportGap);
+      const top = rect.bottom + 4 + menuHeight <= window.innerHeight ? rect.bottom + 4 : Math.max(viewportGap, rect.top - menuHeight - 4);
+      setPosition({ top, left });
+      setOpen(true);
+    }} aria-haspopup="menu" aria-expanded={open} aria-label={`More actions for ${project.name}`} title="More actions">⋯</button>
+    {open && position && createPortal(<div ref={menuRef} className="project-menu" role="menu" style={position}>
+      <button role="menuitem" onClick={() => { setOpen(false); setConfirmingDelete(false); onRename(); }}>Rename</button>
+      <button role="menuitem" onClick={() => { setOpen(false); setConfirmingDelete(false); onManageAgents(); }}>Manage connected agents</button>
       {confirmingDelete
-        ? <button role="menuitem" className="project-menu-danger" disabled={busy} onClick={() => { setOpen(false); onDelete(); }}>Confirm delete?</button>
+        ? <button role="menuitem" className="project-menu-danger" disabled={busy} onClick={() => { setOpen(false); setConfirmingDelete(false); onDelete(); }}>Confirm delete?</button>
         : <button role="menuitem" className="project-menu-danger" onClick={() => setConfirmingDelete(true)}>Delete project</button>}
-    </div>}
+    </div>, document.body)}
   </div>;
 }
 
@@ -1037,7 +1054,7 @@ function Agents({ sources, items, claims, busy, onSetup, onDelete }: { sources: 
           "Connect agent" already shows, to paste back into this specific agent, rather
           than silently marking the card active while nothing has actually reconnected. */}
       <div className="agent-card-actions">
-        {source.status !== "active" && <button className="agent-reconnect" onClick={onSetup}>Reconnect {sourceName(source, agentAmbiguousFamilies)}</button>}
+        {source.status === "ended" && <button className="agent-reconnect" onClick={onSetup}>Reconnect {sourceName(source, agentAmbiguousFamilies)}</button>}
         <button className="agent-delete" disabled={busy} onClick={() => {
           if (confirmingDeleteId === source.id) { setConfirmingDeleteId(null); onDelete(source); }
           else setConfirmingDeleteId(source.id);

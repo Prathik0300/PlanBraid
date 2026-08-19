@@ -55,7 +55,7 @@ export async function loadProjectView(
   projectId: string,
   parts: ProjectViewParts = {},
 ): Promise<ProjectView> {
-  const statements = [db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ?").bind(projectId, organizationId)];
+  const statements = [db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ? AND status <> 'archived'").bind(projectId, organizationId)];
   const order: Array<keyof ProjectViewParts> = [];
 
   if (parts.items) {
@@ -88,11 +88,12 @@ export async function loadProjectView(
   if (!projectRow) throw notFound();
 
   const view: ProjectView = { project: mapProject(projectRow), workItems: [], events: [], sources: [], dependencies: [], evidence: [], aliases: [] };
+  const presenceNow = Date.now();
   for (const [index, part] of order.entries()) {
     const rows = results[index + 1].results as Row[];
     if (part === "items") view.workItems = rows.map(mapItem);
     else if (part === "events") view.events = rows.map(mapEvent);
-    else if (part === "sources") view.sources = rows.map(mapSource);
+    else if (part === "sources") view.sources = rows.map((row) => mapSource(row, presenceNow));
     else if (part === "dependencies") view.dependencies = rows.map(mapDependency);
     else if (part === "evidence") view.evidence = rows.map(mapEvidence);
     else if (part === "aliases") view.aliases = rows.map(mapAlias);
@@ -102,7 +103,7 @@ export async function loadProjectView(
 
 /** Ownership check on its own, for callers that need nothing else back. */
 export async function requireProject(db: PgD1, organizationId: string, projectId: string) {
-  const row = await db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ?").bind(projectId, organizationId).first<Row>();
+  const row = await db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ? AND status <> 'archived'").bind(projectId, organizationId).first<Row>();
   if (!row) throw notFound();
   return row;
 }

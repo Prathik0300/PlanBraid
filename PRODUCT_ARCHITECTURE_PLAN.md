@@ -952,6 +952,8 @@ Each session row shows:
 - provider and agent/model label;
 - project and source chat title;
 - state: active, idle, ended, unknown;
+- presence is normalized on server reads rather than trusting the last client status forever: a source is active for two minutes after its latest registration or heartbeat, idle until the existing 45-minute work-claim lease expires, then ended;
+- explicit `end_agent_session` and project-scoped removal are authoritative terminal states; only a new `register_agent_session` call reconnects them;
 - current claimed work items;
 - tasks created/updated/completed;
 - last event and capture quality;

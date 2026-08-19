@@ -115,8 +115,11 @@ test("ships the product UI, service worker, and manifest", async () => {
   assert.match(app, /Connect agent/);
   assert.match(app, /action: "remove_source"/);
   assert.match(app, /className="agent-delete"/);
+  assert.match(app, /source\.status === "ended" && <button className="agent-reconnect"/);
   assert.match(app, /className="agent-manage-identity"/);
+  assert.match(app, /createPortal\(<div ref=\{menuRef\} className="project-menu"/);
   assert.match(css, /\.agent-delete\s*\{[^}]*color:\s*#ff9ba2/);
+  assert.match(css, /\.project-menu\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*2147483647/);
   assert.match(css, /\.agent-manage-identity \.provider-icon\s*\{[^}]*background:\s*transparent/);
   assert.match(css, /grid-template-columns:\s*var\(--rail\)/);
   assert.match(css, /prefers-reduced-motion/);

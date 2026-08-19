@@ -32,6 +32,9 @@ the original Cloudflare-based architecture; §1 reflects current state.
 | Derived board columns, "waiting on" chain, started-while-blocked anomaly badge | `lib/graph/column.ts`, `app/planbraid-app.tsx` |
 | `get_ready_work`: unlock-count ranking, live-session collision exclusion | `lib/store.ts:getReadyWork`, `worker/index.ts` |
 | Connected-agent management: project-scoped session removal with preserved provenance, card delete controls, and compact modal identity/action rows | `lib/contracts.ts`, `lib/store.ts`, `app/planbraid-app.tsx`, `app/globals.css` |
+| Server-normalized agent presence: shared active/idle/ended freshness policy, lease-aligned expiry, authoritative explicit end/removal, and reconnect-only terminal recovery | `lib/presence.ts`, `lib/read`, `lib/store.ts`, `app/planbraid-app.tsx`, `tests` |
+| Unclipped project action menus: body-level portal positioning above scroll containers and all sidebar sections | `app/planbraid-app.tsx`, `app/globals.css`, `tests/rendered-html.test.mjs` |
+| Project deletion visibility: archived tombstones are excluded from dashboard/project reads and reject later direct access while idempotent deletion retries remain valid | `lib/store.ts`, `lib/read/project-view.ts`, `app/api/events/route.ts`, `tests/project-management.test.mjs` |
 | Rebrand: `PLANBRAID_*` primary with `RELAYBOARD_*` fallback, `planbraid-app.tsx`/`planbraid-hook.mjs` renamed | `integrations/`, root docs, `apps/web/app` |
 | Domain-logic test coverage | `tests/dedup.test.mjs`, `tests/graph.test.mjs`, `tests/auto-unblock.test.mjs`, `tests/column.test.mjs`, `tests/ready-work.test.mjs` — 92 tests total, plus the 9-test build/rendered-HTML suite |
 

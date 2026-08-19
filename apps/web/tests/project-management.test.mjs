@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { executeCommand, loadDashboard, registerSourceSession, updateSourceHeartbeat } from "@/lib/store.ts";
+import { loadProjectView } from "@/lib/read/project-view.ts";
 import { createTestDb } from "./support/local-pg.mjs";
 import { principal } from "./support/fixtures.mjs";
 
@@ -108,4 +109,23 @@ test("remove_source hides one project session without deleting its historical pr
   const reconnected = await registerSourceSession(db, principal, { projectId, provider: "cursor", externalId: "cursor-session-1", title: "Cursor plan" });
   assert.equal(reconnected.sourceId, registered.sourceId);
   assert.equal((await loadDashboard(db, principal)).sources.find((entry) => entry.id === registered.sourceId).status, "active");
+});
+
+test("delete_project removes the project from active surfaces while preserving an archival tombstone", async () => {
+  const db = await createTestDb();
+  const created = await executeCommand(db, principal, { action: "create_project", name: "Delete me", idempotencyKey: "delete-project-create" });
+  const organizationId = (await db.prepare("SELECT organization_id FROM projects WHERE id = ?").bind(created.projectId).first()).organization_id;
+
+  const deleted = await executeCommand(db, principal, { action: "delete_project", projectId: created.projectId, idempotencyKey: "delete-project" });
+  const replay = await executeCommand(db, principal, { action: "delete_project", projectId: created.projectId, idempotencyKey: "delete-project" });
+
+  assert.equal((await db.prepare("SELECT status FROM projects WHERE id = ?").bind(created.projectId).first()).status, "archived", "history is retained as an internal tombstone");
+  assert.equal((await loadDashboard(db, principal)).projects.some((project) => project.id === created.projectId), false, "deleted projects must disappear from the sidebar payload");
+  await assert.rejects(() => loadProjectView(db, organizationId, created.projectId), (error) => error.code === "NOT_FOUND");
+  await assert.rejects(
+    () => executeCommand(db, principal, { action: "update_project", projectId: created.projectId, name: "Should stay deleted", idempotencyKey: "update-deleted-project" }),
+    (error) => error.code === "NOT_FOUND",
+  );
+  assert.equal(replay.idempotentReplay, true, "retrying the original delete remains safe after the project disappears");
+  assert.equal(replay.projectRevision, deleted.projectRevision);
 });

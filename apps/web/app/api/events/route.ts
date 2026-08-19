@@ -12,7 +12,7 @@ export async function GET(request: Request) {
     const projectId = url.searchParams.get("projectId");
     const after = Number(url.searchParams.get("after") ?? 0);
     if (!projectId) return Response.json({ error: { code: "VALIDATION_FAILED", message: "projectId is required" } }, { status: 422 });
-    const project = await env.DB.prepare("SELECT id FROM projects WHERE id = ? AND organization_id = ?").bind(projectId, organizationId).first();
+    const project = await env.DB.prepare("SELECT id FROM projects WHERE id = ? AND organization_id = ? AND status <> 'archived'").bind(projectId, organizationId).first();
     if (!project) return Response.json({ error: { code: "NOT_FOUND", message: "Project not found" } }, { status: 404 });
 
     const encoder = new TextEncoder();

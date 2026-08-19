@@ -7,6 +7,7 @@
  * can drift — the mistake `PLANNING_INTELLIGENCE_ROADMAP.md` F14 records for the matcher.
  */
 import type { Maturity, Notification, Project, Resolution, Source, WorkEvent, WorkItem, WorkStatus } from "@/lib/contracts";
+import { normalizeSourcePresence } from "@/lib/presence";
 
 export type Row = Record<string, unknown>;
 
@@ -26,8 +27,11 @@ export function mapProject(row: Row): Project {
   return { id: text(row, "id"), name: text(row, "name"), description: text(row, "description"), directory: text(row, "directory"), gitRemote: nullable(row, "git_remote"), defaultBranch: text(row, "default_branch"), revision: number(row, "revision"), status: text(row, "status"), updatedAt: text(row, "updated_at"), gateProposals: settings.gateProposals === true };
 }
 
-export function mapSource(row: Row): Source {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), codingSpaceId: nullable(row, "coding_space_id"), provider: text(row, "provider") as Source["provider"], externalId: text(row, "external_id"), title: text(row, "title"), model: nullable(row, "model"), status: text(row, "status"), assurance: text(row, "assurance") as Source["assurance"], currentTaskIds: parseJson(text(row, "current_task_ids"), []), lastSeenAt: text(row, "last_seen_at"), agentAccountId: nullable(row, "agent_account_id"), agentAccountLabel: nullable(row, "agent_account_label"), credentialId: nullable(row, "credential_id"), accessBlocked: Boolean(row.access_blocked) };
+export function mapSource(row: Row, now = Date.now()): Source {
+  const lastSeenAt = text(row, "last_seen_at");
+  const status = normalizeSourcePresence(text(row, "status"), lastSeenAt, now);
+  const currentTaskIds = status === "ended" || status === "removed" ? [] : parseJson<string[]>(text(row, "current_task_ids"), []);
+  return { id: text(row, "id"), projectId: text(row, "project_id"), codingSpaceId: nullable(row, "coding_space_id"), provider: text(row, "provider") as Source["provider"], externalId: text(row, "external_id"), title: text(row, "title"), model: nullable(row, "model"), status, assurance: text(row, "assurance") as Source["assurance"], currentTaskIds, lastSeenAt, agentAccountId: nullable(row, "agent_account_id"), agentAccountLabel: nullable(row, "agent_account_label"), credentialId: nullable(row, "credential_id"), accessBlocked: Boolean(row.access_blocked) };
 }
 
 export function mapItem(row: Row): WorkItem {

@@ -15,6 +15,7 @@ import { accountDisplayName, agentAccountKey, normalizeAccountLabel, providerFam
 import { provenanceFor, type Provenance } from "@/lib/trust/provenance.ts";
 import { mapAlias, mapClaim, mapDependency, mapEvent, mapEvidence, mapItem, mapNotification, mapProject, mapSource, nullable, number, parseJson, text, type Row } from "@/lib/read/rows.ts";
 import { itemKeysFor } from "@/lib/read/project-view.ts";
+import { SOURCE_ENDED_AFTER_MS } from "@/lib/presence.ts";
 
 export type Principal = {
   userId: string;
@@ -183,8 +184,9 @@ async function removeGeneratedProjectShorthands(db: PgD1, organizationId: string
 
 export async function loadDashboard(db: PgD1, principal: Principal): Promise<DashboardState> {
   const organizationId = await organizationFor(db, principal);
+  const presenceNow = Date.now();
   const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows, claimRows] = await db.batch([
-    db.prepare("SELECT * FROM projects WHERE organization_id = ? ORDER BY updated_at DESC").bind(organizationId),
+    db.prepare("SELECT * FROM projects WHERE organization_id = ? AND status <> 'archived' ORDER BY updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM coding_spaces WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
     db.prepare("SELECT sources.*, (pab.credential_id IS NOT NULL) AS access_blocked FROM sources LEFT JOIN project_access_blocks pab ON pab.project_id = sources.project_id AND pab.credential_id = sources.credential_id WHERE sources.organization_id = ? ORDER BY sources.last_seen_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM work_items WHERE organization_id = ? AND archived_at IS NULL ORDER BY updated_at DESC").bind(organizationId),
@@ -202,7 +204,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     viewer: { id: principal.userId, name: principal.displayName, email: principal.email },
     projects: (projects.results as Row[]).map(mapProject),
     codingSpaces: (spaces.results as Row[]).map((row) => ({ id: text(row, "id"), projectId: text(row, "project_id"), label: text(row, "label"), safePath: text(row, "safe_path"), branch: text(row, "branch"), kind: text(row, "kind"), status: text(row, "status"), lastSeenAt: text(row, "last_seen_at") })),
-    sources: (sources.results as Row[]).map(mapSource),
+    sources: (sources.results as Row[]).map((row) => mapSource(row, presenceNow)),
     workItems: (items.results as Row[]).map(mapItem),
     events: (events.results as Row[]).map(mapEvent),
     notifications: (notifications.results as Row[]).map(mapNotification),
@@ -216,7 +218,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
 }
 
 async function ownedProject(db: PgD1, organizationId: string, projectId: string) {
-  const project = await db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ?").bind(projectId, organizationId).first<Row>();
+  const project = await db.prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ? AND status <> 'archived'").bind(projectId, organizationId).first<Row>();
   if (!project) throw domainError("NOT_FOUND", "Project not found", 404);
   return project;
 }
@@ -1574,7 +1576,7 @@ export async function getReadyWork(
  * hold on a task expires on its own after this, with no scheduler needed — readers simply
  * filter on `lease_expires_at > now()`. Long enough for a real task, short enough that an
  * abandoned session stops mattering before anyone notices. See finding F1. */
-const CLAIM_LEASE_MS = 45 * 60 * 1000;
+const CLAIM_LEASE_MS = SOURCE_ENDED_AFTER_MS;
 
 /**
  * Keeps `work_claims` in sync with a heartbeat's reported task IDs — the write side of
@@ -1615,17 +1617,19 @@ async function syncClaims(db: PgD1, sourceId: string, taskIds: string[], ended: 
 export async function updateSourceHeartbeat(db: PgD1, principal: Principal, input: { sourceId: string; state?: string; currentTaskIds?: string[]; end?: boolean }) {
   const organizationId = await organizationFor(db, principal);
   const taskIds = (input.currentTaskIds ?? []).slice(0, 100);
-  // A background heartbeat must not undo a person's explicit removal. Only the
-  // registerSourceSession reconnect path restores a removed session to active.
-  const result = await db.prepare("UPDATE sources SET status = CASE WHEN status = 'removed' THEN 'removed' ELSE ? END, current_task_ids = CASE WHEN status = 'removed' THEN '[]' ELSE ? END, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? RETURNING id, status")
-    .bind(input.end ? "ended" : input.state ?? "active", JSON.stringify(taskIds), input.sourceId, organizationId).first<Row>();
+  // Background traffic must not undo an explicit end or removal. A source that only
+  // *derived* as ended can still recover because derived state is never persisted; stored
+  // terminal states require the deliberate register/reconnect path.
+  const result = await db.prepare("UPDATE sources SET status = CASE WHEN status = 'removed' THEN 'removed' WHEN status = 'ended' AND ? = false THEN 'ended' ELSE ? END, current_task_ids = CASE WHEN status IN ('removed', 'ended') OR ? = true THEN '[]' ELSE ? END, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? RETURNING id, status")
+    .bind(Boolean(input.end), input.end ? "ended" : input.state ?? "active", Boolean(input.end), JSON.stringify(taskIds), input.sourceId, organizationId).first<Row>();
   if (!result) throw domainError("NOT_FOUND", "Source session not found", 404);
-  const removed = text(result, "status") === "removed";
+  const status = text(result, "status");
+  const terminal = status === "removed" || status === "ended";
   // input.currentTaskIds is undefined (as opposed to []) when a heartbeat only updates
   // presence and says nothing about current work; claims are left untouched in that case
   // rather than being wiped by an update that never meant to report on them.
-  if (removed || input.end || input.currentTaskIds !== undefined) await syncClaims(db, input.sourceId, removed ? [] : taskIds, removed || Boolean(input.end));
-  return { sourceId: input.sourceId, status: removed ? "removed" : input.end ? "ended" : input.state ?? "active" };
+  if (terminal || input.currentTaskIds !== undefined) await syncClaims(db, input.sourceId, terminal ? [] : taskIds, terminal);
+  return { sourceId: input.sourceId, status };
 }
 
 /**
