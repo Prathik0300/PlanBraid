@@ -113,6 +113,11 @@ test("ships the product UI, service worker, and manifest", async () => {
   assert.match(app, /Chats & agents/);
   assert.match(app, /EventSource/);
   assert.match(app, /Connect agent/);
+  assert.match(app, /action: "remove_source"/);
+  assert.match(app, /className="agent-delete"/);
+  assert.match(app, /className="agent-manage-identity"/);
+  assert.match(css, /\.agent-delete\s*\{[^}]*color:\s*#ff9ba2/);
+  assert.match(css, /\.agent-manage-identity \.provider-icon\s*\{[^}]*background:\s*transparent/);
   assert.match(css, /grid-template-columns:\s*var\(--rail\)/);
   assert.match(css, /prefers-reduced-motion/);
   assert.equal(JSON.parse(manifest).short_name, "Planbraid");

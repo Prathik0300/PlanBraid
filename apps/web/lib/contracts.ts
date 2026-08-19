@@ -190,6 +190,10 @@ export type Command =
   /** Renames how a source displays for this project. Cosmetic only — see
    * set_project_access for the real per-project access boundary. */
   | { action: "update_source"; projectId: string; sourceId: string; title: string; idempotencyKey: string }
+  /** Removes one session from the project's connected-agent surfaces without erasing
+   * its historical provenance. A later explicit reconnect of the same session restores
+   * it, while set_project_access remains the durable credential-level access control. */
+  | { action: "remove_source"; projectId: string; sourceId: string; idempotencyKey: string }
   /** The real access boundary update_source can't provide: blocks (or unblocks) the
    * credential behind a source from this one project, enforced server-side on every MCP
    * call, and unaffected by that credential reconnecting under a new session or marker. */

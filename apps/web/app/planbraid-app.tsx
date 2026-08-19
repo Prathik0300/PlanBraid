@@ -277,7 +277,10 @@ export function PlanbraidApp() {
 
   const project = data?.projects.find((entry) => entry.id === projectId) ?? null;
   const projectItems = useMemo(() => (data?.workItems ?? []).filter((item) => item.projectId === projectId), [data, projectId]);
-  const sources = useMemo(() => (data?.sources ?? []).filter((source) => source.projectId === projectId), [data, projectId]);
+  // Removed sessions stay available for historical provider/name attribution. Only the
+  // connected-agent surfaces hide them; reconnecting the same session restores it.
+  const projectSources = useMemo(() => (data?.sources ?? []).filter((source) => source.projectId === projectId), [data, projectId]);
+  const sources = useMemo(() => projectSources.filter((source) => source.status !== "removed"), [projectSources]);
   const proposals = useMemo(() => projectItems.filter((item) => isProposal(item) && !["done", "cancelled"].includes(item.status)), [projectItems]);
   // With gating on, unaccepted work leaves the board and lives in the Proposals queue
   // instead. Off by default, so an existing project's board is unchanged until someone
@@ -413,23 +416,23 @@ export function PlanbraidApp() {
         {newUpdates > 0 && <button className="new-updates" onClick={() => { setNewUpdates(0); window.scrollTo({ top: 0, behavior: "smooth" }); }}>↑ {newUpdates} new {newUpdates === 1 ? "update" : "updates"}</button>}
         <div className="workspace-body">
           {!project && <Empty title={`Welcome back, ${data!.viewer.name}`} body={data!.projects.length ? "Pick a project from the sidebar, create a new one, or connect an agent to get started." : "Create a project for organized tracking, or connect an agent now and create the project from your MCP client."} action="Create project" onAction={() => setCommandOpen("project")} secondaryAction="Connect agent" onSecondaryAction={() => setSetupOpen(true)} />}
-          {project && view === "stream" && <Stream events={events} items={projectItems} sources={sources} onItem={setSelectedItemId} />}
-          {project && view === "board" && <Board items={filteredItems} sources={sources} aliases={data?.aliases ?? []} dependencies={data?.dependencies ?? []} onItem={setSelectedItemId} onTransition={(item, status) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status, idempotencyKey: requestId("drag") }, `${item.itemKey} moved to ${statusMeta[status].label}`)} />}
+          {project && view === "stream" && <Stream events={events} items={projectItems} sources={projectSources} onItem={setSelectedItemId} />}
+          {project && view === "board" && <Board items={filteredItems} sources={projectSources} aliases={data?.aliases ?? []} dependencies={data?.dependencies ?? []} onItem={setSelectedItemId} onTransition={(item, status) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status, idempotencyKey: requestId("drag") }, `${item.itemKey} moved to ${statusMeta[status].label}`)} />}
           {project && view === "proposals" && <Proposals
-            items={proposals} sources={sources} busy={mutating} gated={project.gateProposals} onItem={setSelectedItemId}
+            items={proposals} sources={projectSources} busy={mutating} gated={project.gateProposals} onItem={setSelectedItemId}
             onAccept={(item) => void command({ action: "set_maturity", projectId: item.projectId, itemIds: [item.id], maturity: "accepted", idempotencyKey: requestId("accept") }, `${item.itemKey} accepted`)}
             onAcceptAll={() => void command({ action: "set_maturity", projectId, itemIds: proposals.map((item) => item.id), maturity: "accepted", idempotencyKey: requestId("accept-all") }, `${proposals.length} proposal${proposals.length === 1 ? "" : "s"} accepted`)}
             onReject={(item) => void command({ action: "transition_item", projectId: item.projectId, itemId: item.id, expectedVersion: item.version, status: "cancelled", resolution: "rejected", reason: "Rejected from the proposals queue", idempotencyKey: requestId("reject") }, `${item.itemKey} rejected`)}
             onToggleGate={() => void command({ action: "update_project", projectId, gateProposals: !project.gateProposals, idempotencyKey: requestId("gate") }, project.gateProposals ? "Proposals now appear on the board again" : "Proposals are kept off the board until accepted")}
           />}
           {project && view === "decisions" && <Decisions decisions={decisions} loading={decisionsLoading} items={projectItems} resolvingOptionId={resolvingDecision} onResolve={resolveDecisionChoice} onItem={setSelectedItemId} />}
-          {project && view === "list" && <ListView items={filteredItems} sources={sources} aliases={data?.aliases ?? []} onItem={setSelectedItemId} />}
+          {project && view === "list" && <ListView items={filteredItems} sources={projectSources} aliases={data?.aliases ?? []} onItem={setSelectedItemId} />}
           {project && view === "inbox" && <Inbox notifications={data!.notifications.filter((entry) => entry.projectId === projectId)} onOpen={(notification) => { if (notification.workItemId) setSelectedItemId(notification.workItemId); void command({ action: "mark_notification", notificationId: notification.id, read: true, idempotencyKey: requestId("read") }, "Notification marked read"); }} onResolve={(notification) => void command({ action: "mark_notification", notificationId: notification.id, read: true, resolved: true, idempotencyKey: requestId("resolve") }, "Action resolved")} />}
-          {project && view === "agents" && <Agents sources={sources} items={projectItems} claims={data?.claims ?? []} onSetup={() => setSetupOpen(true)} />}
+          {project && view === "agents" && <Agents sources={sources} items={projectItems} claims={data?.claims ?? []} busy={mutating} onSetup={() => setSetupOpen(true)} onDelete={(source) => void command({ action: "remove_source", projectId, sourceId: source.id, idempotencyKey: requestId("remove-source") }, `${sourceName(source, ambiguousFamiliesOf(sources))} removed from this project`)} />}
         </div>
         {project && view !== "inbox" && view !== "agents" && view !== "proposals" && <Composer project={project} sources={sources} busy={mutating} onCreate={(title, source) => void command({ action: "create_item", projectId, title, sourceId: source || undefined, status: "proposed", idempotencyKey: requestId("create") }, "Task added to the unified plan")} />}
       </section>
-      {selectedItem && <TaskDrawer item={selectedItem} source={sources.find((entry) => entry.id === selectedItem.sourceId) ?? null} sources={sources} events={(data?.events ?? []).filter((event) => event.workItemId === selectedItem.id)} evidence={(data?.evidence ?? []).filter((entry) => entry.workItemId === selectedItem.id)} dependencies={(data?.dependencies ?? []).filter((entry) => entry.fromWorkItemId === selectedItem.id || entry.toWorkItemId === selectedItem.id)} aliases={(data?.aliases ?? []).filter((entry) => entry.workItemId === selectedItem.id)} allItems={projectItems} viewerName={data!.viewer.name} busy={mutating} close={() => setSelectedItemId(null)} transition={(status, reason) => void command({ action: "transition_item", projectId: selectedItem.projectId, itemId: selectedItem.id, expectedVersion: selectedItem.version, status, reason, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("transition") }, `${selectedItem.itemKey} is now ${statusMeta[status].label}`)} note={(summary) => void command({ action: "add_note", projectId: selectedItem.projectId, itemId: selectedItem.id, summary, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("note") }, "Progress recorded")} splitAlias={(aliasId) => void command({ action: "split_alias", projectId: selectedItem.projectId, aliasId, idempotencyKey: requestId("split") }, "Moved back into its own task")} />}
+      {selectedItem && <TaskDrawer item={selectedItem} source={projectSources.find((entry) => entry.id === selectedItem.sourceId) ?? null} sources={projectSources} events={(data?.events ?? []).filter((event) => event.workItemId === selectedItem.id)} evidence={(data?.evidence ?? []).filter((entry) => entry.workItemId === selectedItem.id)} dependencies={(data?.dependencies ?? []).filter((entry) => entry.fromWorkItemId === selectedItem.id || entry.toWorkItemId === selectedItem.id)} aliases={(data?.aliases ?? []).filter((entry) => entry.workItemId === selectedItem.id)} allItems={projectItems} viewerName={data!.viewer.name} busy={mutating} close={() => setSelectedItemId(null)} transition={(status, reason) => void command({ action: "transition_item", projectId: selectedItem.projectId, itemId: selectedItem.id, expectedVersion: selectedItem.version, status, reason, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("transition") }, `${selectedItem.itemKey} is now ${statusMeta[status].label}`)} note={(summary) => void command({ action: "add_note", projectId: selectedItem.projectId, itemId: selectedItem.id, summary, sourceId: selectedItem.sourceId ?? undefined, idempotencyKey: requestId("note") }, "Progress recorded")} splitAlias={(aliasId) => void command({ action: "split_alias", projectId: selectedItem.projectId, aliasId, idempotencyKey: requestId("split") }, "Moved back into its own task")} />}
       {commandOpen && <CommandDialog projects={data!.projects} currentProject={projectId} initialMode={commandOpen === "project" ? "project" : "search"} busy={mutating} close={() => setCommandOpen(false)} create={async (input) => {
         const result = await command({ action: "create_project", name: input.name, description: input.description || undefined, gitRemote: input.gitRemote || undefined, idempotencyKey: requestId("project") }, (outcome) =>
           outcome.status === "matched" ? `Opened "${outcome.project?.name}" instead, the existing project for this ${outcome.matchedOn}`
@@ -500,7 +503,7 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
     <div className="rail-label">Chats & agents</div>
     <div className="agent-list"><button className={`source-row all-sources ${selectedSource === null ? "active" : ""}`} onClick={() => onSource(null)}><span className="all-agent-icon">◎</span><span><strong>All activity</strong><small>Every connected conversation</small></span></button>{sources.map((source) => <button key={source.id} className={`source-row ${selectedSource === source.id ? "active" : ""}`} onClick={() => onSource(source.id)}><ProviderIcon provider={source.provider} /><span><strong>{sourceName(source, railAmbiguousFamilies)}</strong><small>{source.title}</small></span><span className={`presence ${source.status}`} title={source.status} /></button>)}</div>
     <button className="rail-footer" onClick={onProfile}><span className="avatar">{avatarUrl ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(avatarUrl)})` }} aria-hidden="true" /> : data.viewer.name.slice(0, 1).toUpperCase()}</span><span><strong>{data.viewer.name}</strong><small>Account &amp; profile</small></span><b aria-hidden="true">›</b></button></>}
-    {managingProject && <AgentsManageDialog project={managingProject} sources={data.sources.filter((source) => source.projectId === managingProject.id)} busy={busy} command={command} close={() => setManagingProject(null)} onOpenAccountSetup={() => { setManagingProject(null); onOpenAccountSetup(); }} />}
+    {managingProject && <AgentsManageDialog project={managingProject} sources={data.sources.filter((source) => source.projectId === managingProject.id && source.status !== "removed")} busy={busy} command={command} close={() => setManagingProject(null)} onOpenAccountSetup={() => { setManagingProject(null); onOpenAccountSetup(); }} />}
   </aside>;
 }
 
@@ -554,13 +557,13 @@ function AgentsManageDialog({ project, sources, busy, command, close, onOpenAcco
         {sources.length ? sources.map((source) => <div className="agent-manage-row" key={source.id}>
           {renamingId === source.id
             ? <form className="connection-rename" onSubmit={(event) => { event.preventDefault(); void saveRename(source); }}><input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} maxLength={120} aria-label={`Rename ${source.title}`} /><button type="submit">Save</button><button type="button" onClick={() => setRenamingId(null)}>Cancel</button></form>
-            : <><ProviderIcon provider={source.provider} /><span><strong>{sourceName(source, ambiguousFamilies)}</strong><small>{source.title} · {source.accessBlocked ? "Blocked from this project" : `Last seen ${relative(source.lastSeenAt)}`}</small></span>
-              <button onClick={() => startRename(source)}>Rename</button>
-              <button
-                disabled={busy || !source.credentialId}
-                title={source.credentialId ? undefined : "This session connected before blocking existed here; it needs to reconnect once before it can be blocked"}
-                onClick={() => void command({ action: "set_project_access", projectId: project.id, credentialId: source.credentialId!, blocked: !source.accessBlocked, idempotencyKey: requestId("project-access") }, source.accessBlocked ? "Agent unblocked from this project" : "Agent blocked from this project")}
-              >{source.accessBlocked ? "Unblock" : "Block from this project"}</button></>}
+            : <><div className="agent-manage-identity"><ProviderIcon provider={source.provider} /><span className="agent-manage-copy"><strong>{sourceName(source, ambiguousFamilies)}</strong><small>{source.title} · {source.accessBlocked ? "Blocked from this project" : `Last seen ${relative(source.lastSeenAt)}`}</small></span></div>
+              <div className="agent-manage-actions"><button onClick={() => startRename(source)}>Rename</button>
+                <button
+                  disabled={busy || !source.credentialId}
+                  title={source.credentialId ? undefined : "This session connected before blocking existed here; it needs to reconnect once before it can be blocked"}
+                  onClick={() => void command({ action: "set_project_access", projectId: project.id, credentialId: source.credentialId!, blocked: !source.accessBlocked, idempotencyKey: requestId("project-access") }, source.accessBlocked ? "Agent unblocked from this project" : "Agent blocked from this project")}
+                >{source.accessBlocked ? "Unblock" : "Block from this project"}</button></div></>}
         </div>) : <p className="oauth-help">No agents have connected to this project yet.</p>}
       </div>
       <p className="oauth-help">Blocking is enforced on every call this connection makes for this project, and survives it reconnecting, though it can still use the same token or OAuth connection for your other projects. To cut off a connection everywhere, revoke it entirely in <button className="link-button" onClick={onOpenAccountSetup}>Setup → Connected apps</button>.</p>
@@ -1022,8 +1025,9 @@ function Inbox({ notifications, onOpen, onResolve }: { notifications: Notificati
 /** M14: "who holds what, and for how long" - read from live work_claims leases (F1), not
  * from sourceId (who originally proposed an item). A session can hold work someone else
  * created, and conflating the two would show the wrong agent as the active holder. */
-function Agents({ sources, items, claims, onSetup }: { sources: Source[]; items: WorkItem[]; claims: DashboardState["claims"]; onSetup: () => void }) {
+function Agents({ sources, items, claims, busy, onSetup, onDelete }: { sources: Source[]; items: WorkItem[]; claims: DashboardState["claims"]; busy: boolean; onSetup: () => void; onDelete: (source: Source) => void }) {
   const agentAmbiguousFamilies = ambiguousFamiliesOf(sources);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   return <div className="agents-view"><div className="inbox-heading"><span><h2>Connected agents</h2><p>Sessions, coding spaces, capture assurance, and current work.</p></span></div><div className="agent-grid">{sources.map((source) => {
     const held = claims.filter((claim) => claim.sourceId === source.id).map((claim) => ({ claim, item: items.find((entry) => entry.id === claim.workItemId) })).filter((entry): entry is { claim: DashboardState["claims"][number]; item: WorkItem } => entry.item != null);
     return <article className="agent-card" key={source.id}><header><ProviderIcon provider={source.provider} /><span><h3>{sourceName(source, agentAmbiguousFamilies)}</h3><p>{source.model ?? "Agent session"}</p></span><span className={`agent-status ${source.status}`}>{source.status}</span></header><h4>{source.title}</h4><div className="assurance-line"><Assurance value={source.assurance} /><span>Last event {relative(source.lastSeenAt)}</span></div><div className="agent-work">{held.length ? held.map(({ claim, item }) => <span key={claim.id}><b>{item.itemKey}</b> {item.title} <small>holds for {expiresIn(claim.leaseExpiresAt)}</small></span>) : <span className="muted">Holding nothing right now</span>}</div>
@@ -1032,7 +1036,13 @@ function Agents({ sources, items, claims, onSetup }: { sources: Source[]; items:
           honest about that, and takes you to the same connection instructions
           "Connect agent" already shows, to paste back into this specific agent, rather
           than silently marking the card active while nothing has actually reconnected. */}
-      {source.status !== "active" && <button className="agent-reconnect" onClick={onSetup}>Reconnect {sourceName(source, agentAmbiguousFamilies)}</button>}
+      <div className="agent-card-actions">
+        {source.status !== "active" && <button className="agent-reconnect" onClick={onSetup}>Reconnect {sourceName(source, agentAmbiguousFamilies)}</button>}
+        <button className="agent-delete" disabled={busy} onClick={() => {
+          if (confirmingDeleteId === source.id) { setConfirmingDeleteId(null); onDelete(source); }
+          else setConfirmingDeleteId(source.id);
+        }}>{confirmingDeleteId === source.id ? "Confirm delete" : "Delete"}</button>
+      </div>
     </article>;
   })}</div></div>;
 }

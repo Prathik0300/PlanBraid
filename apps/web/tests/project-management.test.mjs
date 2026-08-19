@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { executeCommand, loadDashboard } from "@/lib/store.ts";
+import { executeCommand, loadDashboard, registerSourceSession, updateSourceHeartbeat } from "@/lib/store.ts";
 import { createTestDb } from "./support/local-pg.mjs";
 import { principal } from "./support/fixtures.mjs";
 
@@ -83,4 +83,29 @@ test("replaying the same update_project key returns the first result rather than
 
   assert.equal(replay.projectRevision, first.projectRevision);
   assert.equal(replay.idempotentReplay, true);
+});
+
+test("remove_source hides one project session without deleting its historical provenance", async () => {
+  const db = await createTestDb();
+  const { projectId } = await executeCommand(db, principal, { action: "create_project", name: "Agent cleanup", idempotencyKey: "p7" });
+  const registered = await registerSourceSession(db, principal, { projectId, provider: "cursor", externalId: "cursor-session-1", title: "Cursor plan" });
+  const created = await executeCommand(db, principal, { action: "create_item", projectId, title: "Historical work", sourceId: registered.sourceId, idempotencyKey: "agent-item" });
+
+  const removed = await executeCommand(db, principal, { action: "remove_source", projectId, sourceId: registered.sourceId, idempotencyKey: "remove-agent" });
+  const dashboard = await loadDashboard(db, principal);
+  const source = dashboard.sources.find((entry) => entry.id === registered.sourceId);
+  const item = dashboard.workItems.find((entry) => entry.id === created.itemId);
+
+  assert.equal(source.status, "removed");
+  assert.equal(item.sourceId, registered.sourceId, "removing a card must not erase historical attribution");
+  assert.equal(dashboard.events.some((event) => event.eventType === "source.removed" && event.sourceId === registered.sourceId), true);
+  assert.equal(removed.projectRevision, 3);
+
+  const heartbeat = await updateSourceHeartbeat(db, principal, { sourceId: registered.sourceId, state: "active", currentTaskIds: [created.itemId] });
+  assert.equal(heartbeat.status, "removed", "a background heartbeat must not undo an explicit removal");
+  assert.equal((await db.prepare("SELECT COUNT(*)::int AS count FROM work_claims WHERE source_id = ?").bind(registered.sourceId).first()).count, 0);
+
+  const reconnected = await registerSourceSession(db, principal, { projectId, provider: "cursor", externalId: "cursor-session-1", title: "Cursor plan" });
+  assert.equal(reconnected.sourceId, registered.sourceId);
+  assert.equal((await loadDashboard(db, principal)).sources.find((entry) => entry.id === registered.sourceId).status, "active");
 });

@@ -438,6 +438,25 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     return response;
   }
 
+  if (command.action === "remove_source") {
+    const source = await db.prepare("SELECT id, title, provider, agent_account_label FROM sources WHERE id = ? AND project_id = ? AND organization_id = ?").bind(command.sourceId, command.projectId, organizationId).first<Row>();
+    if (!source) throw domainError("NOT_FOUND", "Agent session not found in this project", 404);
+    const response = { projectId: command.projectId, sourceId: command.sourceId, projectRevision: nextRevision };
+    await commitMutation(db, [
+      // Source IDs are durable provenance referenced by work, evidence, interactions and
+      // events, so this is a soft delete. An explicit reconnect changes it back to active.
+      db.prepare("UPDATE sources SET status = 'removed', current_task_ids = '[]', updated_at = ? WHERE id = ? AND project_id = ? AND organization_id = ?")
+        .bind(now, command.sourceId, command.projectId, organizationId),
+      db.prepare("DELETE FROM work_claims WHERE source_id = ?").bind(command.sourceId),
+      db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND revision = ?")
+        .bind(nextRevision, now, command.projectId, organizationId, currentRevision),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, source_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, 'source.removed', ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, nextRevision, command.sourceId, principal.displayName, `${principal.displayName} removed ${actorNameFor(text(source, "provider"), nullable(source, "agent_account_label"))} from this project`, now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    return response;
+  }
+
   if (command.action === "set_project_access") {
     const response = { projectId: command.projectId, credentialId: command.credentialId, blocked: command.blocked };
     await commitMutation(db, [
@@ -1596,13 +1615,17 @@ async function syncClaims(db: PgD1, sourceId: string, taskIds: string[], ended: 
 export async function updateSourceHeartbeat(db: PgD1, principal: Principal, input: { sourceId: string; state?: string; currentTaskIds?: string[]; end?: boolean }) {
   const organizationId = await organizationFor(db, principal);
   const taskIds = (input.currentTaskIds ?? []).slice(0, 100);
-  const result = await db.prepare("UPDATE sources SET status = ?, current_task_ids = ?, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? RETURNING id").bind(input.end ? "ended" : input.state ?? "active", JSON.stringify(taskIds), input.sourceId, organizationId).first();
+  // A background heartbeat must not undo a person's explicit removal. Only the
+  // registerSourceSession reconnect path restores a removed session to active.
+  const result = await db.prepare("UPDATE sources SET status = CASE WHEN status = 'removed' THEN 'removed' ELSE ? END, current_task_ids = CASE WHEN status = 'removed' THEN '[]' ELSE ? END, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? RETURNING id, status")
+    .bind(input.end ? "ended" : input.state ?? "active", JSON.stringify(taskIds), input.sourceId, organizationId).first<Row>();
   if (!result) throw domainError("NOT_FOUND", "Source session not found", 404);
+  const removed = text(result, "status") === "removed";
   // input.currentTaskIds is undefined (as opposed to []) when a heartbeat only updates
   // presence and says nothing about current work; claims are left untouched in that case
   // rather than being wiped by an update that never meant to report on them.
-  if (input.end || input.currentTaskIds !== undefined) await syncClaims(db, input.sourceId, taskIds, Boolean(input.end));
-  return { sourceId: input.sourceId, status: input.end ? "ended" : input.state ?? "active" };
+  if (removed || input.end || input.currentTaskIds !== undefined) await syncClaims(db, input.sourceId, removed ? [] : taskIds, removed || Boolean(input.end));
+  return { sourceId: input.sourceId, status: removed ? "removed" : input.end ? "ended" : input.state ?? "active" };
 }
 
 /**
