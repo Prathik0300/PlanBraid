@@ -1231,37 +1231,69 @@ export async function registerSourceSession(db: PgD1, principal: Principal, inpu
   // no distinguishing credential at all.
   const accountId = principal.agentAccountId ?? null;
   const accountLabel = principal.agentAccountLabel ?? normalizeAccountLabel(input.accountLabel);
-  let externalId = requestedExternalId;
-  const existing = await db.prepare("SELECT id, agent_account_id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string; agent_account_id: string | null }>();
-  if (existing) {
-    // Same conversation id, different agent login. sources' UNIQUE key predates agent
-    // accounts and cannot separate them, so rather than let one account silently adopt
-    // another's session, fork onto a deterministic id derived from the account. Only
-    // reachable when a client reuses a fixed session id across accounts; per-conversation
-    // UUIDs never collide here.
-    if (accountId && existing.agent_account_id && existing.agent_account_id !== accountId) {
-      externalId = `${requestedExternalId}::${accountId}`.slice(0, 240);
-    } else {
-      await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label), credential_id = COALESCE(?, credential_id) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountId, accountLabel, principal.credentialId ?? null, existing.id).run();
-      return { sourceId: existing.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, existing.id), existingWork };
+  const credentialId = principal.credentialId ?? null;
+  const endedBefore = new Date(Date.now() - SOURCE_ENDED_AFTER_MS).toISOString();
+
+  // Registration is the lifecycle boundary between external conversations and durable
+  // Planbraid source cards. Serialize it per project/provider so two fresh conversations
+  // cannot both adopt the same ended card (or race on the external-id unique key).
+  return db.transaction(async (tx) => {
+    await tx.lock(`planbraid:register_source:${input.projectId}:${provider}`);
+    let externalId = requestedExternalId;
+    const existing = await tx.prepare("SELECT id, agent_account_id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string; agent_account_id: string | null }>();
+    if (existing) {
+      // Same conversation id, different agent login. sources' UNIQUE key predates agent
+      // accounts and cannot separate them, so rather than let one account silently adopt
+      // another's session, fork onto a deterministic id derived from the account. Only
+      // reachable when a client reuses a fixed session id across accounts; per-conversation
+      // UUIDs never collide here.
+      if (accountId && existing.agent_account_id && existing.agent_account_id !== accountId) {
+        externalId = `${requestedExternalId}::${accountId}`.slice(0, 240);
+      } else {
+        await tx.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label), credential_id = COALESCE(?, credential_id) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountId, accountLabel, credentialId, existing.id).run();
+        return { sourceId: existing.id, idempotentReplay: true, resumed: false, pendingImportRequest: await pendingImportForSource(tx, input.projectId, existing.id), existingWork };
+      }
     }
-  }
-  const forked = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
-  if (forked) {
-    await db.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_label = COALESCE(?, agent_account_label), credential_id = COALESCE(?, credential_id) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountLabel, principal.credentialId ?? null, forked.id).run();
-    return { sourceId: forked.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, forked.id), existingWork };
-  }
-  const sourceId = id("src");
-  // Two concurrent register_agent_session calls for the same (project, provider,
-  // external_id) can both reach here believing no source exists yet (Postgres runs
-  // them in true parallel, unlike D1 which serialized every query). The losing insert
-  // hits sources' UNIQUE(project_id, provider, external_id), not the id primary key, so
-  // re-select on conflict rather than assume this insert is the row that landed.
-  const inserted = await db.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance, agent_account_id, agent_account_label, credential_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?) ON CONFLICT (project_id, provider, external_id) DO NOTHING RETURNING id")
-    .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed", accountId, accountLabel, principal.credentialId ?? null).first<{ id: string }>();
-  if (inserted) return { sourceId: inserted.id, idempotentReplay: false, pendingImportRequest: await pendingImportForSource(db, input.projectId, inserted.id), existingWork };
-  const winner = await db.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
-  return { sourceId: winner!.id, idempotentReplay: true, pendingImportRequest: await pendingImportForSource(db, input.projectId, winner!.id), existingWork };
+    const forked = await tx.prepare("SELECT id FROM sources WHERE project_id = ? AND provider = ? AND external_id = ?").bind(input.projectId, provider, externalId).first<{ id: string }>();
+    if (forked) {
+      await tx.prepare("UPDATE sources SET status = 'active', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, title = COALESCE(?, title), model = COALESCE(?, model), agent_account_label = COALESCE(?, agent_account_label), credential_id = COALESCE(?, credential_id) WHERE id = ?").bind(input.title ?? null, input.model ?? null, accountLabel, credentialId, forked.id).run();
+      return { sourceId: forked.id, idempotentReplay: true, resumed: false, pendingImportRequest: await pendingImportForSource(tx, input.projectId, forked.id), existingWork };
+    }
+
+    // Active sessions remain distinct so simultaneous conversations can hold independent
+    // claims and presence. A genuinely ended session, whether explicitly ended or expired
+    // by the shared server freshness policy, is instead the same agent returning to the
+    // same project. Rebind that durable source to the new external conversation ID.
+    const identitySql = accountId
+      ? "agent_account_id = ?"
+      : credentialId
+        ? "agent_account_id IS NULL AND credential_id = ?"
+        : accountLabel
+          ? "agent_account_id IS NULL AND credential_id IS NULL AND agent_account_label = ?"
+          : "agent_account_id IS NULL AND credential_id IS NULL AND agent_account_label IS NULL";
+    const identityValue = accountId ?? credentialId ?? accountLabel;
+    const reusableQuery = `SELECT id FROM sources
+      WHERE project_id = ? AND organization_id = ? AND provider = ?
+        AND ${identitySql}
+        AND (status = 'ended' OR (status NOT IN ('ended', 'removed') AND last_seen_at <= ?::timestamptz))
+      ORDER BY last_seen_at DESC, updated_at DESC, id ASC
+      LIMIT 1`;
+    const reusableStatement = tx.prepare(reusableQuery);
+    const reusable = identityValue === null
+      ? await reusableStatement.bind(input.projectId, organizationId, provider, endedBefore).first<{ id: string }>()
+      : await reusableStatement.bind(input.projectId, organizationId, provider, identityValue, endedBefore).first<{ id: string }>();
+    if (reusable) {
+      await tx.prepare("UPDATE sources SET external_id = ?, coding_space_id = COALESCE(?, coding_space_id), title = COALESCE(?, title), model = COALESCE(?, model), status = 'active', assurance = COALESCE(?, assurance), current_task_ids = '[]', last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, agent_account_id = COALESCE(?, agent_account_id), agent_account_label = COALESCE(?, agent_account_label), credential_id = COALESCE(?, credential_id) WHERE id = ?")
+        .bind(externalId, input.codingSpaceId ?? null, input.title?.slice(0, 240) ?? null, input.model?.slice(0, 120) ?? null, input.assurance ?? null, accountId, accountLabel, credentialId, reusable.id).run();
+      await tx.prepare("DELETE FROM work_claims WHERE source_id = ?").bind(reusable.id).run();
+      return { sourceId: reusable.id, idempotentReplay: false, resumed: true, pendingImportRequest: await pendingImportForSource(tx, input.projectId, reusable.id), existingWork };
+    }
+
+    const sourceId = id("src");
+    await tx.prepare("INSERT INTO sources (id, organization_id, project_id, coding_space_id, provider, external_id, title, model, status, assurance, agent_account_id, agent_account_label, credential_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)")
+      .bind(sourceId, organizationId, input.projectId, input.codingSpaceId ?? null, provider, externalId, input.title?.slice(0, 240) || `${provider} session`, input.model?.slice(0, 120) ?? null, input.assurance ?? "instructed", accountId, accountLabel, credentialId).run();
+    return { sourceId, idempotentReplay: false, resumed: false, pendingImportRequest: await pendingImportForSource(tx, input.projectId, sourceId), existingWork };
+  });
 }
 
 /**

@@ -151,7 +151,7 @@ async function callTool(db: PgD1, principal: Principal, name: string, args: Json
     const outcome = await createWorkItemsDeduplicated(db, principal, {
       projectId, sourceId, importRequestId: optional(args, "import_request_id"), idempotencyKey,
       proposals: items.slice(0, 50).map((item) => ({
-        ref: optional(item, "ref"), title: required(item, "title"), description: optional(item, "description"),
+        ref: optional(item, "ref"), title: required(item, "title"), description: detailedDescription(item, "description"),
         status: optional(item, "status"), priority: optional(item, "priority"),
         dependsOn: Array.isArray(item.depends_on) ? item.depends_on.map(String) : undefined,
       })),
@@ -169,7 +169,7 @@ async function callTool(db: PgD1, principal: Principal, name: string, args: Json
     if (!ids.length) throw toolError("VALIDATION_FAILED", "At least one work_item_id is required", 422);
     return executeCommand(db, principal, { action: "set_maturity", projectId: required(args, "project_id"), itemIds: ids, maturity: "accepted", statedBy: required(args, "stated_by"), reason: optional(args, "reason"), sourceId: optional(args, "source_id"), idempotencyKey: required(args, "idempotency_key") });
   }
-  if (name === "update_work_item") return executeCommand(db, principal, { action: "update_item", projectId: required(args, "project_id"), itemId: required(args, "work_item_id"), expectedVersion: Number(args.expected_version), sourceId: optional(args, "source_id"), title: optional(args, "title"), description: optional(args, "description"), priority: optional(args, "priority") as never, assignee: args.assignee == null ? args.assignee as null | undefined : String(args.assignee), idempotencyKey: required(args, "idempotency_key") });
+  if (name === "update_work_item") return executeCommand(db, principal, { action: "update_item", projectId: required(args, "project_id"), itemId: required(args, "work_item_id"), expectedVersion: Number(args.expected_version), sourceId: optional(args, "source_id"), title: optional(args, "title"), description: optionalDetailedDescription(args, "description"), priority: optional(args, "priority") as never, assignee: args.assignee == null ? args.assignee as null | undefined : String(args.assignee), idempotencyKey: required(args, "idempotency_key") });
   if (name === "start_work") {
     return startWork(db, principal, {
       projectId: required(args, "project_id"), itemId: required(args, "work_item_id"), expectedVersion: Number(args.expected_version),
@@ -357,6 +357,24 @@ function conciseResult(name: string, result: Json) {
 }
 function required(object: Json, key: string) { const value = object[key]; if (value == null || String(value).trim() === "") throw toolError("VALIDATION_FAILED", `${key} is required`, 422); return String(value); }
 function optional(object: Json, key: string) { return object[key] == null ? undefined : String(object[key]); }
+// The tools/list schema alone can't force a real description out of a caller: the
+// low-level Server never validates arguments against it (only that "arguments" itself
+// is an object), so a client that ignores the schema would otherwise sail straight
+// through with an empty or one-word placeholder. A length floor can't verify quality,
+// but it does reject the laziest failure mode outright instead of only asking nicely.
+function detailedDescription(object: Json, key: string) {
+  const value = required(object, key);
+  if (value.trim().length < 20) throw toolError("VALIDATION_FAILED", `${key} must actually describe the work (what changes, acceptance criteria, known constraints), not a restatement of the title or a placeholder`, 422);
+  return value;
+}
+// update_work_item's description is a genuine partial-update field (omitted means
+// "leave it alone"), so this only enforces the same floor when a value is actually
+// being set, never presence.
+function optionalDetailedDescription(object: Json, key: string) {
+  const value = optional(object, key);
+  if (value !== undefined && value.trim().length < 20) throw toolError("VALIDATION_FAILED", `${key} must actually describe the work (what changes, acceptance criteria, known constraints), not a restatement of the title or a placeholder`, 422);
+  return value;
+}
 function toolError(code: string, message: string, status = 422) { return Object.assign(new Error(message), { code, status }); }
 
 /** The method name a tool call needs work:read vs work:write for, or the fixed scope a

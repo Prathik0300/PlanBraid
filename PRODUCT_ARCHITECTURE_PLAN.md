@@ -623,7 +623,12 @@ These tools augment the task tools without forcing ordinary mutations through a 
 Input: project/coding-space hints, provider, external session ID, model, safe title, capabilities, privacy mode.  
 Output: Relayboard source/session ID, project resolution, session token/handle, project revision.
 
-The tool is idempotent on provider installation plus external session ID.
+The tool is idempotent on provider installation plus external session ID. A different
+external session ID reuses the most recently ended source for the same project, provider,
+and authenticated agent account; a still-active source remains separate so concurrent
+conversations can coexist. Reuse preserves the durable source ID and provenance while
+rebinding the card to the new external session. Project-removed sources are not implicit
+reuse candidates.
 
 #### `begin_interaction`
 
@@ -953,7 +958,7 @@ Each session row shows:
 - project and source chat title;
 - state: active, idle, ended, unknown;
 - presence is normalized on server reads rather than trusting the last client status forever: a source is active for two minutes after its latest registration or heartbeat, idle until the existing 45-minute work-claim lease expires, then ended;
-- explicit `end_agent_session` and project-scoped removal are authoritative terminal states; only a new `register_agent_session` call reconnects them;
+- explicit `end_agent_session` and project-scoped removal are authoritative terminal states; a new `register_agent_session` reconnects an ended source for the same provider account, while a removed source is reused only by an explicit registration of that exact external session;
 - current claimed work items;
 - tasks created/updated/completed;
 - last event and capture quality;

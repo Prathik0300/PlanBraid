@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { actorNameFor, createMcpToken, executeCommand, getReadyWork, loadDashboard, organizationFor, principalFromBearer, registerSourceSession } from "@/lib/store.ts";
+import { actorNameFor, createMcpToken, executeCommand, getReadyWork, loadDashboard, organizationFor, principalFromBearer, registerSourceSession, updateSourceHeartbeat } from "@/lib/store.ts";
 import { accountDisplayName, agentAccountKey, normalizeAccountLabel, providerFamily } from "@/lib/providers.ts";
 import { createTestDb } from "./support/local-pg.mjs";
 import { principal, setupProject, createItem } from "./support/fixtures.mjs";
@@ -26,7 +26,7 @@ async function connect(db, name, marker) {
 }
 
 async function sourceRow(db, sourceId) {
-  return db.prepare("SELECT provider, external_id, agent_account_id, agent_account_label FROM sources WHERE id = ?").bind(sourceId).first();
+  return db.prepare("SELECT provider, external_id, title, status, agent_account_id, agent_account_label FROM sources WHERE id = ?").bind(sourceId).first();
 }
 
 test("one credential, two ?agent= markers: two accounts, not one", async () => {
@@ -89,6 +89,49 @@ test("the same account across two conversations is one account and two sessions"
   assert.notEqual(first.sourceId, second.sourceId, "each conversation is its own session");
   const rows = [await sourceRow(db, first.sourceId), await sourceRow(db, second.sourceId)];
   assert.equal(new Set(rows.map((row) => row.agent_account_id)).size, 1, "but both belong to one account");
+});
+
+test("a new conversation reuses the same account's ended card for every provider", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+
+  for (const provider of ["codex", "claude", "cursor"]) {
+    const account = await connect(db, `${provider} account`);
+    const first = await registerSourceSession(db, account, { projectId, provider, externalId: `${provider}-old`, title: `${provider} old conversation` });
+    await updateSourceHeartbeat(db, account, { sourceId: first.sourceId, end: true });
+
+    const resumed = await registerSourceSession(db, account, { projectId, provider, externalId: `${provider}-new`, title: `${provider} new conversation` });
+    assert.equal(resumed.sourceId, first.sourceId, `${provider} should keep its durable project card`);
+    assert.equal(resumed.resumed, true);
+    assert.equal(resumed.idempotentReplay, false, "a different external conversation is a resume, not an idempotent replay");
+    assert.deepEqual(
+      await sourceRow(db, resumed.sourceId),
+      {
+        provider,
+        external_id: `${provider}-new`,
+        title: `${provider} new conversation`,
+        status: "active",
+        agent_account_id: account.agentAccountId,
+        agent_account_label: `${provider} account`,
+      },
+    );
+    assert.equal((await db.prepare("SELECT COUNT(*)::int AS count FROM sources WHERE project_id = ? AND provider = ?").bind(projectId, provider).first()).count, 1);
+  }
+});
+
+test("an ended card is never reused by a different account", async () => {
+  const db = await createTestDb();
+  const projectId = await setupProject(db);
+  const personal = await connect(db, "Codex personal");
+  const work = await connect(db, "Codex work");
+
+  const ended = await registerSourceSession(db, personal, { projectId, provider: "codex", externalId: "personal-old" });
+  await updateSourceHeartbeat(db, personal, { sourceId: ended.sourceId, end: true });
+  const registered = await registerSourceSession(db, work, { projectId, provider: "codex", externalId: "work-new" });
+
+  assert.notEqual(registered.sourceId, ended.sourceId);
+  assert.equal(registered.resumed, false);
+  assert.equal((await sourceRow(db, ended.sourceId)).status, "ended");
 });
 
 test("a second account reusing a session id gets its own source instead of adopting the first", async () => {
