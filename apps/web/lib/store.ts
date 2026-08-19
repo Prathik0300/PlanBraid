@@ -1,6 +1,6 @@
 import { ensureSchema } from "@/db/setup";
 import type { PgD1, PgD1PreparedStatement } from "@/db/pg-d1";
-import { AGENT_WRITABLE_MATURITIES, MATURITIES, RESOLUTIONS, type Authority, type Command, type DashboardState, type Maturity, type Resolution, type WorkItem, type WorkStatus } from "@/lib/contracts";
+import { AGENT_WRITABLE_MATURITIES, ALLOWED_TRANSITIONS, MATURITIES, RESOLUTIONS, type Authority, type Command, type DashboardState, type Maturity, type Resolution, type WorkItem, type WorkStatus } from "@/lib/contracts";
 import type { Proposal } from "@/lib/dedup/match.ts";
 import { aliasStatement, resolveProposals } from "@/lib/dedup/resolve.ts";
 import { edgeTypeForRelation } from "@/lib/dedup/relations.ts";
@@ -44,17 +44,10 @@ export type Principal = {
 // pre-execution status is therefore legal. This removes no protection that existed:
 // proposed -> ready -> in_progress was always two permitted calls, so the ladder never
 // gated acceptance, and blocked -> in_progress is likewise long-permitted-and-flagged
-// (see isStartedWhileBlocked) rather than forbidden.
-const ALLOWED_TRANSITIONS: Record<WorkStatus, WorkStatus[]> = {
-  proposed: ["planned", "ready", "in_progress", "cancelled"],
-  planned: ["ready", "in_progress", "blocked", "cancelled"],
-  ready: ["in_progress", "blocked", "cancelled"],
-  in_progress: ["blocked", "in_review", "done", "cancelled"],
-  blocked: ["ready", "in_progress", "cancelled"],
-  in_review: ["done", "in_progress", "blocked", "cancelled"],
-  done: ["ready", "in_progress", "cancelled"],
-  cancelled: ["proposed", "planned"],
-};
+// (see isStartedWhileBlocked) rather than forbidden. Defined in lib/contracts.ts, not
+// here: the client's status dropdown needs this exact table too, to stop offering a
+// transition the server will reject, and contracts.ts is the shared, DB-free module
+// both sides can import.
 
 /** A resolved item can never leave anything blocked on it. Cancelled counts as resolved
  * exactly like done: if it didn't, cancelling an upstream task would deadlock its whole

@@ -26,19 +26,29 @@ test("an actor's assertion always wins over topology, regardless of blockingCoun
 });
 
 test("unratified work is unaffected when nothing blocks it: it stays where its status says", () => {
-  for (const status of ["proposed", "planned", "ready"]) {
+  for (const status of ["proposed", "planned"]) {
     assert.equal(deriveColumn(raw(status, 0)), status);
   }
+});
+
+test("a stored 'ready' on unratified work is never shown as ready: getReadyWork would refuse it", () => {
+  // Reachable by hand: the drawer's Status dropdown can set 'ready' directly, and nothing
+  // stops that on a proposal. deriveColumn and getReadyWork's SQL are documented as unable
+  // to diverge on what counts as actionable, so the column must not assert 'ready' here
+  // either - it downgrades to 'planned' rather than echo a claim the agent queue rejects.
+  assert.equal(deriveColumn(raw("ready", 0)), "planned");
 });
 
 test("accepting unblocked work is what makes it ready, whatever its stored status says", () => {
   // The bug this replaced: set_maturity only ever writes `maturity`, and deriveColumn read
   // only {status, blockingCount}, so acceptance was computed from inputs it never touched
   // and provably could not move a single card.
-  for (const status of ["proposed", "planned", "ready"]) {
+  for (const status of ["proposed", "planned"]) {
     assert.equal(deriveColumn(raw(status, 0)), status, "a proposal is not ready no matter how clear the graph is");
     assert.equal(deriveColumn(ratified(status, 0)), "ready", "acceptance is what promotes it");
   }
+  assert.equal(deriveColumn(raw("ready", 0)), "planned", "a stored 'ready' predating acceptance downgrades rather than asserting readiness");
+  assert.equal(deriveColumn(ratified("ready", 0)), "ready", "acceptance is what promotes it");
   assert.equal(deriveColumn({ status: "proposed", blockingCount: 0, maturity: "committed", deferredUntil: null }), "ready", "committed counts as ratified too");
 });
 
@@ -63,13 +73,24 @@ test("a live deferral is never ready, however clear the graph is", () => {
   assert.equal(deriveColumn({ status: "proposed", blockingCount: 0, maturity: "accepted", deferredUntil: past }), "ready", "an expired deferral simply lapses, with no write");
 });
 
+test("a stored 'ready' under a live deferral downgrades to 'planned', not a lapsed-looking 'ready'", () => {
+  // Same reachable-by-hand path as the unratified case above: the dropdown can set
+  // 'ready' on an item that is separately deferred. getReadyWork's deferred_until clause
+  // would still refuse it, so the column must not claim otherwise.
+  const future = new Date(Date.now() + 86_400_000).toISOString();
+  assert.equal(deriveColumn({ status: "ready", blockingCount: 0, maturity: "accepted", deferredUntil: future }), "planned");
+});
+
 test("the full 8-status derivation table across maturity and topology", () => {
   // The rule, stated once independently of the implementation: assertions win; then a
-  // blocked prerequisite only alarms for work already scheduled; then acceptance promotes.
-  function expected(status, blockingCount, ratifiedItem) {
+  // blocked prerequisite only alarms for work already scheduled; then a stored 'ready'
+  // that isn't actually actionable (unratified, or still deferred) downgrades rather than
+  // asserting readiness the agent queue would refuse; then acceptance promotes.
+  function expected(status, blockingCount, actionable) {
     if (ASSERTION_WINS.has(status)) return status;
     if (blockingCount > 0) return status === "ready" ? "blocked" : status;
-    return ratifiedItem ? "ready" : status;
+    if (!actionable) return status === "ready" ? "planned" : status;
+    return "ready";
   }
   for (const status of STATUSES) {
     for (const blockingCount of [0, 2]) {

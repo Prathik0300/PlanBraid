@@ -95,12 +95,17 @@ export async function createSimplificationRun(db: PgD1, principal: Principal, in
     // Only worth saying when finishing it actually frees something; otherwise "do this
     // first" is just restating that the board has a ready column.
     if (!entry.unlockCount) continue;
+    // Up to 3 of these can be open findings at once, and none of them has a dependency
+    // on the others (getReadyWork already excludes anything blocked) — they are
+    // independent starting points, not competing claims to be done "first". Naming
+    // each one "first" produced multiple do_first cards each telling the user to start
+    // there, which reads as contradictory rather than as a set of options.
     findings.push({
       kind: "do_first",
       dedupeKey: `do_first:${entry.id}`,
       workItemId: entry.id,
       verdict: "informational",
-      reason: `Do ${entry.itemKey} first`,
+      reason: `${entry.itemKey} is ready to start`,
       detail: entry.reason,
     });
   }

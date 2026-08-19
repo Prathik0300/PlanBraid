@@ -1,6 +1,21 @@
 export const WORK_STATUSES = ["proposed", "planned", "ready", "in_progress", "blocked", "in_review", "done", "cancelled"] as const;
 export type WorkStatus = (typeof WORK_STATUSES)[number];
 
+/** Every legal manual transition out of a status, enforced server-side in
+ * lib/store.ts's transition_item handler and used client-side to keep the drawer's
+ * status dropdown from ever offering a move the server will reject. Lives here, not in
+ * lib/store.ts, because it is a pure domain rule both sides need and neither owns. */
+export const ALLOWED_TRANSITIONS: Record<WorkStatus, WorkStatus[]> = {
+  proposed: ["planned", "ready", "in_progress", "cancelled"],
+  planned: ["ready", "in_progress", "blocked", "cancelled"],
+  ready: ["in_progress", "blocked", "cancelled"],
+  in_progress: ["blocked", "in_review", "done", "cancelled"],
+  blocked: ["ready", "in_progress", "cancelled"],
+  in_review: ["done", "in_progress", "blocked", "cancelled"],
+  done: ["ready", "in_progress", "cancelled"],
+  cancelled: ["proposed", "planned"],
+};
+
 /**
  * Planning maturity: whether this is work yet, or still something somebody said.
  *

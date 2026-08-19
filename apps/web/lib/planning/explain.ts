@@ -114,7 +114,9 @@ export function explainCause(item: WorkItem, chain: Chain | null, claim: Claim, 
     const note = unaccepted.length
       ? ` ${unaccepted.join(", ")} ${unaccepted.length === 1 ? "is" : "are"} still only a proposal, so this is waiting on a decision, not on work.`
       : "";
-    return { cause: "blocked_by_dependency", summary: `${item.itemKey} ${chain.reason}.${note}`, detail: { ...base, blockedByChain: chain.itemKeys, unacceptedBlockers: unaccepted } };
+    // chain.reason already opens with the item's own key ("#21 is waiting on #20, ..."),
+    // from findBlockedChains — prepending it again here produced "#21 #21 is waiting on".
+    return { cause: "blocked_by_dependency", summary: `${chain.reason}.${note}`, detail: { ...base, blockedByChain: chain.itemKeys, unacceptedBlockers: unaccepted } };
   }
 
   // 4. An actor asserted a block that the graph doesn't know about — waiting on a person,
