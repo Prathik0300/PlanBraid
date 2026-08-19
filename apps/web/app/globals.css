@@ -11,7 +11,7 @@
 /* Every scroll container in the app hides its scrollbar this way, so a global rule
    covers all of them (board, dashboard, dialogs, and anything added later) instead of
    maintaining the same two declarations on each one individually. Scrolling itself is
-   untouched — only the track/thumb rendering is suppressed. */
+   untouched; only the track/thumb rendering is suppressed. */
 * { box-sizing: border-box; scrollbar-width: none; -ms-overflow-style: none; }
 *::-webkit-scrollbar { display: none; width: 0; height: 0; }
 /* Every numeric count badge in the app (tab unread counts, filter-bar counts, board
@@ -183,7 +183,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .provider-stack { display: flex; align-items: center; cursor: default; }
 /* Overlapping rather than side-by-side is what reads as "the same set of people/models"
    at a glance; the panel-color ring is what makes overlapping logos read as separate
-   items instead of one smudge. Each provider keeps its own background — only a border
+   items instead of one smudge. Each provider keeps its own background; only a border
    is added, so Claude's cream and Gemini's white stay visually distinct. */
 .provider-stack .provider-icon { width: 15px; height: 15px; font-size: 6px; margin-left: -5px; box-shadow: 0 0 0 1.5px var(--panel-2); }
 .provider-stack .provider-icon:first-child { margin-left: 0; }.task-card select { width: 100%; border: 0; border-top: 1px solid var(--line-soft); background: #13161b; color: var(--muted); font-size: 12px; padding: 5px 8px; outline: 0; }.priority { width: 3px; height: 13px; border-radius: 2px; background: var(--faint); display: inline-block; }.priority.urgent { background: var(--red); }.priority.high { background: var(--orange); }.priority.normal { background: var(--blue); }.priority.low { background: var(--green); }.blocker-copy { color: #e8a0a3; font-size: 12px; line-height: 1.35; }.alias-badge { font: 12px var(--font-geist-mono); color: var(--muted); background: var(--panel-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; line-height: 16px; cursor: default; }.alias-badge.corroborated { color: var(--green); background: #17231b; border-color: #38563f; }.anomaly-badge { font-size: 12px; color: var(--orange); background: #2a2013; border: 1px solid #5a4420; border-radius: 4px; padding: 0 5px; line-height: 16px; cursor: default; }.proposal-badge { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--blue); background: #141d2b; border: 1px solid #2f4767; border-radius: 4px; padding: 0 5px; line-height: 16px; cursor: default; }.resolution-copy { color: var(--muted); font-size: 12px; line-height: 1.35; }.why-not-done { color: var(--muted); font-size: 12px; line-height: 1.4; margin: 6px 0 0; font-style: italic; }
