@@ -211,7 +211,14 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .connection-scope-note strong { color: #cfe3ff; font-size: 12px; }
 .connection-scope-note span { color: var(--muted); font-size: 12px; line-height: 1.45; }
 
-.drawer-backdrop, .dialog-backdrop { position: fixed; z-index: 30; inset: 0; background: #05060899; display: flex; justify-content: flex-end; }.drawer-backdrop { z-index: 31; }.task-drawer { width: min(520px, 94vw); height: 100%; background: #111419; border-left: 1px solid #363c47; box-shadow: -20px 0 60px #0008; display: flex; flex-direction: column; overflow: hidden; animation: slide-in .18s ease-out; }.drawer-header { height: 49px; padding: 0 17px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; }.drawer-title { padding: 19px 20px 13px; }.drawer-title > small { font: 12px var(--font-geist-mono); }.drawer-title h2 { font-size: 20px; line-height: 1.25; margin: 7px 0 9px; }.drawer-title p { color: #aeb4bf; line-height: 1.5; margin: 0; font-size: 12px; }.drawer-title p.corroboration-banner { color: var(--green); margin-top: 9px; }.drawer-title p.anomaly-banner { color: var(--orange); margin-top: 9px; }.drawer-fields { padding: 0 20px 16px; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px; }.drawer-fields label { min-height: 50px; border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; color: var(--faint); font-size: 12px; display: flex; flex-direction: column; gap: 6px; }.drawer-fields select { border: 0; background: transparent; outline: 0; color: var(--text); font-size: 12px; }.drawer-fields strong { color: var(--text); font-size: 12px; font-weight: 540; display: flex; align-items: center; gap: 5px; text-transform: capitalize; }.priority-value.urgent { color: var(--red); }.priority-value.high { color: var(--orange); }
+.drawer-backdrop, .dialog-backdrop { position: fixed; z-index: 30; inset: 0; background: #05060899; display: flex; justify-content: flex-end; }.drawer-backdrop { z-index: 31; }
+/* Opened from inside an already-open Plan modal: no dimming, and pointer-events pass
+   straight through the empty backdrop to whatever the drawer is floating over, so the
+   modal underneath stays fully legible and clickable without the drawer closing first.
+   The drawer itself opts back into pointer-events so it stays interactive. */
+.drawer-backdrop.plan-linked { background: transparent; pointer-events: none; }
+.drawer-backdrop.plan-linked .task-drawer { pointer-events: auto; }
+.task-drawer { width: min(520px, 94vw); height: 100%; background: #111419; border-left: 1px solid #363c47; box-shadow: -20px 0 60px #0008; display: flex; flex-direction: column; overflow: hidden; animation: slide-in .18s ease-out; }.drawer-header { height: 49px; padding: 0 17px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; }.drawer-title { padding: 19px 20px 13px; }.drawer-title > small { font: 12px var(--font-geist-mono); }.drawer-title h2 { font-size: 20px; line-height: 1.25; margin: 7px 0 9px; }.drawer-title p { color: #aeb4bf; line-height: 1.5; margin: 0; font-size: 12px; }.drawer-title p.corroboration-banner { color: var(--green); margin-top: 9px; }.drawer-title p.anomaly-banner { color: var(--orange); margin-top: 9px; }.drawer-fields { padding: 0 20px 16px; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px; }.drawer-fields label { min-height: 50px; border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; color: var(--faint); font-size: 12px; display: flex; flex-direction: column; gap: 6px; }.drawer-fields select { border: 0; background: transparent; outline: 0; color: var(--text); font-size: 12px; }.drawer-fields strong { color: var(--text); font-size: 12px; font-weight: 540; display: flex; align-items: center; gap: 5px; text-transform: capitalize; }.priority-value.urgent { color: var(--red); }.priority-value.high { color: var(--orange); }
 .drawer-tabs { height: 38px; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line); padding: 0 20px; display: flex; gap: 17px; }.drawer-tabs button { border: 0; background: transparent; color: var(--muted); font-size: 12px; position: relative; }.drawer-tabs button.active { color: var(--text); }.drawer-tabs button.active::after { content: ""; position: absolute; height: 2px; background: var(--blue); bottom: 0; left: 0; right: 0; }.drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: 17px 20px 80px; }.drawer-body section { margin-bottom: 20px; }.drawer-body h3 { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px; }.confidence { display: flex; gap: 6px; }.confidence span { padding: 5px 8px; border: 1px solid #38563f; color: var(--green); background: #17231b; border-radius: 5px; text-transform: capitalize; font-size: 12px; }.blocker-panel { border: 1px solid #5a3036; background: #24181b; padding: 10px; border-radius: 7px; }.blocker-panel h3 { color: var(--red); }.blocker-panel p { color: #e6b4b6; font-size: 12px; margin: 0; }.dependency-row { display: grid; grid-template-columns: 48px 46px minmax(0,1fr); gap: 6px; min-height: 35px; align-items: center; border-top: 1px solid var(--line-soft); }
 .dependency-row[role="button"], .waiting-on-row[role="button"] { cursor: pointer; border-radius: 6px; margin: 0 -6px; padding: 0 6px; }
 .dependency-row[role="button"]:hover, .dependency-row[role="button"]:focus-visible, .waiting-on-row[role="button"]:hover, .waiting-on-row[role="button"]:focus-visible { background: var(--hover); outline: 0; }.dependency-row span { color: var(--blue); font-size: 12px; }
@@ -353,6 +360,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 :root[data-theme="light"] .endpoint-box code, :root[data-theme="light"] .token-box code { color:var(--text); }
 :root[data-theme="light"] .toast { background:#fff; color:var(--text); border-color:var(--line); box-shadow:0 12px 32px #35405230; }
 :root[data-theme="light"] .dialog-backdrop, :root[data-theme="light"] .drawer-backdrop { background:#2b30394d; }
+:root[data-theme="light"] .drawer-backdrop.plan-linked { background:transparent; }
 :root[data-theme="light"] .mobile-nav { background:#ffffffee; }
 :root[data-theme="light"] input, :root[data-theme="light"] select { color:var(--text); }
 :root[data-theme="light"] input::placeholder { color:var(--faint); opacity:1; }
@@ -658,11 +666,11 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .plan-wave h3 small { color: var(--faint); font-size: 12px; text-transform: none; letter-spacing: 0; }
 .plan-wave { display: flex; flex-direction: column; gap: 6px; }
 /* A flex row here let a long title push .plan-flag past the card's edge instead of
-   shrinking to fit, since flex's default min-content floor on the text span won.
-   A grid with explicit percentage tracks has no such floor: the badge column is always
-   exactly 15% and the text column always exactly 80%, so long text truncates inside its
-   own cell instead of ever pushing anything out. */
-.plan-step-row { display: grid; grid-template-columns: 80% 15%; column-gap: 5%; align-items: center; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); text-align: left; }
+   shrinking to fit, since flex's default min-content floor on the text span won. Grid
+   has the same floor on a bare 1fr track, so it is pinned to 0 explicitly with minmax:
+   the text column then always fills every pixel the (auto-sized) badge column isn't
+   using, and only the text itself truncates, never the row. */
+.plan-step-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px; align-items: center; width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); text-align: left; }
 .plan-step-row:hover { background: var(--panel-3); }
 .plan-step-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .plan-step-main > span:last-child { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -677,9 +685,13 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .plan-step-row.stuck { border-color: #5a3036; background: #24181b; }
 .plan-step-row.stuck:hover { background: #2b1c1f; }
 .plan-step-row.stuck small { color: #e6b4b6; }
-.plan-step-right { display: flex; align-items: center; gap: 6px; justify-self: end; }
-.plan-chevron { color: var(--faint); font-size: 12px; flex-shrink: 0; }
 .plan-step-wrap.expanded .plan-step-row { border-radius: 8px 8px 0 0; border-bottom-color: transparent; }
+/* The grid-rows 0fr/1fr trick: animating a track size (unlike height/max-height) needs no
+   measured pixel value, so this transitions smoothly to and from the content's real height
+   in both directions, including a row switching straight to another row. */
+.plan-step-shell { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .2s ease; }
+.plan-step-shell.open { grid-template-rows: 1fr; }
+.plan-step-clip { overflow: hidden; min-height: 0; }
 /* An accordion panel opened inline from a plan row, showing the same detail as the task
    drawer but without navigating away from the plan. Reuses the drawer's own field/tab/body
    classes so the two views never visually drift apart. */
