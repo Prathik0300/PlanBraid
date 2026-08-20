@@ -362,7 +362,10 @@ export function PlanbraidApp() {
     return item ? deriveColumn(item) === statusFilter : false;
   }), [data, projectId, sourceId, query, statusFilter, projectItems]);
   const selectedItem = data?.workItems.find((item) => item.id === selectedItemId) ?? null;
-  const unread = data?.notifications.filter((notification) => !notification.readAt).length ?? 0;
+  // Scoped to the open project: the Inbox tab it badges only ever shows this project's own
+  // notifications (see the view === "inbox" render below), so an account-wide count here
+  // showed a badge for work in other projects entirely, with nothing behind it to click.
+  const unread = data?.notifications.filter((notification) => !notification.readAt && notification.projectId === projectId).length ?? 0;
 
   async function command(command: Command, success: string | ((result: CommandResult) => string)) {
     setMutating(true);
@@ -570,12 +573,12 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
       const activeCount = data.sources.filter((source) => source.projectId === project.id && source.status === "active").length;
       if (renamingId === project.id) {
         return <form key={project.id} className="project-row project-rename" onSubmit={(event) => { event.preventDefault(); void saveRename(project); }}>
-          <span className="project-glyph">{project.name.slice(0, 1)}</span>
+          <span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span>
           <input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} onBlur={() => void saveRename(project)} onKeyDown={(event) => { if (event.key === "Escape") setRenamingId(null); }} maxLength={120} aria-label={`Rename ${project.name}`} />
         </form>;
       }
       return <div key={project.id} className={`project-row-wrap ${selected === project.id ? "selected" : ""}`}>
-        <button className="project-row" onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1)}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>
+        <button className="project-row" onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>
         <ProjectMenu project={project} busy={busy} onRename={() => startRename(project)} onManageAgents={() => setManagingProject(project)} onDelete={() => void command({ action: "delete_project", projectId: project.id, idempotencyKey: requestId("delete-project") }, `Deleted "${project.name}"`)} />
       </div>;
     })}</div>
@@ -1048,6 +1051,10 @@ function PlanDialog({ plan, sources, allItems, events, evidence, dependencies, a
   // shrink: unmounting on the same tick as the class flip would cut the animation short.
   const [closingId, setClosingId] = useState<string | null>(null);
   const [tab, setTab] = useState<"overview" | "activity" | "evidence">("overview");
+  // Lets the pinned bar scroll straight back to whichever row it mirrors, however far the
+  // waves have scrolled it out of view - a plain map keyed by item id rather than one ref
+  // per row, since the row set changes every time a wave renders.
+  const rowRefs = useRef(new Map<string, HTMLDivElement>());
   function toggle(id: string) {
     setExpandedId((current) => {
       if (current === id) { setClosingId(id); return null; }
@@ -1060,7 +1067,7 @@ function PlanDialog({ plan, sources, allItems, events, evidence, dependencies, a
     const expanded = item.id === expandedId;
     const mounted = expanded || item.id === closingId;
     const corroboration = "corroboration" in item ? item.corroboration : 0;
-    return <div className={`plan-step-wrap ${mounted ? "expanded" : ""}`} key={item.id}>
+    return <div className={`plan-step-wrap ${mounted ? "expanded" : ""}`} key={item.id} ref={(el) => { if (el) rowRefs.current.set(item.id, el); else rowRefs.current.delete(item.id); }}>
       <button className={`plan-step-row ${stuck ? "stuck" : ""}`} onClick={() => toggle(item.id)} aria-expanded={expanded}>
         <span className="plan-step-main">
           <span className={`priority ${item.priority}`} />
@@ -1092,7 +1099,7 @@ function PlanDialog({ plan, sources, allItems, events, evidence, dependencies, a
       </div>}
       {plan.waves.length
         ? <div className="plan-waves">
-            {expandedItem && <button className="plan-pinned-title" onClick={() => toggle(expandedItem.id)}>
+            {expandedItem && <button className="plan-pinned-title" onClick={() => rowRefs.current.get(expandedItem.id)?.scrollIntoView({ behavior: "smooth", block: "start" })} title="Scroll back to this item">
               <span className={`priority ${expandedItem.priority}`} />
               <strong>{expandedItem.itemKey} {expandedItem.title}</strong>
               <span className="plan-pinned-hint">viewing</span>
@@ -1462,7 +1469,7 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
           <header><span>⌕</span><input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Type a command or project…" /><kbd>esc</kbd></header>
           <div className="command-results">
             <button onClick={() => setMode("project")}><span>＋</span><b>Create a new project</b><small>Track work across every connected agent</small></button>
-            {projects.filter((project) => !search.trim() || `${project.name} ${project.description} ${project.directory}`.toLowerCase().includes(search.trim().toLowerCase())).map((project) => <a href={`/?project=${project.id}`} key={project.id} className={project.id === currentProject ? "current" : ""}><span className="project-glyph">{project.name[0]}</span><b>Open {project.name}</b><small>{project.directory || project.description}</small></a>)}
+            {projects.filter((project) => !search.trim() || `${project.name} ${project.description} ${project.directory}`.toLowerCase().includes(search.trim().toLowerCase())).map((project) => <a href={`/?project=${project.id}`} key={project.id} className={project.id === currentProject ? "current" : ""}><span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span><b>Open {project.name}</b><small>{project.directory || project.description}</small></a>)}
           </div>
         </>}
     </div>
