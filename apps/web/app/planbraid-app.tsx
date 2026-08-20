@@ -93,6 +93,27 @@ function initialTheme(): Theme {
   return attr === "light" || attr === "dark" ? attr : "dark";
 }
 
+const NAV_STORAGE_KEY = "planbraid-last-nav";
+const VIEWS: readonly View[] = ["stream", "board", "proposals", "decisions", "list", "inbox", "agents"];
+
+/** Restores the project and tab a reload lands back on. Scoped to sessionStorage rather
+ * than localStorage on purpose: a page script has no way to tell a cache-bypassing
+ * reload from an ordinary one (both report the same PerformanceNavigationTiming type),
+ * so "same tab, however it got refreshed" is the closest thing to "soft refresh" that is
+ * actually detectable - and it is sessionStorage's own boundary for free, since a fresh
+ * tab or window starts with nothing stored and falls back to the welcome screen exactly
+ * as refresh() below already guarantees once the loaded project list confirms an id. */
+function initialNav(): { projectId: string; view: View } {
+  if (typeof window === "undefined") return { projectId: "", view: "stream" };
+  try {
+    const raw = window.sessionStorage.getItem(NAV_STORAGE_KEY);
+    if (!raw) return { projectId: "", view: "stream" };
+    const parsed = JSON.parse(raw) as { projectId?: string; view?: string };
+    const view = VIEWS.includes(parsed.view as View) ? (parsed.view as View) : "stream";
+    return { projectId: parsed.projectId ?? "", view };
+  } catch { return { projectId: "", view: "stream" }; }
+}
+
 type ProposingAccount = { provider: string; family: string; accountId: string | null; accountLabel: string | null };
 
 /**
@@ -203,10 +224,10 @@ export function PlanbraidApp() {
   const [data, setData] = useState<DashboardState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [projectId, setProjectId] = useState("");
+  const [projectId, setProjectId] = useState(() => initialNav().projectId);
   const [sourceId, setSourceId] = useState<string | null>(null);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
-  const [view, setView] = useState<View>("stream");
+  const [view, setView] = useState<View>(() => initialNav().view);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<WorkStatus | "all">("all");
   const [newUpdates, setNewUpdates] = useState(0);
@@ -244,11 +265,11 @@ export function PlanbraidApp() {
       if (!response.ok) throw new Error("Planbraid could not load project state");
       const state = await response.json() as DashboardState;
       setData(state);
-      // No default project on load, and none re-picked automatically if the selected one
-      // is gone (deleted, or a stale id from a previous session): landing on the welcome
-      // screen with nothing highlighted is the point, not a state to fall back out of.
-      // Still preserves an already-valid selection across a background refresh, so
-      // actually working in a project isn't interrupted by every 15s poll.
+      // A selection restored from sessionStorage (or just picked) is only honored if the
+      // project still exists: deleted, or a stale id left over from a much older session,
+      // both fall back to the welcome screen rather than a broken-looking selected-but-
+      // gone state. This same check is what makes a background refresh never interrupt
+      // actually working in a project - it re-validates, not re-picks.
       setProjectId((current) => (current && state.projects.some((project) => project.id === current)) ? current : "");
       setError(null);
     } catch (caught) {
@@ -257,6 +278,14 @@ export function PlanbraidApp() {
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  // Persists the last project/tab so an ordinary reload picks up where it left off; see
+  // initialNav's own note on why sessionStorage (not localStorage) is the right scope.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!projectId) { window.sessionStorage.removeItem(NAV_STORAGE_KEY); return; }
+    window.sessionStorage.setItem(NAV_STORAGE_KEY, JSON.stringify({ projectId, view }));
+  }, [projectId, view]);
 
   useEffect(() => {
     // A newly-connected agent (OAuth completing in a separate tab/window, or an MCP
@@ -500,7 +529,7 @@ export function PlanbraidApp() {
       {simplifyRun && <SimplifyPanel run={simplifyRun} busy={applyingFinding} close={() => setSimplifyRun(null)} onApply={(findingId) => void resolveFinding(findingId, "apply")} onDismiss={(findingId) => void resolveFinding(findingId, "dismiss")} />}
       {handoffText && <HandoffDialog text={handoffText} close={() => setHandoffText(null)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
       {health && <HealthDialog health={health} close={() => setHealth(null)} onItem={(id) => { setHealth(null); setSelectedItemId(id); }} />}
-      {plan && <PlanDialog plan={plan} sources={projectSources} allItems={projectItems} events={data?.events ?? []} evidence={data?.evidence ?? []} dependencies={data?.dependencies ?? []} aliases={data?.aliases ?? []} close={() => setPlan(null)} onItem={setSelectedItemId} />}
+      {plan && <PlanDialog plan={plan} sources={projectSources} allItems={projectItems} events={data?.events ?? []} evidence={data?.evidence ?? []} dependencies={data?.dependencies ?? []} aliases={data?.aliases ?? []} close={() => { setPlan(null); setSelectedItemId(null); }} onItem={setSelectedItemId} />}
       {viewsOpen && <ViewsDialog active={activeSavedView} setActive={setActiveSavedView} items={savedViewItems} loading={savedViewLoading} close={() => { setViewsOpen(false); setSavedViewItems(null); }} onItem={(id) => { setViewsOpen(false); setSavedViewItems(null); setSelectedItemId(id); }} />}
       {toast && <div className="toast" role="status">{toast}</div>}
       {project && <nav className="mobile-nav" aria-label="Mobile navigation">
@@ -1044,6 +1073,12 @@ function PlanDialog({ plan, sources, allItems, events, evidence, dependencies, a
       </PlanStepShell>}
     </div>;
   }
+  // A sticky row can only stick within its own parent's box, so pinning the row itself
+  // stops working the moment a later wave scrolls past that box entirely - which is
+  // exactly when losing track of what's open is the real problem. A dedicated bar as a
+  // direct child of the scroll container has no such ceiling: it can stick for the whole
+  // list, however many waves separate it from the row it mirrors.
+  const expandedItem = expandedId ? (plan.waves.flatMap((wave) => wave.items).find((item) => item.id === expandedId) ?? plan.stuck.find((item) => item.id === expandedId)) : null;
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
     <section className="plan-dialog" role="dialog" aria-modal="true" aria-labelledby="plan-title">
       <header><div><span className="eyebrow">EXECUTION PLAN</span><h2 id="plan-title">The most efficient order</h2><p>Ordered by critical path: the longest chain of work sets the finish date, so it goes first. Everything else has float.</p></div><button className="icon-button" onClick={close} aria-label="Close execution plan">×</button></header>
@@ -1056,7 +1091,13 @@ function PlanDialog({ plan, sources, allItems, events, evidence, dependencies, a
         </span>)}</div>
       </div>}
       {plan.waves.length
-        ? <div className="plan-waves">{plan.waves.map((wave) => <div className="plan-wave" key={wave.wave}>
+        ? <div className="plan-waves">
+            {expandedItem && <button className="plan-pinned-title" onClick={() => toggle(expandedItem.id)}>
+              <span className={`priority ${expandedItem.priority}`} />
+              <strong>{expandedItem.itemKey} {expandedItem.title}</strong>
+              <span className="plan-pinned-hint">viewing</span>
+            </button>}
+            {plan.waves.map((wave) => <div className="plan-wave" key={wave.wave}>
             <h3>Wave {wave.wave}<small>{wave.items.length} task{wave.items.length === 1 ? "" : "s"}{wave.wave === 1 ? " · actionable now" : ""}</small></h3>
             {wave.items.map((item) => row(item))}
           </div>)}</div>

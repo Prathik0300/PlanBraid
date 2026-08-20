@@ -649,7 +649,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .plan-dialog > header > div { flex: 1; }
 .plan-dialog h2 { margin: 4px 0 6px; font-size: 18px; }
 .plan-dialog > header p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
-.plan-critical { padding: 14px 18px 0; }
+.plan-critical { padding: 14px 18px 18px; border-bottom: 1px solid var(--line); }
 .plan-critical h3 { margin: 0 0 4px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; display: flex; align-items: center; gap: 7px; }
 .plan-critical h3 small { color: var(--faint); font-size: 12px; text-transform: none; letter-spacing: 0; }
 .plan-critical > p.muted { margin: 0 0 8px; line-height: 1.45; }
@@ -661,7 +661,15 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .plan-flag { flex: 0 0 auto; border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; color: var(--faint); font-size: 12px; white-space: nowrap; }
 .plan-flag.critical { border-color: #5a4420; background: #2a2013; color: var(--orange); }
 .plan-step-row.critical { border-color: #5a4420; }
-.plan-waves { overflow-y: auto; padding: 14px 18px 6px; display: flex; flex-direction: column; gap: 16px; }
+.plan-waves { overflow-y: auto; padding: 14px 18px 22px; display: flex; flex-direction: column; gap: 16px; }
+/* A direct child of the scroll container, not the expanded row itself: a sticky row can
+   only stick within its own parent's box, so once a later wave scrolls that box fully out
+   of view there is nothing left to stick to. This bar's containing block is the whole
+   list, so it stays in view exactly as long as anything is open, however far down the
+   waves have scrolled underneath it. */
+.plan-pinned-title { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-3); box-shadow: 0 6px 14px -8px #000a; text-align: left; }
+.plan-pinned-title strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 560; }
+.plan-pinned-title .plan-pinned-hint { flex-shrink: 0; color: var(--faint); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .plan-wave h3 { margin: 0 0 8px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; display: flex; align-items: center; gap: 7px; }
 .plan-wave h3 small { color: var(--faint); font-size: 12px; text-transform: none; letter-spacing: 0; }
 .plan-wave { display: flex; flex-direction: column; gap: 6px; }
@@ -679,7 +687,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .plan-step-row small { color: var(--muted); font-size: 12px; }
 .plan-step-row .priority { flex-shrink: 0; }
 .plan-step-row .plan-flag { justify-self: end; }
-.plan-stuck { border-top: 1px solid var(--line); padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 6px; }
+.plan-stuck { border-top: 1px solid var(--line); padding: 14px 18px 22px; display: flex; flex-direction: column; gap: 6px; }
 .plan-stuck h3 { margin: 0 0 2px; color: var(--red); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
 .plan-stuck > p.muted { margin: 0 0 6px; }
 .plan-step-row.stuck { border-color: #5a3036; background: #24181b; }
