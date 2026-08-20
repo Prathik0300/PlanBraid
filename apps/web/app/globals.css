@@ -632,6 +632,57 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .agent-manage-row small { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agent-manage-row button { border: 1px solid var(--line); background: var(--panel-3); color: var(--text); border-radius: 5px; min-height: 25px; padding: 0 7px; font-size: 12px; }
 @media (max-width: 620px) { .agent-manage-row { align-items: flex-start; flex-wrap: wrap; }.agent-manage-identity { flex-basis: 100%; }.agent-manage-actions { width: 100%; justify-content: flex-end; }.agent-manage-row .connection-rename { width: 100%; } }
+.integrations-backdrop { z-index: 40; }
+.integrations-dialog { position: relative; width: min(900px, calc(100vw - 28px)); max-height: min(850px, calc(100dvh - 40px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: 0 24px 80px #000c; }
+.integrations-dialog > header { flex: 0 0 auto; display: flex; align-items: flex-start; gap: 16px; padding: 18px 20px 15px; border-bottom: 1px solid var(--line); }
+.integrations-dialog > header > div { flex: 1; min-width: 0; }
+.integrations-dialog .eyebrow { color: var(--blue); font-size: 12px; font-weight: 650; letter-spacing: .1em; }
+.integrations-dialog h2 { margin: 4px 0 5px; font-size: 19px; }
+.integrations-dialog > header p, .integration-review header p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.integration-body { overflow-y: auto; padding: 18px 20px 24px; display: flex; flex-direction: column; gap: 22px; }
+.integration-body section > h3, .integration-add header h3, .integration-review header h3 { margin: 0 0 9px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+.integration-provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.integration-provider-card { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; align-items: center; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.integration-provider-card > div, .integration-bindings article > div, .integration-candidates article > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.integration-provider-card strong, .integration-bindings strong, .integration-candidates strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.integration-provider-card small, .integration-bindings small, .integration-candidates small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
+.integration-provider-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 7px; font-size: 15px; font-weight: 750; }
+.integration-provider-mark.basecamp { color: #fff; background: #2f78c4; }
+.integration-provider-mark.jira { color: #fff; background: #1868db; }
+.integration-provider-mark.slack { color: #fff; background: #4a154b; }
+.integration-provider-card button, .integration-provider-card a, .integration-add button, .integration-bindings button, .integration-review button, .integration-candidates a { min-height: 29px; display: inline-flex; align-items: center; justify-content: center; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-3); color: var(--text); font-size: 12px; text-decoration: none; white-space: nowrap; }
+.integration-provider-card button:disabled, .integration-add button:disabled, .integration-bindings button:disabled, .integration-review button:disabled { opacity: .5; cursor: default; }
+.integration-provider-actions { display: inline-flex; align-items: center; gap: 6px; }
+.integration-add { padding: 14px; display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 11px; border: 1px solid #3c4960; border-radius: 9px; background: #141a24; }
+.integration-add > header { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; }
+.integration-add > header h3 { margin: 0; }
+.integration-add label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 12px; }
+.integration-add select, .integration-add input { width: 100%; height: 35px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); color: var(--text); padding: 0 9px; outline: 0; }
+.integration-add label small { color: var(--faint); }
+.integration-add .integration-primary { grid-column: 1 / -1; }
+.integration-add-events, .integration-confirm-all { grid-column: 1 / -1; }
+.integration-event-toggles { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 2px; }
+.integration-event-toggles label, .integration-confirm-all { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: 12px; font-weight: 400; }
+.integration-primary { border-color: #4d608a !important; background: #28344d !important; }
+.integration-bindings { display: flex; flex-direction: column; gap: 7px; }
+.integration-bindings article { display: grid; grid-template-columns: 32px minmax(0,1fr) auto auto auto auto; align-items: center; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.integration-count { padding: 3px 7px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.integration-danger { color: var(--red) !important; }
+.integration-review { padding-top: 3px; border-top: 1px solid var(--line); }
+.integration-review > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-top: 17px; }
+.integration-review > header h3 { margin-bottom: 4px; }
+.integration-review-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0 8px; }
+.integration-review-toolbar label { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+.integration-candidates { max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.integration-candidates article { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.integration-candidates article.decided { opacity: .62; }
+.integration-candidates p { margin: 1px 0 0; color: var(--faint); font-size: 12px; }
+.integration-decision { color: var(--green); font-size: 12px; }
+.integration-empty { margin: 0; padding: 28px 20px; color: var(--muted); font-size: 12px; }
+.integration-empty.compact { padding: 12px; border: 1px dashed var(--line); border-radius: 8px; }
+@media (max-width: 720px) { .integration-provider-grid { grid-template-columns: 1fr; }.integration-add { grid-template-columns: 1fr; }.integration-add > * { grid-column: 1 !important; }.integration-bindings article { grid-template-columns: 32px minmax(0,1fr) auto; }.integration-bindings article button { grid-row: 2; }.integration-bindings article button:nth-last-child(3) { grid-column: 2; }.integration-candidates article { grid-template-columns: auto minmax(0,1fr) auto; }.integration-candidates article > button, .integration-candidates article > .integration-decision { grid-column: 2 / -1; justify-self: end; } }
+:root[data-theme="light"] .integrations-dialog { background: #fff; box-shadow: 0 24px 80px #31415726; }
+:root[data-theme="light"] .integration-add { background: #f4f7fb; border-color: #c5d2e4; }
 .inline-link-button { display: inline; border: 0; background: transparent; padding: 0; color: var(--blue); text-decoration: underline; font: inherit; cursor: pointer; }
 .health-button { height: 30px; padding: 0 12px; border-radius: 7px; font-size: 12px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); white-space: nowrap; }
 .plan-button { height: 30px; padding: 0 12px; border-radius: 7px; font-size: 12px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); white-space: nowrap; }

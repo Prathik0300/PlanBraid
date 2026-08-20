@@ -227,6 +227,50 @@ export const SCHEMA_STATEMENTS = [
   // file is edited above the symbol, and the primary key deliberately does not include it.
   `CREATE TABLE IF NOT EXISTS repo_symbols (organization_id TEXT NOT NULL, project_id TEXT NOT NULL, file TEXT NOT NULL, symbol TEXT NOT NULL, kind TEXT NOT NULL, line INTEGER NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (project_id, file, symbol))`,
   `CREATE INDEX IF NOT EXISTS idx_repo_symbols_project_symbol ON repo_symbols(project_id, symbol)`,
+  // Provider-neutral OAuth grants. One grant can expose several Basecamp accounts or
+  // Jira sites, so account/site selection belongs to a project binding rather than the
+  // connection. Both tokens are AES-GCM sealed by lib/crypto-box.ts before storage.
+  `CREATE TABLE IF NOT EXISTS integration_connections (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, provider TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', access_token TEXT NOT NULL, refresh_token TEXT, access_token_expires_at TIMESTAMPTZ, granted_scopes TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'connected', last_success_at TIMESTAMPTZ, last_error_code TEXT, last_error_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(owner_user_id, provider))`,
+  `CREATE INDEX IF NOT EXISTS idx_integration_connections_org_provider ON integration_connections(organization_id, provider)`,
+  // OAuth state is stored as a digest so a database read cannot mint a valid callback.
+  // project_id is the project whose integration dialog initiated the connection and is
+  // used only to return the browser to the right place after consent.
+  `CREATE TABLE IF NOT EXISTS integration_oauth_states (state_hash TEXT PRIMARY KEY, organization_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, provider TEXT NOT NULL, project_id TEXT, redirect_uri TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+  `CREATE INDEX IF NOT EXISTS idx_integration_oauth_states_expiry ON integration_oauth_states(expires_at)`,
+  // A binding selects one concrete external project/container for one Planbraid project.
+  // The callback secret is both sealed (needed to recreate provider registrations) and
+  // hashed (constant-time verification of inbound callback paths without decryption).
+  `CREATE TABLE IF NOT EXISTS integration_bindings (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, connection_id TEXT NOT NULL, provider TEXT NOT NULL, external_account_id TEXT NOT NULL, external_account_name TEXT NOT NULL DEFAULT '', external_project_id TEXT NOT NULL, external_project_key TEXT, external_project_name TEXT NOT NULL, external_base_url TEXT NOT NULL, filter_query TEXT NOT NULL DEFAULT '', settings TEXT NOT NULL DEFAULT '{}', webhook_id TEXT, webhook_secret TEXT NOT NULL, webhook_secret_hash TEXT NOT NULL, webhook_expires_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'active', last_sync_at TIMESTAMPTZ, last_success_at TIMESTAMPTZ, last_error_code TEXT, last_error_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(project_id, provider, external_account_id, external_project_id))`,
+  `CREATE INDEX IF NOT EXISTS idx_integration_bindings_project ON integration_bindings(project_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_integration_bindings_connection ON integration_bindings(connection_id, status)`,
+  // Canonical provider snapshots live separately from accepted Planbraid work. A changed
+  // provider snapshot reopens review; it never silently overwrites a work item.
+  `CREATE TABLE IF NOT EXISTS external_items (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, binding_id TEXT NOT NULL, provider TEXT NOT NULL, external_id TEXT NOT NULL, external_key TEXT, item_type TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', external_status TEXT NOT NULL DEFAULT '', normalized_status TEXT NOT NULL DEFAULT 'proposed', priority TEXT NOT NULL DEFAULT 'normal', assignee TEXT, due_at TIMESTAMPTZ, parent_external_id TEXT, canonical_url TEXT NOT NULL DEFAULT '', external_revision TEXT, content_hash TEXT NOT NULL, normalized_snapshot TEXT NOT NULL DEFAULT '{}', raw_snapshot TEXT NOT NULL DEFAULT '{}', review_status TEXT NOT NULL DEFAULT 'pending', tombstoned_at TIMESTAMPTZ, first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(binding_id, external_id))`,
+  `CREATE INDEX IF NOT EXISTS idx_external_items_binding_review ON external_items(binding_id, review_status, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_external_items_project ON external_items(project_id, provider)`,
+  `CREATE TABLE IF NOT EXISTS work_item_external_links (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, binding_id TEXT NOT NULL, external_item_id TEXT NOT NULL, work_item_id TEXT NOT NULL, link_kind TEXT NOT NULL DEFAULT 'imported', last_applied_hash TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(external_item_id), UNIQUE(binding_id, work_item_id, external_item_id))`,
+  `CREATE INDEX IF NOT EXISTS idx_external_links_work_item ON work_item_external_links(work_item_id)`,
+  // Webhook endpoints acknowledge after this durable insert. Redeliveries collapse on
+  // delivery_key; processing failures remain visible and can be replayed by a later sync.
+  `CREATE TABLE IF NOT EXISTS integration_webhook_inbox (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, binding_id TEXT NOT NULL, provider TEXT NOT NULL, delivery_key TEXT NOT NULL, payload_hash TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TIMESTAMPTZ, last_error TEXT, received_at TIMESTAMPTZ NOT NULL DEFAULT now(), processed_at TIMESTAMPTZ, UNIQUE(binding_id, delivery_key))`,
+  `CREATE INDEX IF NOT EXISTS idx_integration_webhook_pending ON integration_webhook_inbox(status, next_attempt_at, received_at)`,
+  // Outbound effects are introduced with the same durable/idempotent contract even
+  // though Basecamp/Jira begin read-only. Webhook registration and future write-back use
+  // this table instead of coupling provider availability to a domain transaction.
+  `CREATE TABLE IF NOT EXISTS integration_outbox (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, binding_id TEXT, provider TEXT NOT NULL, effect_key TEXT NOT NULL, operation TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TIMESTAMPTZ, provider_response_id TEXT, last_error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ, UNIQUE(provider, effect_key))`,
+  `CREATE INDEX IF NOT EXISTS idx_integration_outbox_pending ON integration_outbox(status, next_attempt_at, created_at)`,
+  `CREATE TABLE IF NOT EXISTS integration_sync_runs (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, project_id TEXT NOT NULL, binding_id TEXT NOT NULL, provider TEXT NOT NULL, run_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running', cursor TEXT, fetched_count INTEGER NOT NULL DEFAULT 0, changed_count INTEGER NOT NULL DEFAULT 0, tombstoned_count INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0, error_summary TEXT, started_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ)`,
+  `CREATE INDEX IF NOT EXISTS idx_integration_sync_runs_binding ON integration_sync_runs(binding_id, started_at DESC)`,
+  // Slack/Teams are a publish destination, not an import source, so their binding shape
+  // is genuinely different from integration_bindings (one external project per binding):
+  // scope_type lets one channel receive either one project's updates or a portfolio feed
+  // across every current-and-future eligible project, with project_id NULL only for the
+  // latter. excluded_project_ids is how an all_projects binding opts specific projects
+  // out; event_types is the per-binding delivery-toggle set from the settings UI.
+  `CREATE TABLE IF NOT EXISTS integration_channel_bindings (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, connection_id TEXT NOT NULL, provider TEXT NOT NULL, scope_type TEXT NOT NULL DEFAULT 'project', project_id TEXT, external_channel_id TEXT NOT NULL, external_channel_name TEXT NOT NULL DEFAULT '', excluded_project_ids TEXT NOT NULL DEFAULT '[]', event_types TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', last_success_at TIMESTAMPTZ, last_error_code TEXT, last_error_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (scope_type IN ('project', 'all_projects')), CHECK ((scope_type = 'project') = (project_id IS NOT NULL)))`,
+  `CREATE INDEX IF NOT EXISTS idx_channel_bindings_project ON integration_channel_bindings(project_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_channel_bindings_org_scope ON integration_channel_bindings(organization_id, scope_type, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_channel_bindings_connection ON integration_channel_bindings(connection_id, status)`,
 ] as const;
 
 /**
@@ -327,6 +371,12 @@ export const MIGRATION_STATEMENTS = [
   // credential touch a project, so it survives that agent simply reconnecting.
   `CREATE TABLE IF NOT EXISTS project_access_blocks (project_id TEXT NOT NULL, credential_id TEXT NOT NULL, organization_id TEXT NOT NULL, blocked_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (project_id, credential_id))`,
   `CREATE INDEX IF NOT EXISTS idx_project_access_blocks_credential ON project_access_blocks(credential_id)`,
+  // Provider identity that doesn't fit the existing columns (Slack's team id/name and bot
+  // user id — needed to know which workspace a connection's channel list belongs to, and
+  // to render "connected to Acme Corp" without decrypting the token). JSON text like every
+  // other structured column here, so a future provider's own identity fields need no
+  // schema change.
+  `ALTER TABLE integration_connections ADD COLUMN IF NOT EXISTS metadata TEXT NOT NULL DEFAULT '{}'`,
 ] as const;
 
 let initialized = false;

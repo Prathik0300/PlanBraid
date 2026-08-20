@@ -8,6 +8,7 @@ import { judgmentId, judgmentRequestStatement } from "@/lib/dedup/judgments.ts";
 import { backfillBlockingIndex, blockingIndexStatements, retrieveCandidates } from "@/lib/dedup/blocking.ts";
 import { backfillEmbeddingIndex } from "@/lib/dedup/embedding-index.ts";
 import { captureLabelStatement, snapshotAdjudication } from "@/lib/dedup/labels.ts";
+import { buildPublicationStatements, PUBLICATION_EVENT_TYPES, type PublicationEventType } from "@/lib/integrations/publish.ts";
 import { appendPlanOp, type AuthorKind } from "@/lib/ops/log.ts";
 import { opPayloadFrom } from "@/lib/ops/hash.ts";
 import { DAG_EDGE_TYPES, DAG_EDGE_TYPE_SQL_LIST, isDagEdgeType } from "@/lib/graph/edges.ts";
@@ -869,6 +870,19 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
       db.prepare("INSERT INTO notifications (id, organization_id, recipient_user_id, project_id, work_item_id, event_type, priority, title, body, deep_link, dedupe_key, requires_action, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(id("ntf"), organizationId, principal.userId, command.projectId, command.itemId, propagationEventType, "normal", willBeResolved ? `${keys.length} task${keys.length === 1 ? "" : "s"} now ready` : `${keys.length} task${keys.length === 1 ? "" : "s"} blocked again`, propagationSummary, `/?project=${command.projectId}`, `${propagationEventType}:${command.itemId}:${propagationRevision}`, 0, now),
     );
+  }
+
+  // Slack/Teams publication: queued in this same commit (never a separate at-most-once
+  // side effect - see lib/integrations/publish.ts's own note), for whichever of this
+  // transition's own event and the downstream propagation event are publication-worthy.
+  // Provider failures can never block this write: nothing here does network I/O, it only
+  // inserts rows a later worker drains.
+  if ((PUBLICATION_EVENT_TYPES as readonly string[]).includes(eventType)) {
+    statements.push(...await buildPublicationStatements(db, { organizationId, projectId: command.projectId, projectName: text(project, "name"), eventType: eventType as PublicationEventType, workItemId: command.itemId, itemKey, title: text(item, "title"), summary }));
+  }
+  if (crossing.length && willBeResolved) {
+    const propagationSummary2 = `${crossing.length} task${crossing.length === 1 ? "" : "s"} now ready: ${crossing.map((entry) => entry.itemKey).join(", ")}`;
+    statements.push(...await buildPublicationStatements(db, { organizationId, projectId: command.projectId, projectName: text(project, "name"), eventType: "work_item.downstream_unblocked", workItemId: null, itemKey: null, title: propagationSummary2, summary: propagationSummary2 }));
   }
 
   await commitMutation(db, statements);

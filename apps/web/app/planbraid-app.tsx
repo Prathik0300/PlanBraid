@@ -8,6 +8,7 @@ import { createPortal } from "react-dom";
 import { authClient } from "@/lib/auth-client";
 import { firstValidationMessage, passwordSchema } from "@/lib/auth-validation";
 import { GoogleIcon } from "@/app/google-icon";
+import { IntegrationsDialog } from "@/app/integrations-dialog";
 import { ALLOWED_TRANSITIONS, type Command, type DashboardState, type Notification, type Project, type Provider, type Source, type WorkEvent, type WorkItem, type WorkStatus } from "@/lib/contracts";
 import { deriveColumn, isStartedWhileBlocked } from "@/lib/graph/column.ts";
 import { DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
@@ -238,6 +239,7 @@ export function PlanbraidApp() {
   const [commandOpen, setCommandOpen] = useState<false | "search" | "project">(false);
   const [setupOpen, setSetupOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [integrationProject, setIntegrationProject] = useState<Project | null>(null);
   const [simplifyRun, setSimplifyRun] = useState<SimplifyRun | null>(null);
   const [simplifying, setSimplifying] = useState(false);
   const [handoffText, setHandoffText] = useState<string | null>(null);
@@ -278,6 +280,23 @@ export function PlanbraidApp() {
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  // OAuth returns to the app with the originating project in the query string. Restore
+  // that context and open the integration manager without leaving callback parameters
+  // stuck in every copied URL or subsequent reload.
+  useEffect(() => {
+    if (!data || typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    const integrationProjectId = url.searchParams.get("integrationProject");
+    const provider = url.searchParams.get("integration");
+    const integrationError = url.searchParams.get("integrationError");
+    if (!integrationProjectId && !provider && !integrationError) return;
+    const target = data.projects.find((entry) => entry.id === integrationProjectId);
+    if (target) { setProjectId(target.id); setIntegrationProject(target); }
+    if (integrationError) { setToast(integrationError); setTimeout(() => setToast(null), 5000); }
+    url.searchParams.delete("integrationProject"); url.searchParams.delete("integration"); url.searchParams.delete("integrationError");
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [data]);
 
   // Persists the last project/tab so an ordinary reload picks up where it left off; see
   // initialNav's own note on why sessionStorage (not localStorage) is the right scope.
@@ -337,7 +356,7 @@ export function PlanbraidApp() {
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setCommandOpen("search"); }
-      if (event.key === "Escape") { setSelectedItemId(null); setCommandOpen(false); setSetupOpen(false); setProfileOpen(false); setSidebarOpen(false); }
+      if (event.key === "Escape") { setSelectedItemId(null); setCommandOpen(false); setSetupOpen(false); setProfileOpen(false); setIntegrationProject(null); setSidebarOpen(false); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -491,7 +510,7 @@ export function PlanbraidApp() {
 
   return (
     <main className={`app-shell ${sidebarOpen ? "sidebar-open" : ""}`}>
-      <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} command={command} busy={mutating} onOpenAccountSetup={() => setSetupOpen(true)} />
+      <ProjectRail data={data!} avatarUrl={avatarUrl} selected={projectId} selectedSource={sourceId} sources={sources} onSelect={(id) => { setProjectId(id); setSourceId(null); setSelectedItemId(null); setStatusFilter("all"); setQuery(""); setView("stream"); settleSidebarAfterSelection(); }} onSource={(id) => { setSourceId(id); setStatusFilter("all"); setView("stream"); settleSidebarAfterSelection(); }} open={sidebarOpen} toggle={() => setSidebarOpen((open) => !open)} onNew={() => setCommandOpen("project")} onProfile={() => setProfileOpen(true)} command={command} busy={mutating} onOpenAccountSetup={() => setSetupOpen(true)} onManageIntegrations={setIntegrationProject} />
       <section className="workspace" aria-label="Unified project workspace">
         <Header project={project} itemCount={projectItems.length} sources={sources} unread={unread} proposalCount={proposals.length} decisionCount={decisions?.length ?? 0} view={view} setView={setView} query={query} setQuery={setQuery} theme={theme} toggleTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} onSetup={() => setSetupOpen(true)} viewer={data!.viewer} avatarUrl={avatarUrl} onProfile={() => setProfileOpen(true)} />
         {project && view !== "inbox" && view !== "agents" && view !== "proposals" && view !== "decisions" && <FilterBar items={projectItems} filter={statusFilter} setFilter={setStatusFilter} source={sources.find((entry) => entry.id === sourceId) ?? null} clearSource={() => setSourceId(null)} onSimplify={() => void runSimplify()} simplifying={simplifying} onHandoff={() => void runHandoff()} handoffLoading={handoffLoading} onHealth={() => void runHealth()} healthLoading={healthLoading} onPlan={() => void runPlan()} planLoading={planLoading} onViews={() => setViewsOpen(true)} project={project} sources={sources} importRequests={data?.importRequests ?? []} onSetup={() => setSetupOpen(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
@@ -529,6 +548,7 @@ export function PlanbraidApp() {
       }} />}
       {setupOpen && <SetupDialog project={project} close={() => setSetupOpen(false)} toast={setToast} />}
       {profileOpen && <ProfileDialog viewer={data!.viewer} close={() => setProfileOpen(false)} />}
+      {integrationProject && <IntegrationsDialog project={integrationProject} close={() => setIntegrationProject(null)} onImported={() => refresh(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 5000); }} />}
       {simplifyRun && <SimplifyPanel run={simplifyRun} busy={applyingFinding} close={() => setSimplifyRun(null)} onApply={(findingId) => void resolveFinding(findingId, "apply")} onDismiss={(findingId) => void resolveFinding(findingId, "dismiss")} />}
       {handoffText && <HandoffDialog text={handoffText} close={() => setHandoffText(null)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
       {health && <HealthDialog health={health} close={() => setHealth(null)} onItem={(id) => { setHealth(null); setSelectedItemId(id); }} />}
@@ -545,7 +565,7 @@ export function PlanbraidApp() {
 function LoadingShell() { return <div className="loading-screen"><div className="brand-mark graphic" aria-hidden="true" /><div><strong>Planbraid</strong><span>Braiding your project work…</span></div></div>; }
 function ErrorState({ message, retry }: { message: string; retry: () => void }) { return <div className="error-screen"><div className="brand-mark graphic" aria-hidden="true" /><h1>Couldn’t open Planbraid</h1><p>{message}</p><button onClick={retry}>Try again</button></div>; }
 
-function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSelect, onSource, open, toggle, onNew, onProfile, command, busy, onOpenAccountSetup }: { data: DashboardState; avatarUrl: string | null; selected: string; selectedSource: string | null; sources: Source[]; onSelect: (id: string) => void; onSource: (id: string | null) => void; open: boolean; toggle: () => void; onNew: () => void; onProfile: () => void; command: (command: Command, success: string | ((result: CommandResult) => string)) => Promise<CommandResult>; busy: boolean; onOpenAccountSetup: () => void }) {
+function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSelect, onSource, open, toggle, onNew, onProfile, command, busy, onOpenAccountSetup, onManageIntegrations }: { data: DashboardState; avatarUrl: string | null; selected: string; selectedSource: string | null; sources: Source[]; onSelect: (id: string) => void; onSource: (id: string | null) => void; open: boolean; toggle: () => void; onNew: () => void; onProfile: () => void; command: (command: Command, success: string | ((result: CommandResult) => string)) => Promise<CommandResult>; busy: boolean; onOpenAccountSetup: () => void; onManageIntegrations: (project: Project) => void }) {
   const railAmbiguousFamilies = ambiguousFamiliesOf(sources);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -579,7 +599,7 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
       }
       return <div key={project.id} className={`project-row-wrap ${selected === project.id ? "selected" : ""}`}>
         <button className="project-row" onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>
-        <ProjectMenu project={project} busy={busy} onRename={() => startRename(project)} onManageAgents={() => setManagingProject(project)} onDelete={() => void command({ action: "delete_project", projectId: project.id, idempotencyKey: requestId("delete-project") }, `Deleted "${project.name}"`)} />
+        <ProjectMenu project={project} busy={busy} onRename={() => startRename(project)} onManageAgents={() => setManagingProject(project)} onManageIntegrations={() => onManageIntegrations(project)} onDelete={() => void command({ action: "delete_project", projectId: project.id, idempotencyKey: requestId("delete-project") }, `Deleted "${project.name}"`)} />
       </div>;
     })}</div>
     <div className="rail-divider" />
@@ -590,7 +610,7 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
   </aside>;
 }
 
-function ProjectMenu({ project, busy, onRename, onManageAgents, onDelete }: { project: Project; busy: boolean; onRename: () => void; onManageAgents: () => void; onDelete: () => void }) {
+function ProjectMenu({ project, busy, onRename, onManageAgents, onManageIntegrations, onDelete }: { project: Project; busy: boolean; onRename: () => void; onManageAgents: () => void; onManageIntegrations: () => void; onDelete: () => void }) {
   const [open, setOpen] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
@@ -619,7 +639,7 @@ function ProjectMenu({ project, busy, onRename, onManageAgents, onDelete }: { pr
       const rect = triggerRef.current?.getBoundingClientRect();
       if (!rect) return;
       const menuWidth = 190;
-      const menuHeight = 122;
+      const menuHeight = 158;
       const viewportGap = 8;
       const left = Math.min(Math.max(viewportGap, rect.right - menuWidth), window.innerWidth - menuWidth - viewportGap);
       const top = rect.bottom + 4 + menuHeight <= window.innerHeight ? rect.bottom + 4 : Math.max(viewportGap, rect.top - menuHeight - 4);
@@ -629,6 +649,7 @@ function ProjectMenu({ project, busy, onRename, onManageAgents, onDelete }: { pr
     {open && position && createPortal(<div ref={menuRef} className="project-menu" role="menu" style={position}>
       <button role="menuitem" onClick={() => { setOpen(false); setConfirmingDelete(false); onRename(); }}>Rename</button>
       <button role="menuitem" onClick={() => { setOpen(false); setConfirmingDelete(false); onManageAgents(); }}>Manage connected agents</button>
+      <button role="menuitem" onClick={() => { setOpen(false); setConfirmingDelete(false); onManageIntegrations(); }}>Manage work integrations</button>
       {confirmingDelete
         ? <button role="menuitem" className="project-menu-danger" disabled={busy} onClick={() => { setOpen(false); setConfirmingDelete(false); onDelete(); }}>Confirm delete?</button>
         : <button role="menuitem" className="project-menu-danger" onClick={() => setConfirmingDelete(true)}>Delete project</button>}
