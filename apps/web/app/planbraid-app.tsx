@@ -1105,7 +1105,7 @@ function PlanDialog({ plan, sources, allItems, events, evidence, dependencies, a
               <span className="plan-pinned-hint">viewing</span>
             </button>}
             {plan.waves.map((wave) => <div className="plan-wave" key={wave.wave}>
-            <h3>Wave {wave.wave}<small>{wave.items.length} task{wave.items.length === 1 ? "" : "s"}{wave.wave === 1 ? " · actionable now" : ""}</small></h3>
+            <h3>Wave {wave.wave}<small>· {wave.items.length} task{wave.items.length === 1 ? "" : "s"}{wave.wave === 1 ? " · actionable now" : ""}</small></h3>
             {wave.items.map((item) => row(item))}
           </div>)}</div>
         : <Empty title="Nothing open" body="Every work item is done or cancelled, so there's no plan to compute." />}
@@ -1253,7 +1253,7 @@ function Decisions({ decisions, loading, items, resolvingOptionId, onResolve, on
 }
 
 function Inbox({ notifications, onOpen, onResolve }: { notifications: Notification[]; onOpen: (notification: Notification) => void; onResolve: (notification: Notification) => void }) {
-  const [tab, setTab] = useState<"action" | "updates" | "all">("action");
+  const [tab, setTab] = useState<"action" | "updates" | "all">("all");
   const visible = notifications.filter((notification) => tab === "all" || tab === "action" ? (tab === "all" || notification.requiresAction && !notification.resolvedAt) : !notification.requiresAction);
   return <div className="inbox"><div className="inbox-heading"><span><h2>Inbox</h2><p>Decisions, completed turns, blockers, and agent health.</p></span><div className="segment"><button className={tab === "action" ? "active" : ""} onClick={() => setTab("action")}>Needs action</button><button className={tab === "updates" ? "active" : ""} onClick={() => setTab("updates")}>Updates</button><button className={tab === "all" ? "active" : ""} onClick={() => setTab("all")}>All</button></div></div>{visible.length ? <div className="inbox-list">{visible.map((notification) => <article className={`notification-card ${notification.readAt ? "read" : ""}`} key={notification.id}><span className={`notification-priority ${notification.priority}`}>!</span><button className="notification-main" onClick={() => onOpen(notification)}><div><strong>{notification.title}</strong><time>{relative(notification.createdAt)}</time></div><p>{notification.body}</p><small>{notification.eventType.replaceAll("_", " ").replaceAll(".", " · ")}</small></button>{notification.requiresAction && !notification.resolvedAt && <button className="resolve-button" onClick={() => onResolve(notification)}>Resolve</button>}</article>)}</div> : <Empty title="You’re caught up" body="Nothing in this notification view needs your attention." />}</div>;
 }
