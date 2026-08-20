@@ -9,6 +9,10 @@ import type { PushEnvironment } from "@/lib/push";
 import { buildMcpServer, rpcScope } from "@/lib/mcp/server";
 
 export const dynamic = "force-dynamic";
+// Default function duration (10s) isn't enough room for executeCommand's waitUntil-based
+// Slack drain kick (see lib/store.ts's kickSlackDrain), triggered by MCP tool calls like
+// block_work/report_completion exactly as it is from the browser's /api/commands.
+export const maxDuration = 30;
 
 type Env = PushEnvironment & { DB: PgD1 };
 type RpcId = string | number | null;

@@ -7,7 +7,7 @@
     },
     {
       "path": "/api/integrations/slack/drain",
-      "schedule": "* * * * *"
+      "schedule": "43 4 * * *"
     }
   ]
 }

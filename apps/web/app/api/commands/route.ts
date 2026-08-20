@@ -5,6 +5,9 @@ import { errorResponse, executeCommand } from "@/lib/store";
 import { dispatchNotification } from "@/lib/push";
 
 export const dynamic = "force-dynamic";
+// Default function duration (10s) isn't enough room for executeCommand's waitUntil-based
+// Slack drain kick, which deliberately waits past a 20s debounce window before draining.
+export const maxDuration = 30;
 
 export async function POST(request: Request) {
   try {

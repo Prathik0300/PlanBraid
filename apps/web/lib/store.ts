@@ -8,7 +8,8 @@ import { judgmentId, judgmentRequestStatement } from "@/lib/dedup/judgments.ts";
 import { backfillBlockingIndex, blockingIndexStatements, retrieveCandidates } from "@/lib/dedup/blocking.ts";
 import { backfillEmbeddingIndex } from "@/lib/dedup/embedding-index.ts";
 import { captureLabelStatement, snapshotAdjudication } from "@/lib/dedup/labels.ts";
-import { buildPublicationStatements, PUBLICATION_EVENT_TYPES, type PublicationEventType } from "@/lib/integrations/publish.ts";
+import { buildPublicationStatements, drainSlackOutbox, PUBLICATION_EVENT_TYPES, type PublicationEventType } from "@/lib/integrations/publish.ts";
+import { waitUntil } from "@vercel/functions";
 import { appendPlanOp, type AuthorKind } from "@/lib/ops/log.ts";
 import { opPayloadFrom } from "@/lib/ops/hash.ts";
 import { DAG_EDGE_TYPES, DAG_EDGE_TYPE_SQL_LIST, isDagEdgeType } from "@/lib/graph/edges.ts";
@@ -877,20 +878,43 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   // transition's own event and the downstream propagation event are publication-worthy.
   // Provider failures can never block this write: nothing here does network I/O, it only
   // inserts rows a later worker drains.
+  let publicationQueued = false;
   if ((PUBLICATION_EVENT_TYPES as readonly string[]).includes(eventType)) {
-    statements.push(...await buildPublicationStatements(db, { organizationId, projectId: command.projectId, projectName: text(project, "name"), eventType: eventType as PublicationEventType, workItemId: command.itemId, itemKey, title: text(item, "title"), summary }));
+    const publicationStatements = await buildPublicationStatements(db, { organizationId, projectId: command.projectId, projectName: text(project, "name"), eventType: eventType as PublicationEventType, workItemId: command.itemId, itemKey, title: text(item, "title"), summary });
+    statements.push(...publicationStatements);
+    publicationQueued ||= publicationStatements.length > 0;
   }
   if (crossing.length && willBeResolved) {
     const propagationSummary2 = `${crossing.length} task${crossing.length === 1 ? "" : "s"} now ready: ${crossing.map((entry) => entry.itemKey).join(", ")}`;
-    statements.push(...await buildPublicationStatements(db, { organizationId, projectId: command.projectId, projectName: text(project, "name"), eventType: "work_item.downstream_unblocked", workItemId: null, itemKey: null, title: propagationSummary2, summary: propagationSummary2 }));
+    const propagationPublicationStatements = await buildPublicationStatements(db, { organizationId, projectId: command.projectId, projectName: text(project, "name"), eventType: "work_item.downstream_unblocked", workItemId: null, itemKey: null, title: propagationSummary2, summary: propagationSummary2 });
+    statements.push(...propagationPublicationStatements);
+    publicationQueued ||= propagationPublicationStatements.length > 0;
   }
 
   await commitMutation(db, statements);
+  // buildPublicationStatements holds new rows for a 20s debounce window so near-
+  // simultaneous *separate* commands land in one Slack message instead of several (this
+  // one batch's own rows already consolidate on their own via drainSlackOutbox's grouping,
+  // regardless of timing). Without this kick, delivery depends entirely on the cron in
+  // vercel.json - which on a Hobby plan can only run once a day, meaning a real message
+  // would sit unsent for up to 24h. waitUntil extends this request just long enough to
+  // drain what its own commit queued; the cron remains the backstop for whatever a kick
+  // misses (a crashed instance, dead-lettered rows, a burst that outlasts the delay).
+  if (publicationQueued) waitUntil(kickSlackDrain(db));
   await appendPlanOp(db, { organizationId, projectId: command.projectId, type: command.action, payload: opPayloadFrom(command), authorKind: authorKindOf(principal), authorName: actor, sourceId: command.sourceId });
   return response;
 }
 
 /** Hard-downstream items (via DAG_EDGE_TYPES) of `itemId`, with their current blocking_count. */
+/** Waits past buildPublicationStatements' 20s debounce window, then drains whatever is
+ * due. Swallows its own errors: this runs inside waitUntil, well after the response for
+ * the triggering command has already gone out, so nothing here has anyone left to report
+ * a failure to - the daily cron is what actually guarantees delivery either way. */
+async function kickSlackDrain(db: PgD1) {
+  await new Promise((resolve) => setTimeout(resolve, 21_000));
+  try { await drainSlackOutbox(db); } catch { /* the daily cron retries whatever this pass could not reach */ }
+}
+
 async function downstreamOf(db: PgD1, organizationId: string, projectId: string, itemId: string) {
   const rows = await db.prepare(
     `SELECT wi.id AS id, wi.item_key AS "itemKey", wi.blocking_count AS "blockingCount" FROM dependencies d
