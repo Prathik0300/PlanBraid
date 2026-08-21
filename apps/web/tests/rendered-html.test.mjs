@@ -157,6 +157,9 @@ test("keeps primary navigation clear and every visible button actionable", async
   assert.match(integrations, /Review before importing/);
   assert.match(integrations, /Import selected/);
   assert.match(integrations, /nothing here writes work back to/);
+  assert.match(integrations, /reviewRef\.current\?\.scrollIntoView\(\{ behavior: "smooth", block: "start" \}\)/);
+  assert.match(integrations, /<section ref=\{reviewRef\} className="integration-review">/);
+  assert.match(css, /:root\[data-theme="light"\] \.integration-primary\s*\{[^}]*color:\s*#fff !important;[^}]*background:\s*#174f91 !important/);
   assert.doesNotMatch(sidebar, /codingSpaces|safePath|worktree|local main|branch/);
   assert.doesNotMatch(app, /function SourceRail|event-menu|Workspace settings|saved-views/);
   assert.match(app, /aria-pressed=\{view === entry\}/);

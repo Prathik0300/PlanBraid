@@ -66,6 +66,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   const [externalProjectId, setExternalProjectId] = useState("");
   const [filterQuery, setFilterQuery] = useState("");
   const [reviewing, setReviewing] = useState<IntegrationBindingSummary | null>(null);
+  const [reviewReveal, setReviewReveal] = useState(0);
   const [candidates, setCandidates] = useState<ExternalCandidate[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [channelBindings, setChannelBindings] = useState<IntegrationChannelBindingSummary[]>([]);
@@ -76,7 +77,13 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   const [slackEvents, setSlackEvents] = useState<Set<string>>(new Set(DEFAULT_EVENTS));
   const [bindProjectId, setBindProjectId] = useState(projectId ?? "");
   const toastRef = useRef(toast);
+  const reviewRef = useRef<HTMLElement | null>(null);
   useEffect(() => { toastRef.current = toast; }, [toast]);
+  useEffect(() => {
+    if (!reviewReveal) return;
+    const frame = requestAnimationFrame(() => reviewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    return () => cancelAnimationFrame(frame);
+  }, [reviewReveal]);
 
   const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
   const integrationsScope = projectId ?? "all";
@@ -223,7 +230,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
         queryFn: () => fetchData<ExternalCandidate[]>(`/api/integrations/bindings/${binding.id}/candidates`),
         staleTime: 30_000,
       });
-      setReviewing(binding); setCandidates(data); setSelected(new Set(data.filter((item) => item.reviewStatus === "pending").map((item) => item.id)));
+      setReviewing(binding); setCandidates(data); setSelected(new Set(data.filter((item) => item.reviewStatus === "pending").map((item) => item.id))); setReviewReveal((current) => current + 1);
     } catch (error) { toast(messageOf(error)); }
     finally { setBusy(null); }
   }
@@ -320,7 +327,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
       <span className={`integration-provider-mark ${binding.provider}`}><ProviderMark provider={binding.provider} /></span><div><strong>{binding.externalProjectKey ? `${binding.externalProjectKey} · ` : ""}{binding.externalProjectName}</strong><small>{LABEL[binding.provider]} · {projectName(binding.projectId)} · {binding.status.replaceAll("_", " ")}{binding.lastSyncAt ? ` · last synced ${new Date(binding.lastSyncAt).toLocaleString()}` : " · not synced yet"}{binding.lastErrorCode ? ` · ${binding.lastErrorCode}` : ""}</small></div><span className="integration-count">{binding.pendingCount} pending</span>
       <button disabled={rowBusy} title={`Read the latest work from ${LABEL[binding.provider]} into the review queue`} onClick={() => void sync(binding)}>{busy === `sync:${binding.id}` ? "Fetching…" : "Fetch latest"}</button><button disabled={rowBusy} title="Open the staged items without importing them" onClick={() => void openReview(binding)}>Review items</button><button className="integration-danger" disabled={rowBusy} onClick={() => void disconnect(binding)}>Disconnect</button>
     </article>; })}</div> : <p className="integration-empty compact">No external projects are connected yet.</p>}</section>
-    {reviewing && <section className="integration-review"><header><div><h3>Review before importing · {reviewing.externalProjectName}</h3><p>{pendingCandidates.length} items are staged only. Select what you want, then import it into Planbraid. Imported items appear as proposals in the project; nothing here writes work back to {LABEL[reviewing.provider]}.</p></div><button onClick={() => setReviewing(null)}>Close review</button></header>
+    {reviewing && <section ref={reviewRef} className="integration-review"><header><div><h3>Review before importing · {reviewing.externalProjectName}</h3><p>{pendingCandidates.length} items are staged only. Select what you want, then import it into Planbraid. Imported items appear as proposals in the project; nothing here writes work back to {LABEL[reviewing.provider]}.</p></div><button onClick={() => setReviewing(null)}>Close review</button></header>
       <div className="integration-review-toolbar"><label><input type="checkbox" checked={pendingCandidates.length > 0 && pendingCandidates.every((item) => selected.has(item.id))} onChange={(event) => setSelected(event.target.checked ? new Set(pendingCandidates.map((item) => item.id)) : new Set())} /> Select pending</label><button className="integration-primary" disabled={!selected.size || busy !== null} onClick={() => void applySelected()}>{busy === `apply:${reviewing.id}` ? "Importing…" : `Import selected (${selected.size})`}</button></div>
       <div className="integration-candidates">{candidates.length ? candidates.map((candidate) => <article key={candidate.id} className={candidate.reviewStatus !== "pending" ? "decided" : ""}>
         <input type="checkbox" disabled={candidate.reviewStatus !== "pending"} checked={selected.has(candidate.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(candidate.id)) next.delete(candidate.id); else next.add(candidate.id); return next; })} aria-label={`Select ${candidate.title}`} />
