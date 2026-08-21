@@ -71,6 +71,20 @@ export async function listBindings(db: PgD1, principal: Principal, projectId: st
   return result.results.map(mapBinding);
 }
 
+/** Same as listBindings but across every project in the org - the account-level
+ * Integrations tab has no single project in view, unlike the per-project dialog. */
+export async function listAllBindings(db: PgD1, principal: Principal): Promise<IntegrationBindingSummary[]> {
+  const organizationId = await organizationFor(db, principal);
+  const result = await db.prepare(`SELECT b.*,
+      COUNT(e.id) FILTER (WHERE e.review_status = 'pending') AS pending_count,
+      COUNT(e.id) FILTER (WHERE e.review_status IN ('imported','matched')) AS imported_count
+    FROM integration_bindings b LEFT JOIN external_items e ON e.binding_id = b.id
+    WHERE b.organization_id = ? AND b.status <> 'disconnected'
+    GROUP BY b.id ORDER BY b.created_at`)
+    .bind(organizationId).all<Row>();
+  return result.results.map(mapBinding);
+}
+
 export async function listCandidates(db: PgD1, principal: Principal, bindingId: string, limit = 200): Promise<ExternalCandidate[]> {
   const binding = await ownedBinding(db, principal, bindingId);
   const result = await db.prepare(`SELECT e.*, l.work_item_id, w.item_key

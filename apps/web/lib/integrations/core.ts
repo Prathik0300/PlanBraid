@@ -66,8 +66,11 @@ export async function beginProviderOAuth(db: PgD1, principal: Principal, provide
     const url = new URL("https://slack.com/oauth/v2/authorize");
     url.searchParams.set("client_id", clientId);
     // Bot scopes only (no user_scope): posting always happens as the bot, never as the
-    // installing person, so there is no per-user token to request or store.
-    url.searchParams.set("scope", "chat:write,chat:write.public,channels:read,groups:read,team:read");
+    // installing person, so there is no per-user token to request or store. `commands`
+    // is for the /planbraid slash command; message shortcuts need no scope of their own
+    // (Slack pushes the clicked message's content directly in the interaction payload,
+    // so this never reads channel history - see slack-import.ts's file comment).
+    url.searchParams.set("scope", "chat:write,chat:write.public,channels:read,groups:read,team:read,commands");
     url.searchParams.set("redirect_uri", redirectUri);
     url.searchParams.set("state", state);
     return url.toString();

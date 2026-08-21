@@ -1,8 +1,8 @@
 import { env } from "@/lib/runtime-env";
 import { principalFromRequest } from "@/lib/app-principal";
 import { disconnectConnection, listConnections } from "@/lib/integrations/core";
-import { listChannelBindings } from "@/lib/integrations/publish";
-import { listBindings } from "@/lib/integrations/service";
+import { listAllChannelBindings, listChannelBindings } from "@/lib/integrations/publish";
+import { listAllBindings, listBindings } from "@/lib/integrations/service";
 import { errorResponse } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
@@ -11,10 +11,12 @@ export async function GET(request: Request) {
   try {
     const principal = await principalFromRequest(env, request);
     const projectId = new URL(request.url).searchParams.get("projectId");
+    // No projectId means the account-level Integrations tab, which has no single project
+    // in view - list everything in the org rather than nothing.
     const [connections, bindings, channelBindings] = await Promise.all([
       listConnections(env.DB, principal),
-      projectId ? listBindings(env.DB, principal, projectId) : Promise.resolve([]),
-      projectId ? listChannelBindings(env.DB, principal, projectId) : Promise.resolve([]),
+      projectId ? listBindings(env.DB, principal, projectId) : listAllBindings(env.DB, principal),
+      projectId ? listChannelBindings(env.DB, principal, projectId) : listAllChannelBindings(env.DB, principal),
     ]);
     return Response.json({ data: { connections, bindings, channelBindings } }, { headers: { "cache-control": "no-store" } });
   } catch (error) { return errorResponse(error); }

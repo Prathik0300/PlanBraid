@@ -76,6 +76,18 @@ export async function listSlackChannels(db: PgD1, connectionId: string, fetcher:
   return channels.sort((left, right) => left.name.localeCompare(right.name));
 }
 
+/** Best-effort: the created task's description links back to the source message when
+ * this succeeds, and simply omits the link when it doesn't (e.g. the message was deleted
+ * between the shortcut click and this call). Never worth failing task creation over. */
+export async function getSlackPermalink(db: PgD1, connectionId: string, channel: string, messageTs: string, fetcher: ProviderRequest = fetch) {
+  const token = await slackAccessToken(db, connectionId);
+  const url = new URL(`${API}/chat.getPermalink`);
+  url.searchParams.set("channel", channel);
+  url.searchParams.set("message_ts", messageTs);
+  const body = await slackJson<{ permalink: string }>(url.toString(), { provider: "slack", fetcher, headers: { authorization: `Bearer ${token}` } });
+  return body.permalink;
+}
+
 export type SlackBlock = Json;
 
 export async function postSlackMessage(db: PgD1, connectionId: string, channel: string, blocks: SlackBlock[], fallbackText: string, fetcher: ProviderRequest = fetch) {
@@ -86,6 +98,29 @@ export async function postSlackMessage(db: PgD1, connectionId: string, channel: 
     body: JSON.stringify({ channel, blocks: blocks.slice(0, 50), text: fallbackText.slice(0, 4000), unfurl_links: false, unfurl_media: false }),
   });
   return { ts: body.ts, channel: body.channel };
+}
+
+/** Opens a modal from a message shortcut's or slash command's trigger_id. trigger_id is
+ * single-use and expires in ~3 seconds, so the caller must call this immediately on
+ * receiving the interaction, before doing any other work. */
+export async function openSlackModal(db: PgD1, connectionId: string, triggerId: string, view: Json, fetcher: ProviderRequest = fetch) {
+  const token = await slackAccessToken(db, connectionId);
+  await slackJson(`${API}/views.open`, {
+    provider: "slack", fetcher, method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ trigger_id: triggerId, view }),
+  });
+}
+
+/** Visible only to the one Slack user who triggered the action - the confirmation for a
+ * task just created from their shortcut or slash command, not a channel-wide message. */
+export async function postSlackEphemeral(db: PgD1, connectionId: string, channel: string, user: string, text: string, fetcher: ProviderRequest = fetch) {
+  const token = await slackAccessToken(db, connectionId);
+  await slackJson(`${API}/chat.postEphemeral`, {
+    provider: "slack", fetcher, method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ channel, user, text: text.slice(0, 4000) }),
+  });
 }
 
 /**

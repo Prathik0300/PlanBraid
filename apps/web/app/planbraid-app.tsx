@@ -5,16 +5,18 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { authClient } from "@/lib/auth-client";
 import { firstValidationMessage, passwordSchema } from "@/lib/auth-validation";
 import { GoogleIcon } from "@/app/google-icon";
-import { IntegrationsDialog } from "@/app/integrations-dialog";
+import { IntegrationsDialog, IntegrationsPanel } from "@/app/integrations-dialog";
 import { ALLOWED_TRANSITIONS, type Command, type DashboardState, type Notification, type Project, type Provider, type Source, type WorkEvent, type WorkItem, type WorkStatus } from "@/lib/contracts";
 import { deriveColumn, isStartedWhileBlocked } from "@/lib/graph/column.ts";
 import { DAG_EDGE_TYPES } from "@/lib/graph/edges.ts";
 import { accountDisplayName, labelFor, providerFamily } from "@/lib/providers.ts";
 import { confidenceOf } from "@/lib/trust/confidence.ts";
 import { provenanceLabel } from "@/lib/trust/provenance.ts";
+import { dashboardQuery, fetchData, queryKeys } from "@/lib/query-cache";
 import claudeLogo from "@lobehub/icons-static-svg/icons/claude-color.svg";
 import codexLogo from "@lobehub/icons-static-svg/icons/codex-color.svg";
 import copilotLogo from "@lobehub/icons-static-svg/icons/copilot-color.svg";
@@ -222,9 +224,11 @@ export function PlanbraidApp() {
   // in sync with the same session the dialog reads: one source of truth, not three.
   const { data: session } = authClient.useSession();
   const avatarUrl = session?.user.image ?? null;
-  const [data, setData] = useState<DashboardState | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const dashboard = useQuery(dashboardQuery());
+  const data = dashboard.data ?? null;
+  const loading = dashboard.isPending;
+  const error = dashboard.error instanceof Error ? dashboard.error.message : dashboard.error ? "Planbraid could not load" : null;
   const [projectId, setProjectId] = useState(() => initialNav().projectId);
   const [sourceId, setSourceId] = useState<string | null>(null);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
@@ -239,6 +243,7 @@ export function PlanbraidApp() {
   const [commandOpen, setCommandOpen] = useState<false | "search" | "project">(false);
   const [setupOpen, setSetupOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [profileTab, setProfileTab] = useState<"profile" | "integrations">("profile");
   const [integrationProject, setIntegrationProject] = useState<Project | null>(null);
   const [simplifyRun, setSimplifyRun] = useState<SimplifyRun | null>(null);
   const [simplifying, setSimplifying] = useState(false);
@@ -261,25 +266,17 @@ export function PlanbraidApp() {
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async (quiet = false) => {
-    if (!quiet) setLoading(true);
-    try {
-      const response = await fetch("/api/state", { cache: "no-store" });
-      if (!response.ok) throw new Error("Planbraid could not load project state");
-      const state = await response.json() as DashboardState;
-      setData(state);
-      // A selection restored from sessionStorage (or just picked) is only honored if the
-      // project still exists: deleted, or a stale id left over from a much older session,
-      // both fall back to the welcome screen rather than a broken-looking selected-but-
-      // gone state. This same check is what makes a background refresh never interrupt
-      // actually working in a project - it re-validates, not re-picks.
-      setProjectId((current) => (current && state.projects.some((project) => project.id === current)) ? current : "");
-      setError(null);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Planbraid could not load");
-    } finally { setLoading(false); }
-  }, []);
+    void quiet; // retained for command call sites; Query handles foreground/background UI
+    await queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
+  }, [queryClient]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  // A restored selection is honored only while that project still exists. Query cache
+  // updates can arrive from a mutation, SSE, focus recovery, or reconnect; all paths use
+  // this single validation rather than each fetch path implementing its own fallback.
+  useEffect(() => {
+    if (!data) return;
+    setProjectId((current) => (current && data.projects.some((project) => project.id === current)) ? current : "");
+  }, [data]);
 
   // OAuth returns to the app with the originating project in the query string. Restore
   // that context and open the integration manager without leaving callback parameters
@@ -293,6 +290,9 @@ export function PlanbraidApp() {
     if (!integrationProjectId && !provider && !integrationError) return;
     const target = data.projects.find((entry) => entry.id === integrationProjectId);
     if (target) { setProjectId(target.id); setIntegrationProject(target); }
+    // Connected from the account-level Integrations tab, which has no project in the
+    // query string - land back on that tab rather than silently dropping the result.
+    else if (provider) { setProfileTab("integrations"); setProfileOpen(true); }
     if (integrationError) { setToast(integrationError); setTimeout(() => setToast(null), 5000); }
     url.searchParams.delete("integrationProject"); url.searchParams.delete("integration"); url.searchParams.delete("integrationError");
     window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
@@ -305,18 +305,6 @@ export function PlanbraidApp() {
     if (!projectId) { window.sessionStorage.removeItem(NAV_STORAGE_KEY); return; }
     window.sessionStorage.setItem(NAV_STORAGE_KEY, JSON.stringify({ projectId, view }));
   }, [projectId, view]);
-
-  useEffect(() => {
-    // A newly-connected agent (OAuth completing in a separate tab/window, or an MCP
-    // client registering a session directly) has no way to push a signal into this tab:
-    // the SSE stream is scoped to an already-selected project's revision, so it never
-    // fires for a brand new project either. Catching up when the tab regains attention
-    // covers both cases without a manual reload.
-    const onFocus = () => { if (document.visibilityState !== "hidden") void refresh(true); };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onFocus);
-    return () => { window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onFocus); };
-  }, [refresh]);
 
   // theme's own useState initializer (below) already reads the value the blocking
   // script in layout.tsx set on <html> before hydration, so there is nothing left to
@@ -342,16 +330,22 @@ export function PlanbraidApp() {
     stream.addEventListener("project-event", (message) => {
       setNewUpdates((count) => count + 1);
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
-      refreshTimer.current = setTimeout(() => void refresh(true), 250);
+      // Invalidating a shared query deduplicates a burst of local mutation + SSE events.
+      // Every mounted consumer sees the same refreshed snapshot.
+      refreshTimer.current = setTimeout(() => void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard }), 250);
       try {
         const event = JSON.parse((message as MessageEvent).data) as { summary?: string; event_type?: string };
         void showSystemNotification(event.event_type?.includes("blocked") ? "Planbraid needs attention" : "Planbraid update", event.summary ?? "Project work changed");
       } catch { /* reconnect refresh is authoritative */ }
     });
-    stream.onerror = () => stream.close();
-    const fallback = setInterval(() => void refresh(true), 15000);
-    return () => { stream.close(); clearInterval(fallback); if (refreshTimer.current) clearTimeout(refreshTimer.current); };
-  }, [projectId, data?.projects, refresh]);
+    // Native EventSource reconnects. A stale-aware invalidation covers any gap without
+    // the old unconditional 15-second full-dashboard poll.
+    stream.onerror = () => {
+      const lastSuccess = queryClient.getQueryState(queryKeys.dashboard)?.dataUpdatedAt ?? 0;
+      if (Date.now() - lastSuccess >= 15_000) void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard, refetchType: "active" });
+    };
+    return () => { stream.close(); if (refreshTimer.current) clearTimeout(refreshTimer.current); };
+  }, [projectId, data?.projects, queryClient]);
 
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
@@ -415,10 +409,8 @@ export function PlanbraidApp() {
   async function runHandoff() {
     setHandoffLoading(true);
     try {
-      const response = await fetch(`/api/handoff?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
-      const body = await response.json() as { data?: { text: string }; error?: { message?: string } };
-      if (!response.ok || !body.data) throw new Error(body.error?.message ?? "Could not prepare a handoff");
-      setHandoffText(body.data.text);
+      const result = await queryClient.fetchQuery({ queryKey: queryKeys.handoff(projectId, project?.revision ?? 0), queryFn: () => fetchData<{ text: string }>(`/api/handoff?projectId=${encodeURIComponent(projectId)}`), staleTime: 2 * 60_000 });
+      setHandoffText(result.text);
     } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not prepare a handoff"); setTimeout(() => setToast(null), 4000); }
     finally { setHandoffLoading(false); }
   }
@@ -426,10 +418,7 @@ export function PlanbraidApp() {
   async function runHealth() {
     setHealthLoading(true);
     try {
-      const response = await fetch(`/api/health?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
-      const body = await response.json() as { data?: PlanningHealth; error?: { message?: string } };
-      if (!response.ok || !body.data) throw new Error(body.error?.message ?? "Could not compute planning health");
-      setHealth(body.data);
+      setHealth(await queryClient.fetchQuery({ queryKey: queryKeys.health(projectId, project?.revision ?? 0), queryFn: () => fetchData<PlanningHealth>(`/api/health?projectId=${encodeURIComponent(projectId)}`), staleTime: 2 * 60_000 }));
     } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not compute planning health"); setTimeout(() => setToast(null), 4000); }
     finally { setHealthLoading(false); }
   }
@@ -437,10 +426,7 @@ export function PlanbraidApp() {
   async function runPlan() {
     setPlanLoading(true);
     try {
-      const response = await fetch(`/api/plan?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
-      const body = await response.json() as { data?: ExecutionPlan; error?: { message?: string } };
-      if (!response.ok || !body.data) throw new Error(body.error?.message ?? "Could not compute an execution plan");
-      setPlan(body.data);
+      setPlan(await queryClient.fetchQuery({ queryKey: queryKeys.plan(projectId, project?.revision ?? 0), queryFn: () => fetchData<ExecutionPlan>(`/api/plan?projectId=${encodeURIComponent(projectId)}`), staleTime: 2 * 60_000 }));
     } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not compute an execution plan"); setTimeout(() => setToast(null), 4000); }
     finally { setPlanLoading(false); }
   }
@@ -449,13 +435,11 @@ export function PlanbraidApp() {
     if (!projectId) return;
     setSavedViewLoading(true);
     try {
-      const response = await fetch(`/api/views?projectId=${encodeURIComponent(projectId)}&view=${view}`, { cache: "no-store" });
-      const body = await response.json() as { data?: { items: SavedViewItem[] }; error?: { message?: string } };
-      if (!response.ok) throw new Error(body.error?.message ?? "Could not load this view");
-      setSavedViewItems(body.data?.items ?? []);
+      const result = await queryClient.fetchQuery({ queryKey: queryKeys.savedView(projectId, project?.revision ?? 0, view), queryFn: () => fetchData<{ items: SavedViewItem[] }>(`/api/views?projectId=${encodeURIComponent(projectId)}&view=${view}`), staleTime: 2 * 60_000 });
+      setSavedViewItems(result.items);
     } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not load this view"); setTimeout(() => setToast(null), 4000); }
     finally { setSavedViewLoading(false); }
-  }, [projectId]);
+  }, [projectId, project?.revision, queryClient]);
 
   useEffect(() => { if (viewsOpen) void loadSavedView(activeSavedView); }, [viewsOpen, activeSavedView, loadSavedView]);
 
@@ -463,13 +447,10 @@ export function PlanbraidApp() {
     if (!projectId) return;
     setDecisionsLoading(true);
     try {
-      const response = await fetch(`/api/decisions?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
-      const body = await response.json() as { data?: Decision[]; error?: { message?: string } };
-      if (!response.ok) throw new Error(body.error?.message ?? "Could not load decisions");
-      setDecisions(body.data ?? []);
+      setDecisions(await queryClient.fetchQuery({ queryKey: queryKeys.decisions(projectId, project?.revision ?? 0), queryFn: () => fetchData<Decision[]>(`/api/decisions?projectId=${encodeURIComponent(projectId)}`), staleTime: 30_000 }));
     } catch (caught) { setToast(caught instanceof Error ? caught.message : "Could not load decisions"); setTimeout(() => setToast(null), 4000); }
     finally { setDecisionsLoading(false); }
-  }, [projectId]);
+  }, [projectId, project?.revision, queryClient]);
 
   useEffect(() => { if (view === "decisions") void loadDecisions(); }, [view, loadDecisions]);
 
@@ -506,7 +487,7 @@ export function PlanbraidApp() {
   }
 
   if (loading && !data) return <LoadingShell />;
-  if (error && !data) return <ErrorState message={error} retry={() => void refresh()} />;
+  if (error && !data) return <ErrorState message={error} retry={() => void dashboard.refetch()} />;
 
   return (
     <main className={`app-shell ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -547,8 +528,8 @@ export function PlanbraidApp() {
         return result;
       }} />}
       {setupOpen && <SetupDialog project={project} close={() => setSetupOpen(false)} toast={setToast} />}
-      {profileOpen && <ProfileDialog viewer={data!.viewer} close={() => setProfileOpen(false)} />}
-      {integrationProject && <IntegrationsDialog project={integrationProject} close={() => setIntegrationProject(null)} onImported={() => refresh(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 5000); }} />}
+      {profileOpen && <ProfileDialog viewer={data!.viewer} projects={data!.projects} initialTab={profileTab} close={() => setProfileOpen(false)} onImported={() => refresh(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 5000); }} />}
+      {integrationProject && <IntegrationsDialog project={integrationProject} projects={data!.projects} close={() => setIntegrationProject(null)} onImported={() => refresh(true)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 5000); }} />}
       {simplifyRun && <SimplifyPanel run={simplifyRun} busy={applyingFinding} close={() => setSimplifyRun(null)} onApply={(findingId) => void resolveFinding(findingId, "apply")} onDismiss={(findingId) => void resolveFinding(findingId, "dismiss")} />}
       {handoffText && <HandoffDialog text={handoffText} close={() => setHandoffText(null)} toast={(message) => { setToast(message); setTimeout(() => setToast(null), 4000); }} />}
       {health && <HealthDialog health={health} close={() => setHealth(null)} onItem={(id) => { setHealth(null); setSelectedItemId(id); }} />}
@@ -698,7 +679,9 @@ function Header({ project, itemCount, sources, unread, proposalCount, decisionCo
   </header>{project && <nav className="view-tabs" aria-label="Project views">{(["stream", "board", "proposals", "decisions", "list", "inbox", "agents"] as View[]).map((entry) => <button key={entry} className={view === entry ? "active" : ""} aria-pressed={view === entry} onClick={() => setView(entry)}>{entry === "stream" ? "Activity" : entry[0].toUpperCase() + entry.slice(1)}{entry === "inbox" && unread > 0 ? <b>{unread}</b> : null}{entry === "proposals" && proposalCount > 0 ? <b>{proposalCount}</b> : null}{entry === "decisions" && decisionCount > 0 ? <b>{decisionCount}</b> : null}</button>)}</nav>}</>;
 }
 
-function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; close: () => void }) {
+function ProfileDialog({ viewer, projects, initialTab, close, onImported, toast }: { viewer: DashboardState["viewer"]; projects: Project[]; initialTab: "profile" | "integrations"; close: () => void; onImported: () => Promise<void>; toast: (message: string) => void }) {
+  const queryClient = useQueryClient();
+  const [tab, setTab] = useState(initialTab);
   const { data: session, isPending } = authClient.useSession();
   const [name, setName] = useState(viewer.name);
   const [providers, setProviders] = useState<string[]>([]);
@@ -713,17 +696,17 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
 
   useEffect(() => {
     void (async () => {
-      const response = await fetch("/api/github", { cache: "no-store" });
-      if (!response.ok) return;
-      const body = await response.json() as { data?: GithubStatus };
-      setGithub(body.data ?? null);
-    })();
-  }, []);
+      const data = await queryClient.fetchQuery({ queryKey: queryKeys.github, queryFn: () => fetchData<GithubStatus>("/api/github"), staleTime: 5 * 60_000 });
+      setGithub(data);
+    })().catch(() => {});
+  }, [queryClient]);
 
   async function disconnectGithub() {
     setBusy(true);
     try {
       await fetch("/api/github", { method: "DELETE" });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.github });
+      queryClient.removeQueries({ queryKey: queryKeys.githubRepos });
       setGithub((current) => current ? { ...current, connected: false, login: null } : current);
     } finally { setBusy(false); }
   }
@@ -732,13 +715,13 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
     if (local) return;
     void Promise.all([
       authClient.listAccounts(),
-      fetch("/api/account/config", { cache: "no-store" }).then((response) => response.json()),
+      queryClient.fetchQuery({ queryKey: queryKeys.accountConfig, queryFn: () => fetchData<{ googleEnabled?: boolean }>("/api/account/config"), staleTime: 5 * 60_000 }),
     ]).then(([accounts, config]) => {
       setProviders((accounts.data ?? []).map((account) => account.providerId));
-      setGoogleEnabled(Boolean((config as { data?: { googleEnabled?: boolean } }).data?.googleEnabled));
+      setGoogleEnabled(Boolean(config.googleEnabled));
       setAccountsLoaded(true);
     }).catch(() => { setAccountsLoaded(true); setMessage("Account details could not be refreshed."); });
-  }, [local]);
+  }, [local, queryClient]);
 
   async function saveProfile(event: FormEvent) {
     event.preventDefault();
@@ -783,7 +766,8 @@ function ProfileDialog({ viewer, close }: { viewer: DashboardState["viewer"]; cl
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><section className="profile-dialog" role="dialog" aria-modal="true" aria-labelledby="profile-title">
     <header><div><span className="eyebrow">PLANBRAID ACCOUNT</span><h2 id="profile-title">Account &amp; profile</h2><p>Your identity and persistent workspace settings.</p></div><button className="icon-button" onClick={close} aria-label="Close account and profile">×</button></header>
     <div className="profile-identity"><span className="profile-avatar">{session?.user.image ? <span className="profile-image" style={{ backgroundImage: `url(${JSON.stringify(session.user.image)})` }} aria-hidden="true" /> : viewer.name.slice(0, 1).toUpperCase()}</span><span><strong>{session?.user.name || viewer.name}</strong><small>{session?.user.email || viewer.email}</small></span></div>
-    {local ? <div className="profile-local-note"><strong>Local development workspace</strong><p>Account sessions are required on the hosted Planbraid app. Localhost keeps a developer-only workspace so the product can be tested without creating an account.</p></div> : <>
+    <div className="segment profile-tabs"><button className={tab === "profile" ? "active" : ""} onClick={() => setTab("profile")}>Profile</button><button className={tab === "integrations" ? "active" : ""} onClick={() => setTab("integrations")}>Integrations</button></div>
+    {tab === "integrations" ? <IntegrationsPanel projectId={null} projects={projects} onImported={onImported} toast={toast} /> : local ? <div className="profile-local-note"><strong>Local development workspace</strong><p>Account sessions are required on the hosted Planbraid app. Localhost keeps a developer-only workspace so the product can be tested without creating an account.</p></div> : <>
       <form className="profile-form" onSubmit={saveProfile}><label><span>Display name</span><input value={name} onChange={(event) => setName(event.target.value)} minLength={2} maxLength={80} disabled={isPending || busy} /></label><label><span>Email</span><input value={session?.user.email || viewer.email} disabled /></label><button className="primary-wide" disabled={busy || isPending || name.trim() === (session?.user.name || viewer.name)}>Save profile</button></form>
       <div className="login-methods"><div><h3>Sign-in methods</h3><p>Methods with the same verified email belong to this one account and workspace.</p></div><div className={`login-method ${accountsLoaded && !providers.includes("credential") ? "unavailable" : ""}`}><span className="method-icon">@</span><span><strong>Email &amp; password</strong><small>{providers.includes("credential") ? "Connected to this account" : accountsLoaded ? "No password set" : "Checking…"}</small></span><b>{providers.includes("credential") ? "Connected" : accountsLoaded ? "Not set" : "…"}</b></div>{accountsLoaded && !providers.includes("credential") && <form className="password-setup" onSubmit={addPassword}><strong>Add password sign-in</strong><p>You signed up with Google. Set a password if you also want to sign in with this account&apos;s email address.</p><p className="field-hint">Use 10 or more characters with uppercase, lowercase, a number, and a special character.</p><label><span>New password</span><input type="password" autoComplete="new-password" minLength={10} maxLength={128} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label><label><span>Confirm password</span><input type="password" autoComplete="new-password" minLength={10} maxLength={128} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required /></label><button className="primary-wide" disabled={busy}>Add password</button></form>}{providers.includes("google") ? <div className="login-method"><ProviderIcon provider="google" /><span><strong>Google</strong><small>Connected to this account</small></span><b>Connected</b></div> : googleEnabled ? <button className="login-method connect-method" disabled={busy} onClick={() => void linkGoogle()}><ProviderIcon provider="google" /><span><strong>Google</strong><small>Add another secure sign-in method</small></span><b>Connect</b></button> : <div className="login-method unavailable"><ProviderIcon provider="google" /><span><strong>Google</strong><small>Waiting for OAuth credentials</small></span><b>Setup needed</b></div>}</div>
       {github?.configured && <div className="login-methods">
@@ -1312,6 +1296,7 @@ function Composer({ project, sources, busy, onCreate }: { project: Project | nul
 }
 
 function TaskDrawer({ item, source, sources, events, evidence, dependencies, aliases, allItems, viewerName, busy, hideNoteInput, transparentBackdrop, close, transition, note, splitAlias, onItem, linkDependencies }: { item: WorkItem; source: Source | null; sources: Source[]; events: WorkEvent[]; evidence: DashboardState["evidence"]; dependencies: DashboardState["dependencies"]; aliases: DashboardState["aliases"]; allItems: WorkItem[]; viewerName: string; busy: boolean; hideNoteInput?: boolean; transparentBackdrop?: boolean; close: () => void; transition: (status: WorkStatus, reason?: string) => void; note: (summary: string) => void; splitAlias: (aliasId: string) => void; onItem: (id: string) => void; linkDependencies: (prerequisiteIds: string[]) => void }) {
+  const queryClient = useQueryClient();
   const [tab, setTab] = useState<"overview" | "activity" | "evidence">("overview"); const [noteText, setNoteText] = useState("");
   const [addDependencyOpen, setAddDependencyOpen] = useState(false);
   const [whyNotDoneItemId, setWhyNotDoneItemId] = useState(item.id);
@@ -1327,12 +1312,15 @@ function TaskDrawer({ item, source, sources, events, evidence, dependencies, ali
   // not something the drawer's core functionality should ever block on.
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/explain?workItemId=${encodeURIComponent(item.id)}`, { cache: "no-store" })
-      .then((response) => response.ok ? response.json() : null)
-      .then((body) => { if (!cancelled && body?.data) setWhyNotDone(body.data); })
+    queryClient.fetchQuery({
+      queryKey: queryKeys.explain(item.id, item.version),
+      queryFn: () => fetchData<{ summary: string; cause: string }>(`/api/explain?workItemId=${encodeURIComponent(item.id)}`),
+      staleTime: 2 * 60_000,
+    })
+      .then((data) => { if (!cancelled) setWhyNotDone(data); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [item.id]);
+  }, [item.id, item.version, queryClient]);
   const corroboratedProviders = corroboratingProviders(item, aliases, sources);
   // Derived here rather than stored, so a card whose evidence was deleted or whose blocker
   // reopened stops claiming yesterday's confidence. See lib/trust/confidence.ts.
@@ -1391,6 +1379,7 @@ function AddDependencyDialog({ item, allItems, excludeIds, busy, close, onLink }
 }
 
 function CommandDialog({ projects, currentProject, initialMode = "search", busy, close, create }: { projects: Project[]; currentProject: string; initialMode?: "search" | "project"; busy: boolean; close: () => void; create: (input: { name: string; description: string; gitRemote: string }) => Promise<CommandResult> }) {
+  const queryClient = useQueryClient();
   const [mode, setMode] = useState<"search" | "project">(initialMode);
   const [search, setSearch] = useState("");
   const [name, setName] = useState("");
@@ -1406,17 +1395,14 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
   useEffect(() => {
     if (mode !== "project") return;
     void (async () => {
-      const response = await fetch("/api/github", { cache: "no-store" });
-      if (!response.ok) return;
-      const body = await response.json() as { data?: GithubStatus };
-      setGithub(body.data ?? null);
-      if (!body.data?.connected) return;
-      const repoResponse = await fetch("/api/github/repos", { cache: "no-store" });
-      const repoBody = await repoResponse.json() as { data?: GithubRepo[]; error?: { message?: string } };
-      if (repoResponse.ok) setRepos(repoBody.data ?? []);
-      else setRepoError(repoBody.error?.message ?? "Could not load your repositories");
-    })();
-  }, [mode]);
+      const status = await queryClient.fetchQuery({ queryKey: queryKeys.github, queryFn: () => fetchData<GithubStatus>("/api/github"), staleTime: 5 * 60_000 });
+      setGithub(status);
+      if (!status.connected) return;
+      try {
+        setRepos(await queryClient.fetchQuery({ queryKey: queryKeys.githubRepos, queryFn: () => fetchData<GithubRepo[]>("/api/github/repos"), staleTime: 5 * 60_000 }));
+      } catch (error) { setRepoError(error instanceof Error ? error.message : "Could not load your repositories"); }
+    })().catch((error) => setRepoError(error instanceof Error ? error.message : "Could not load GitHub"));
+  }, [mode, queryClient]);
 
   function pickRepo(repo: GithubRepo) {
     setLinkedRepo(repo);
@@ -1498,6 +1484,7 @@ function CommandDialog({ projects, currentProject, initialMode = "search", busy,
 }
 
 function SetupDialog({ project, close, toast }: { project: Project | null; close: () => void; toast: (message: string) => void }) {
+  const queryClient = useQueryClient();
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState<"oauth" | "token">("oauth");
@@ -1534,17 +1521,15 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const response = await fetch("/api/oauth-connections", { headers: { accept: "application/json" } });
-      const body = await response.json() as { data?: McpConnection[] };
-      if (!cancelled && response.ok) setOauthConnections(body.data ?? []);
-    })();
+      const data = await queryClient.fetchQuery({ queryKey: queryKeys.oauthConnections, queryFn: () => fetchData<McpConnection[]>("/api/oauth-connections"), staleTime: 30_000 });
+      if (!cancelled) setOauthConnections(data);
+    })().catch(() => {});
     return () => { cancelled = true; };
-  }, []);
+  }, [queryClient]);
   const loadConnections = useCallback(async () => {
-    const response = await fetch("/api/tokens", { headers: { accept: "application/json" } });
-    const body = await response.json() as { data?: McpConnection[] };
-    if (response.ok) setConnections(body.data ?? []);
-  }, []);
+    const data = await queryClient.fetchQuery({ queryKey: queryKeys.mcpTokens, queryFn: () => fetchData<McpConnection[]>("/api/tokens"), staleTime: 30_000 });
+    setConnections(data);
+  }, [queryClient]);
   async function generate() {
     setBusy(true);
     try {
@@ -1555,6 +1540,7 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       const body = await response.json() as { data?: { token: string }; error?: { message?: string } };
       if (!response.ok) throw new Error(body.error?.message ?? "Could not generate an agent token");
       setToken(body.data?.token ?? "");
+      await queryClient.invalidateQueries({ queryKey: queryKeys.mcpTokens });
       await loadConnections();
     } catch (error) { toast(error instanceof Error ? error.message : "Could not generate an agent token"); }
     finally { setBusy(false); }
@@ -1566,6 +1552,7 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       const body = await response.json() as { error?: { message?: string } };
       if (!response.ok) throw new Error(body.error?.message ?? "Could not revoke this connection");
       setConnections((current) => current.filter((entry) => entry.id !== id));
+      queryClient.setQueryData<McpConnection[]>(queryKeys.mcpTokens, (current) => current?.filter((entry) => entry.id !== id));
       toast("MCP connection revoked");
     } catch (error) { toast(error instanceof Error ? error.message : "Could not revoke this connection"); }
     finally { setRevokingId(null); }
@@ -1577,6 +1564,7 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       const body = await response.json() as { data?: { name: string }; error?: { message?: string } };
       if (!response.ok) throw new Error(body.error?.message ?? "Could not rename this connection");
       setOauthConnections((current) => current.map((entry) => entry.id === id ? { ...entry, name: body.data?.name ?? name.trim() } : entry));
+      queryClient.setQueryData<McpConnection[]>(queryKeys.oauthConnections, (current) => current?.map((entry) => entry.id === id ? { ...entry, name: body.data?.name ?? name.trim() } : entry));
       setRenamingId(null);
       toast("Connection renamed");
     } catch (error) { toast(error instanceof Error ? error.message : "Could not rename this connection"); }
@@ -1588,6 +1576,7 @@ function SetupDialog({ project, close, toast }: { project: Project | null; close
       const body = await response.json() as { error?: { message?: string } };
       if (!response.ok) throw new Error(body.error?.message ?? "Could not revoke this connection");
       setOauthConnections((current) => current.filter((entry) => entry.id !== id));
+      queryClient.setQueryData<McpConnection[]>(queryKeys.oauthConnections, (current) => current?.filter((entry) => entry.id !== id));
       toast("OAuth connection revoked");
     } catch (error) { toast(error instanceof Error ? error.message : "Could not revoke this connection"); }
     finally { setRevokingOAuthId(null); }

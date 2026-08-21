@@ -107,9 +107,10 @@ export const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS work_item_tokens (organization_id TEXT NOT NULL, project_id TEXT NOT NULL, work_item_id TEXT NOT NULL, token TEXT NOT NULL, PRIMARY KEY (project_id, token, work_item_id))`,
   `CREATE INDEX IF NOT EXISTS idx_item_tokens_item ON work_item_tokens(work_item_id)`,
   // E5's static embedding tier (RECONCILIATION_ARCHITECTURE.md §6/§6.1, "Route A — vectors
-  // in Postgres"). `vector` ships with Neon (production) and with @electric-sql/pglite's
-  // bundled vector extension (tests, loaded in tests/support/local-pg.mjs) — both speak the
-  // same pgvector SQL, so this schema and every query against it run unmodified in both.
+  // in Postgres"). `vector` ships with every managed Postgres host this app has run on
+  // (Neon, Supabase) and with @electric-sql/pglite's bundled vector extension (tests,
+  // loaded in tests/support/local-pg.mjs) — all speak the same pgvector SQL, so this
+  // schema and every query against it run unmodified across them.
   `CREATE EXTENSION IF NOT EXISTS vector`,
   // The distilled model's own lookup table: one row per vocabulary token, shared and
   // read-only across every organization — it is model data, not tenant data, the same way
@@ -127,9 +128,9 @@ export const SCHEMA_STATEMENTS = [
   // One mean-pooled embedding per work item, the input to pgvector ANN search. Composite
   // primary key matches every other per-item index table in this file (work_item_artifacts,
   // work_item_tokens) for the same reason: project-scoped uniqueness, not a global one.
-  // HNSW over cosine distance is what §6.1 calls out by name ("Neon supports natively...
-  // serves 1M vectors in 5-20ms") — created unconditionally here since both Neon and
-  // PGlite's bundled extension support it; an empty table costs nothing to index.
+  // HNSW over cosine distance is what §6.1 calls out by name ("serves 1M vectors in
+  // 5-20ms") — created unconditionally here since every Postgres host this schema targets
+  // and PGlite's bundled extension support it; an empty table costs nothing to index.
   `CREATE TABLE IF NOT EXISTS work_item_embeddings (organization_id TEXT NOT NULL, project_id TEXT NOT NULL, work_item_id TEXT NOT NULL, embedding vector(256) NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (project_id, work_item_id))`,
   `CREATE INDEX IF NOT EXISTS idx_item_embeddings_ann ON work_item_embeddings USING hnsw (embedding vector_cosine_ops)`,
   // The golden set for the reconciliation engine (RECONCILIATION_ARCHITECTURE.md E0):

@@ -42,4 +42,4 @@ npm test
 
 `npm test` runs the domain-logic suites (deduplication, dependency graph, auto-unblock, ready-work ranking, derived board columns — against a real embedded Postgres, see `tests/support/local-pg.mjs`), then builds and runs the rendered-HTML/build suite.
 
-The app is a standard Next.js application, deployed on Vercel with a Postgres database (Neon). Every push to `main` on the connected GitHub repo auto-deploys via Vercel's native Git integration; pull requests get preview deployments. Localhost is the only anonymous demo environment — hosted access always requires an account.
+The app is a standard Next.js application, deployed on Vercel with a Postgres database (Supabase). Every push to `main` on the connected GitHub repo auto-deploys via Vercel's native Git integration; pull requests get preview deployments. Localhost is the only anonymous demo environment — hosted access always requires an account.

@@ -53,8 +53,8 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 /** pgvector's text input/output format: `[0.1,0.2,...]`. Both PGlite's bundled vector
- * extension and Neon's pgvector accept this directly as a parameter bound to a `vector`
- * column, and return it in the same shape on read. */
+ * extension and every managed Postgres host's pgvector accept this directly as a
+ * parameter bound to a `vector` column, and return it in the same shape on read. */
 export function vectorLiteral(vec: number[]): string {
   return `[${vec.join(",")}]`;
 }
