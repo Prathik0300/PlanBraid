@@ -327,10 +327,15 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
    skeleton neither collapses nor visibly shifts alignment when real content replaces it. */
 .shell-skeleton-body { flex: 1; min-height: 300px; display: flex; align-items: center; justify-content: center; }
 .shell-skeleton-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; }
-.shell-skeleton-empty .skeleton:nth-child(1) { width: 40px; height: 40px; border-radius: 10px; }
-.shell-skeleton-empty .skeleton:nth-child(2) { width: 220px; height: 14px; margin-top: 6px; }
-.shell-skeleton-empty .skeleton:nth-child(3) { width: 280px; height: 12px; }
-.shell-skeleton-empty .skeleton:nth-child(4) { width: 240px; height: 12px; }
+/* Direct-child combinator, not descendant: :nth-child counts position among a node's own
+   siblings, so a plain ".shell-skeleton-empty .skeleton:nth-child(1)" descendant selector
+   also matches the action row's own first button (also its parent's 1st child) - which is
+   exactly how those buttons ended up sized like the icon and title bar instead of like
+   buttons. */
+.shell-skeleton-empty > .skeleton:nth-child(1) { width: 40px; height: 40px; border-radius: 10px; }
+.shell-skeleton-empty > .skeleton:nth-child(2) { width: 220px; height: 14px; margin-top: 6px; }
+.shell-skeleton-empty > .skeleton:nth-child(3) { width: 280px; height: 12px; }
+.shell-skeleton-empty > .skeleton:nth-child(4) { width: 240px; height: 12px; }
 .shell-skeleton-empty-actions { display: flex; gap: 8px; margin-top: 8px; }
 .shell-skeleton-empty-actions .skeleton { width: 108px; height: 34px; border-radius: 7px; }
 .mobile-nav, .mobile-only { display: none; }
@@ -353,6 +358,17 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 
 @keyframes slide-in { from { transform: translateX(24px); opacity: .6; } }
 @keyframes pop-in { from { transform: translateY(-4px) scale(.99); opacity: .4; } }
+
+/* Planbraid's own replacement for window.confirm - see confirm-dialog.tsx's useConfirm. */
+.confirm-backdrop { z-index: 60; }
+.confirm-dialog { width: min(380px, calc(100vw - 28px)); border: 1px solid #3d4450; background: #15181e; border-radius: 12px; box-shadow: 0 24px 80px #000c; animation: pop-in .14s ease-out; padding: 18px; }
+.confirm-dialog h3 { margin: 0 0 8px; font-size: 15px; }
+.confirm-dialog p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.confirm-actions { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; }
+.confirm-actions button { min-height: 32px; padding: 0 14px; border: 1px solid var(--line); background: var(--panel-3); color: var(--text); border-radius: 7px; font-size: 12px; }
+.confirm-primary { border-color: #4d608a !important; background: #28344d !important; color: #dbe5ff; }
+.confirm-primary.danger { border-color: #74383f !important; background: #32191d !important; color: #ff9ba2; }
+.confirm-primary.danger:hover { background: #432026 !important; }
 
 /* Skeleton placeholders: sized to roughly match the real content they stand in for, so a
    loading state never collapses to a one-line message and then jumps to full height once
@@ -399,7 +415,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 :root[data-theme="light"] .drawer-title p.anomaly-banner { color:var(--orange); }
 :root[data-theme="light"] .event-task:hover, :root[data-theme="light"] .task-card select, :root[data-theme="light"] .composer select { background:var(--panel-2); }
 :root[data-theme="light"] .composer { background:#ffffffef; border-color:var(--line); box-shadow:0 12px 36px #38465a1f; }
-:root[data-theme="light"] .task-drawer, :root[data-theme="light"] .drawer-note, :root[data-theme="light"] .command-dialog, :root[data-theme="light"] .setup-dialog, :root[data-theme="light"] .profile-dialog { background:#fff; }
+:root[data-theme="light"] .task-drawer, :root[data-theme="light"] .drawer-note, :root[data-theme="light"] .command-dialog, :root[data-theme="light"] .setup-dialog, :root[data-theme="light"] .profile-dialog, :root[data-theme="light"] .confirm-dialog { background:#fff; }
 :root[data-theme="light"] .task-drawer { border-left-color:#cbd2dc; box-shadow:-20px 0 60px #31415726; }
 :root[data-theme="light"] .endpoint-box, :root[data-theme="light"] .token-box, :root[data-theme="light"] .oauth-setup-card { background:var(--panel-2); }
 :root[data-theme="light"] .endpoint-box code, :root[data-theme="light"] .token-box code { color:var(--text); }
@@ -441,7 +457,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 :root[data-theme="light"] .segment button.active { color:#1c2027; background:#fff; box-shadow:0 1px 2px #27354818; }
 :root[data-theme="light"] .drawer-tabs button, :root[data-theme="light"] .view-tabs button, :root[data-theme="light"] .filter-scroll button { color:var(--muted); }
 :root[data-theme="light"] .drawer-tabs button:hover, :root[data-theme="light"] .view-tabs button:hover, :root[data-theme="light"] .filter-scroll button:hover { color:#1c2027; }
-:root[data-theme="light"] .command-dialog, :root[data-theme="light"] .setup-dialog, :root[data-theme="light"] .profile-dialog { border-color:#cbd2dc; box-shadow:0 24px 80px #31415726; }
+:root[data-theme="light"] .command-dialog, :root[data-theme="light"] .setup-dialog, :root[data-theme="light"] .profile-dialog, :root[data-theme="light"] .confirm-dialog { border-color:#cbd2dc; box-shadow:0 24px 80px #31415726; }
 :root[data-theme="light"] .command-results button, :root[data-theme="light"] .command-results a { color:#1c2027; }
 :root[data-theme="light"] .command-results button:hover, :root[data-theme="light"] .command-results a:hover, :root[data-theme="light"] .command-results a.current { background:#edf1f6; }
 :root[data-theme="light"] .supported-agents > span, :root[data-theme="light"] .manual-token { color:#5e6977; background:#f7f8fa; border-color:#d5dae2; }
@@ -698,6 +714,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .integration-add > header h3 { margin: 0; }
 .integration-add label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 12px; }
 .integration-add select, .integration-add input { width: 100%; height: 35px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); color: var(--text); padding: 0 9px; outline: 0; }
+.integration-add select { padding-right: 22px; }
 .integration-add label small { color: var(--faint); }
 .integration-add .integration-primary { grid-column: 1 / -1; }
 .integration-add-events, .integration-confirm-all, .integration-add-hint { grid-column: 1 / -1; }

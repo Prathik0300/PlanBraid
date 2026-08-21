@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useConfirm } from "@/app/confirm-dialog";
 import type { Project } from "@/lib/contracts";
 import type { ExternalCandidate, ExternalProject, ExternalResource, IntegrationBindingSummary, IntegrationChannelBindingSummary, IntegrationConnectionSummary, IntegrationProvider } from "@/lib/integrations/types";
 import { fetchData, queryKeys } from "@/lib/query-cache";
@@ -32,16 +33,15 @@ const ALL_PROJECTS = "__all_projects__";
  * any theme-conditional CSS - fill="currentColor" just picks up the badge's own fixed
  * white icon color either way.
  *
- * Basecamp and Jira use their real official marks (path data from simple-icons, MIT-
- * licensed, https://github.com/simple-icons/simple-icons - the standard source for
- * exactly this "show a third party's logo in your own product" use case). Slack's own
- * mark isn't in simple-icons - removed from the package entirely as of the current
- * release, most likely a past trademark takedown - so rather than fabricate something
- * claiming to be Slack's actual logo, this is a stylized four-bar mark evoking it
- * without reproducing the trademarked artwork. */
+ * Basecamp, Jira, and Slack all use their real official marks - path data from
+ * simple-icons (MIT-licensed, https://github.com/simple-icons/simple-icons), the
+ * standard source for exactly this "show a third party's logo in your own product"
+ * use case. Slack's own mark was removed from the current package release (most likely
+ * a past trademark takedown against the project), so this one is pinned from
+ * simple-icons@9.0.0, the last version that still shipped it, rather than the live
+ * package the other two came from. */
 function SlackMark() {
-  const unit = <g><rect x="10.5" y="1" width="3" height="8" rx="1.5" /><circle cx="12" cy="11" r="2.2" /></g>;
-  return <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">{unit}<g transform="rotate(90 12 12)">{unit}</g><g transform="rotate(180 12 12)">{unit}</g><g transform="rotate(270 12 12)">{unit}</g></svg>;
+  return <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zM6.313 15.165a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zM8.834 6.313a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zM17.688 8.834a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zM15.165 18.956a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zM15.165 17.688a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z" /></svg>;
 }
 function BasecampMark() {
   return <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.6516 22.453c-4.0328 0-7.575-1.5542-10.244-4.4946a1.11 1.11 0 0 1-.219-1.1338c.7008-1.8884 2.5935-6.2808 5.0205-6.2948h.0125c1.219 0 2.1312.9655 2.8648 1.7412.2192.2324.555.5875.7818.7611.5656-.5587 1.6775-2.4158 2.5422-4.2779.259-.5567.9203-.7985 1.4765-.5402.557.2584.7988.919.5404 1.4762-2.6217 5.6503-4.019 5.6503-4.478 5.6503-1.022 0-1.7628-.7843-2.4791-1.5422-.3208-.339-.9878-1.045-1.2482-1.045h-.0004c-.5665.095-1.8085 2.0531-2.6966 4.2034 2.1925 2.1722 4.9232 3.2726 8.1266 3.2726 4.3955 0 7.683-1.1964 9.0996-3.2953-.4888-5.585-3.5642-13.1634-9.0996-13.1634-4.6855 0-8.2152 3.264-10.4915 9.7007-.205.579-.8416.8828-1.4187.6776-.5789-.2047-.882-.8398-.6776-1.4185 2.624-7.421 6.859-11.1833 12.5878-11.1833 7.4826 0 10.9304 9.5613 11.3458 15.588a1.1154 1.1154 0 0 1-.1456.6314c-1.7407 3.0221-5.7182 4.6864-11.2002 4.6864Z" /></svg>;
@@ -81,6 +81,7 @@ export function IntegrationsDialog({ project, projects, close, onImported, toast
  * own project picker (defaulted to projectId when one is in scope). */
 export function IntegrationsPanel({ projectId, projects, onImported, toast }: PanelProps) {
   const queryClient = useQueryClient();
+  const { confirm, confirmDialog } = useConfirm();
   const [connections, setConnections] = useState<IntegrationConnectionSummary[]>([]);
   const [bindings, setBindings] = useState<IntegrationBindingSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -173,7 +174,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   }
 
   async function disconnectChannel(binding: IntegrationChannelBindingSummary) {
-    if (!window.confirm(`Stop sending updates to #${binding.channelName || binding.channelId}?`)) return;
+    if (!await confirm({ title: "Disconnect channel", message: `Stop sending updates to #${binding.channelName || binding.channelId}?`, confirmLabel: "Disconnect", danger: true })) return;
     setBusy(`disconnect-channel:${binding.id}`);
     try { await api(`/api/integrations/channel-bindings?bindingId=${encodeURIComponent(binding.id)}`, { method: "DELETE" }); await refreshIntegrations(); }
     catch (error) { toast(messageOf(error)); }
@@ -269,7 +270,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   }
 
   async function disconnect(binding: IntegrationBindingSummary) {
-    if (!window.confirm(`Disconnect ${binding.externalProjectName} from Planbraid? Imported work stays in Planbraid.`)) return;
+    if (!await confirm({ title: "Disconnect project", message: `Disconnect ${binding.externalProjectName} from Planbraid? Imported work stays in Planbraid.`, confirmLabel: "Disconnect", danger: true })) return;
     setBusy(`disconnect:${binding.id}`);
     try { await api(`/api/integrations/bindings?bindingId=${encodeURIComponent(binding.id)}`, { method: "DELETE" }); setReviewing(null); queryClient.removeQueries({ queryKey: queryKeys.integrationCandidates(binding.id) }); await refreshIntegrations(); }
     catch (error) { toast(messageOf(error)); }
@@ -277,7 +278,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   }
 
   async function disconnectAccount(connection: IntegrationConnectionSummary) {
-    if (!connection.id || !window.confirm(`Disconnect ${LABEL[connection.provider]} entirely? Every project binding for this account will stop syncing.`)) return;
+    if (!connection.id || !await confirm({ title: "Disconnect account", message: `Disconnect ${LABEL[connection.provider]} entirely? Every project binding for this account will stop syncing.`, confirmLabel: "Disconnect", danger: true })) return;
     setBusy(`account:${connection.id}`);
     try { await api(`/api/integrations?connectionId=${encodeURIComponent(connection.id)}`, { method: "DELETE" }); setAdding(null); setAddingChannel(false); setReviewing(null); queryClient.removeQueries({ queryKey: ["integration", connection.provider, connection.id] }); await refreshIntegrations(); toast(`${LABEL[connection.provider]} account disconnected`); }
     catch (error) { toast(messageOf(error)); }
@@ -291,7 +292,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
     <section><h3>Accounts</h3><div className="integration-provider-grid">{Array.from({ length: 3 }, (_, index) => <Skeleton key={index} height={56} />)}</div></section>
     <section><h3>Slack channels</h3><div className="integration-bindings"><Skeleton height={52} /></div></section>
   </div>;
-  return <div className="integration-body">
+  return <>{confirmDialog}<div className="integration-body">
     <section><h3>Accounts</h3><div className="integration-provider-grid">{connections.map((connection) => { const rowBusy = busy === "channels:slack" || busy === `resources:${connection.provider}` || busy === `account:${connection.id}`; return <article className="integration-provider-card" key={connection.provider}>
       <div className="integration-provider-top"><span className={`integration-provider-mark ${connection.provider}`}><ProviderMark provider={connection.provider} /></span><div><strong>{LABEL[connection.provider]}</strong><small>{connection.id ? `${connection.label} · ${connection.status.replaceAll("_", " ")}` : connection.configured ? "Ready to connect" : "OAuth configuration required"}</small></div></div>
       <div className="integration-provider-actions">{connection.id ? <><button disabled={rowBusy} onClick={() => void beginAdd(connection.provider)}>{connection.provider === "slack" ? "Add channel" : "Add project"}</button><button className="integration-danger" disabled={rowBusy} onClick={() => void disconnectAccount(connection)}>Disconnect</button></> : connection.configured ? <a href={`/api/integrations/${connection.provider}/connect${query}`}>Connect</a> : <button disabled title="Set the provider OAuth environment variables on the server">Not configured</button>}</div>
@@ -306,7 +307,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
     </section>}
     <section><h3>Slack channels</h3>{channelBindings.length ? <div className="integration-bindings">{channelBindings.map((binding) => { const rowBusy = busy === `test:${binding.id}` || busy === `disconnect-channel:${binding.id}`; return <article key={binding.id}>
       <span className="integration-provider-mark slack"><SlackMark /></span><div><strong>#{binding.channelName || binding.channelId}</strong><small>{binding.scopeType === "all_projects" ? "All projects" : binding.projectName ?? "Unknown project"} · {binding.status.replaceAll("_", " ")}{binding.overlapping ? " · overlaps another binding" : ""}{binding.lastErrorCode ? ` · ${binding.lastErrorCode}` : ""}</small></div><span className="integration-count">{binding.eventTypes.length} event{binding.eventTypes.length === 1 ? "" : "s"}</span>
-      <button disabled={rowBusy} onClick={() => void sendTest(binding)}>{busy === `test:${binding.id}` ? "Sending…" : "Send test"}</button><button className="integration-danger" disabled={rowBusy} onClick={() => void disconnectChannel(binding)}>Disconnect</button>
+      <button disabled={rowBusy} title="Post a confirmation message to this channel now, to check the bot can actually deliver here" onClick={() => void sendTest(binding)}>{busy === `test:${binding.id}` ? "Sending…" : "Send test"}</button><button className="integration-danger" disabled={rowBusy} onClick={() => void disconnectChannel(binding)}>Disconnect</button>
     </article>; })}</div> : <p className="integration-empty compact">No Slack channels are connected yet.</p>}</section>
     {adding && <section className="integration-add"><header><h3>Add a {LABEL[adding]} project</h3><button onClick={() => setAdding(null)}>Cancel</button></header>
       <label>Planbraid project<select value={bindProjectId} onChange={(event) => setBindProjectId(event.target.value)}><option value="">Choose…</option>{projects.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select></label>
@@ -326,7 +327,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
         <div><strong>{candidate.externalKey ? `${candidate.externalKey} · ` : ""}{candidate.title}</strong><small>{candidate.itemType} · {candidate.externalStatus || candidate.normalizedStatus} · {candidate.priority}{candidate.assignee ? ` · ${candidate.assignee}` : ""}</small>{candidate.planningHints.length > 0 && <p>{candidate.planningHints.join(" · ")}</p>}</div><a href={candidate.canonicalUrl} target="_blank" rel="noreferrer">Open</a>{candidate.reviewStatus === "pending" ? <button disabled={busy === `ignore:${candidate.id}`} onClick={() => void ignore(candidate)}>Ignore</button> : <span className="integration-decision">{candidate.workItemKey ?? candidate.reviewStatus}</span>}
       </article>) : <p className="integration-empty compact">Sync this project to discover work.</p>}</div>
     </section>}
-  </div>;
+  </div></>;
 }
 
 async function api<T = Record<string, unknown>>(url: string, init?: RequestInit): Promise<T> {
