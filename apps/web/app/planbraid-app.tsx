@@ -543,7 +543,23 @@ export function PlanbraidApp() {
   );
 }
 
-function LoadingShell() { return <div className="loading-screen"><div className="brand-mark graphic" aria-hidden="true" /><div><strong>Planbraid</strong><span>Braiding your project work…</span></div></div>; }
+/** Reusable shimmering placeholder - width/height are set inline since each call site
+ * needs a different shape (a bar, a row, a card), while the shimmer animation and colors
+ * stay in one shared CSS class. */
+function Skeleton({ width, height, className }: { width?: string | number; height?: string | number; className?: string }) {
+  return <span className={`skeleton ${className ?? ""}`} style={{ width, height }} aria-hidden="true" />;
+}
+/** Same grid shape as the real .app-shell, so the first paint already occupies the page
+ * instead of a small centered spinner that jump-cuts to full width once data lands. */
+function LoadingShell() {
+  return <div className="shell-skeleton">
+    <div className="shell-skeleton-rail">{Array.from({ length: 5 }, (_, index) => <Skeleton key={index} />)}</div>
+    <div className="shell-skeleton-main">
+      <div className="shell-skeleton-header"><Skeleton /><Skeleton /></div>
+      <div className="shell-skeleton-body">{Array.from({ length: 5 }, (_, index) => <Skeleton key={index} />)}</div>
+    </div>
+  </div>;
+}
 function ErrorState({ message, retry }: { message: string; retry: () => void }) { return <div className="error-screen"><div className="brand-mark graphic" aria-hidden="true" /><h1>Couldn’t open Planbraid</h1><p>{message}</p><button onClick={retry}>Try again</button></div>; }
 
 function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSelect, onSource, open, toggle, onNew, onProfile, command, busy, onOpenAccountSetup, onManageIntegrations }: { data: DashboardState; avatarUrl: string | null; selected: string; selectedSource: string | null; sources: Source[]; onSelect: (id: string) => void; onSource: (id: string | null) => void; open: boolean; toggle: () => void; onNew: () => void; onProfile: () => void; command: (command: Command, success: string | ((result: CommandResult) => string)) => Promise<CommandResult>; busy: boolean; onOpenAccountSetup: () => void; onManageIntegrations: (project: Project) => void }) {
@@ -1163,7 +1179,7 @@ function ViewsDialog({ active, setActive, items, loading, close, onItem }: { act
       <header><div><span className="eyebrow">SAVED VIEWS</span><h2 id="views-title">{SAVED_VIEW_LABELS[active]}</h2><p>Fixed structured queries over the current plan, not a search.</p></div><button className="icon-button" onClick={close} aria-label="Close saved views">×</button></header>
       <div className="views-segment">{(Object.keys(SAVED_VIEW_LABELS) as SavedViewName[]).map((view) => <button key={view} className={active === view ? "active" : ""} onClick={() => setActive(view)}>{SAVED_VIEW_LABELS[view]}</button>)}</div>
       {loading
-        ? <p className="muted views-loading">Loading…</p>
+        ? <div className="views-list">{Array.from({ length: 4 }, (_, index) => <Skeleton key={index} height={52} />)}</div>
         : items && items.length
           ? <div className="views-list">{items.map((item) => <button className="views-row" key={item.workItemId} onClick={() => onItem(item.workItemId)}>
               <span><strong>{item.itemKey} {item.title}</strong><small>{item.detail}</small></span>

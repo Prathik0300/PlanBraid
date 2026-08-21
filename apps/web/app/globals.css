@@ -13,6 +13,7 @@
    maintaining the same two declarations on each one individually. Scrolling itself is
    untouched; only the track/thumb rendering is suppressed. */
 * { box-sizing: border-box; scrollbar-width: none; -ms-overflow-style: none; }
+input[type="checkbox"] { cursor: pointer; accent-color: var(--blue); }
 *::-webkit-scrollbar { display: none; width: 0; height: 0; }
 /* Every numeric count badge in the app (tab unread counts, filter-bar counts, board
    column counts, alias/connection counts) shares this rule so the digit sits dead
@@ -310,6 +311,19 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .account-chip { color: var(--faint); font-weight: 450; }
 .access-note { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 10px; border: 1px solid #5a4930; border-radius: 7px; background: #201d18; }.access-note strong { color: var(--orange); font-size: 12px; }.access-note span { color: var(--muted); font-size: 12px; line-height: 1.45; }
 .toast { position: fixed; z-index: 50; bottom: 24px; right: 24px; max-width: 420px; border: 1px solid #465063; background: #20252d; color: #e4e7ec; box-shadow: 0 12px 32px #0008; border-radius: 8px; padding: 10px 13px; font-size: 12px; animation: pop-in .15s ease-out; }.loading-screen, .error-screen { height: 100dvh; display: flex; align-items: center; justify-content: center; gap: 12px; background: var(--bg); }.loading-screen > div:last-child { display: flex; flex-direction: column; gap: 4px; }.loading-screen span, .error-screen p { color: var(--muted); }.error-screen { flex-direction: column; text-align: center; }.error-screen h1 { font-size: 18px; }.error-screen p { max-width: 380px; }.error-screen button { border: 1px solid var(--line); background: var(--panel-2); border-radius: 7px; padding: 7px 12px; }
+/* The initial app-boot loader: same grid shape as the real .app-shell (collapsed rail +
+   content), so the very first paint already occupies the page instead of a small
+   centered spinner that gets replaced by a full-width layout once data lands. */
+.shell-skeleton { height: 100dvh; width: 100vw; display: grid; grid-template-columns: var(--rail-closed) minmax(0, 1fr); overflow: hidden; background: var(--bg); }
+.shell-skeleton-rail { background: #101216; border-right: 1px solid var(--line); padding: 12px 0; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.shell-skeleton-rail .skeleton:first-child { width: 28px; height: 28px; border-radius: 8px; }
+.shell-skeleton-rail .skeleton { width: 26px; height: 26px; border-radius: 7px; }
+.shell-skeleton-main { min-width: 0; display: flex; flex-direction: column; }
+.shell-skeleton-header { height: 52px; flex: 0 0 52px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; padding: 0 16px; }
+.shell-skeleton-header .skeleton:first-child { width: 140px; height: 15px; }
+.shell-skeleton-header .skeleton:last-child { width: 90px; height: 24px; margin-left: auto; border-radius: 6px; }
+.shell-skeleton-body { flex: 1; padding: 22px 26px; display: flex; flex-direction: column; gap: 10px; max-width: 640px; }
+.shell-skeleton-body .skeleton { height: 54px; border-radius: 9px; }
 .mobile-nav, .mobile-only { display: none; }
 .sidebar-toggle { color: var(--muted); }
 .sidebar-toggle[aria-expanded="true"] { color: var(--text); }
@@ -330,6 +344,16 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 
 @keyframes slide-in { from { transform: translateX(24px); opacity: .6; } }
 @keyframes pop-in { from { transform: translateY(-4px) scale(.99); opacity: .4; } }
+
+/* Skeleton placeholders: sized to roughly match the real content they stand in for, so a
+   loading state never collapses to a one-line message and then jumps to full height once
+   data arrives (the Profile/Integrations tab-switch height flash this was built to fix). */
+.skeleton { display: block; background: var(--panel-3); border-radius: 6px; position: relative; overflow: hidden; }
+.skeleton::after { content: ""; position: absolute; inset: 0; transform: translateX(-100%); background: linear-gradient(90deg, transparent, var(--hover), transparent); animation: skeleton-shimmer 1.6s ease-in-out infinite; }
+@keyframes skeleton-shimmer { to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .skeleton::after { animation: none; } }
+.skeleton-row { display: flex; align-items: center; gap: 10px; }
+.skeleton-stack { display: flex; flex-direction: column; gap: 6px; }
 
 @media (max-width: 1180px) {
   :root { --rail: 244px; }
@@ -482,6 +506,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .profile-identity > span:last-child { display:flex; min-width:0; flex-direction:column; gap:4px; }
 .profile-identity strong { font-size:13px; }
 .profile-identity small { overflow:hidden; text-overflow:ellipsis; }
+.profile-tabs { margin:22px 19px 4px; width:fit-content; }
 .profile-avatar { width:42px; height:42px; flex:0 0 42px; border:1px solid var(--line); border-radius:50%; display:grid; place-items:center; overflow:hidden; background:var(--accent-bg); color:var(--accent); font-size:15px; font-weight:650; }
 .profile-image { width:100%; height:100%; display:block; background-position:center; background-size:cover; }
 .profile-form { padding:17px 19px; display:grid; grid-template-columns:1fr 1fr; gap:10px; border-bottom:1px solid var(--line); }
@@ -642,17 +667,22 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .integration-body { overflow-y: auto; padding: 18px 20px 24px; display: flex; flex-direction: column; gap: 22px; }
 .integration-body section > h3, .integration-add header h3, .integration-review header h3 { margin: 0 0 9px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
 .integration-provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
-.integration-provider-card { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; align-items: center; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
-.integration-provider-card > div, .integration-bindings article > div, .integration-candidates article > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+/* flex, not a rigid grid: at narrow widths (the account-tab's profile-dialog is much
+   narrower than the per-project dialog this was first built for) two action buttons no
+   longer crush the name/status text into a near-zero-width ellipsis - they wrap onto
+   their own line under it instead. */
+.integration-provider-card { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.integration-provider-card > div, .integration-bindings article > div, .integration-candidates article > div { min-width: 0; flex: 1 1 120px; display: flex; flex-direction: column; gap: 3px; }
 .integration-provider-card strong, .integration-bindings strong, .integration-candidates strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .integration-provider-card small, .integration-bindings small, .integration-candidates small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
-.integration-provider-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 7px; font-size: 15px; font-weight: 750; }
-.integration-provider-mark.basecamp { color: #fff; background: #2f78c4; }
-.integration-provider-mark.jira { color: #fff; background: #1868db; }
-.integration-provider-mark.slack { color: #fff; background: #4a154b; }
+.integration-provider-mark { width: 32px; height: 32px; flex: 0 0 32px; display: grid; place-items: center; border-radius: 7px; color: #fff; }
+.integration-provider-mark svg { width: 18px; height: 18px; }
+.integration-provider-mark.basecamp { background: #1e3a52; }
+.integration-provider-mark.jira { background: #0c3568; }
+.integration-provider-mark.slack { background: #350d36; }
 .integration-provider-card button, .integration-provider-card a, .integration-add button, .integration-bindings button, .integration-review button, .integration-candidates a { min-height: 29px; display: inline-flex; align-items: center; justify-content: center; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-3); color: var(--text); font-size: 12px; text-decoration: none; white-space: nowrap; }
 .integration-provider-card button:disabled, .integration-add button:disabled, .integration-bindings button:disabled, .integration-review button:disabled { opacity: .5; cursor: default; }
-.integration-provider-actions { display: inline-flex; align-items: center; gap: 6px; }
+.integration-provider-actions { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
 .integration-add { padding: 14px; display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 11px; border: 1px solid #3c4960; border-radius: 9px; background: #141a24; }
 .integration-add > header { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; }
 .integration-add > header h3 { margin: 0; }
@@ -660,9 +690,15 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .integration-add select, .integration-add input { width: 100%; height: 35px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); color: var(--text); padding: 0 9px; outline: 0; }
 .integration-add label small { color: var(--faint); }
 .integration-add .integration-primary { grid-column: 1 / -1; }
-.integration-add-events, .integration-confirm-all { grid-column: 1 / -1; }
-.integration-event-toggles { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 2px; }
-.integration-event-toggles label, .integration-confirm-all { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: 12px; font-weight: 400; }
+.integration-add-events, .integration-confirm-all, .integration-add-hint { grid-column: 1 / -1; }
+.integration-add-hint { margin: -3px 0 0; color: var(--faint); }
+/* One option per row, not a wrapped chip row - a checkbox and its label sharing a line
+   with several others at narrow widths is exactly the crowding/overflow this replaces. */
+.integration-event-toggles { display: flex; flex-direction: column; gap: 1px; margin-top: 2px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.integration-event-toggles label, label.integration-confirm-all { display: flex; flex-direction: row; align-items: center; gap: 9px; color: var(--text); font-size: 12px; font-weight: 400; cursor: pointer; }
+.integration-event-toggles label { padding: 8px 10px; background: var(--panel-2); }
+.integration-event-toggles label:hover { background: var(--hover); }
+.integration-event-toggles input[type="checkbox"], .integration-confirm-all input[type="checkbox"] { width: 15px; height: 15px; flex: 0 0 15px; margin: 0; accent-color: var(--blue); cursor: pointer; }
 .integration-primary { border-color: #4d608a !important; background: #28344d !important; }
 .integration-bindings { display: flex; flex-direction: column; gap: 7px; }
 .integration-bindings article { display: grid; grid-template-columns: 32px minmax(0,1fr) auto auto auto auto; align-items: center; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
@@ -785,7 +821,6 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .views-segment { display: flex; flex-wrap: wrap; gap: 4px; padding: 14px 18px 0; }
 .views-segment button { border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); border-radius: 6px; padding: 6px 10px; font-size: 12px; white-space: nowrap; }
 .views-segment button.active { background: var(--panel-3); color: var(--text); border-color: var(--line); }
-.views-loading { padding: 18px; }
 .views-list { overflow-y: auto; padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 6px; }
 .views-row { display: flex; align-items: center; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); text-align: left; }
 .views-row:hover { background: var(--panel-3); }
