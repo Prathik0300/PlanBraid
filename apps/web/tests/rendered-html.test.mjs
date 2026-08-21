@@ -146,6 +146,9 @@ test("keeps primary navigation clear and every visible button actionable", async
   ]);
   const sidebar = app.slice(app.indexOf("function ProjectRail"), app.indexOf("function Header"));
   assert.match(sidebar, /Projects/);
+  assert.match(sidebar, /basecampProjects/);
+  assert.match(sidebar, /project-provider-toggle/);
+  assert.match(sidebar, /aria-expanded=\{basecampExpanded\}/);
   assert.match(sidebar, /Chats & agents/);
   assert.match(sidebar, /All activity/);
   assert.doesNotMatch(sidebar, /codingSpaces|safePath|worktree|local main|branch/);

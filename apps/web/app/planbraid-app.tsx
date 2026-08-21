@@ -567,6 +567,7 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [managingProject, setManagingProject] = useState<Project | null>(null);
+  const [basecampExpanded, setBasecampExpanded] = useState(true);
 
   function startRename(project: Project) { setRenamingId(project.id); setRenameDraft(project.name); }
   async function saveRename(project: Project) {
@@ -574,6 +575,24 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
     setRenamingId(null);
     if (!name || name === project.name) return;
     await command({ action: "update_project", projectId: project.id, name, idempotencyKey: requestId("rename-project") }, `Renamed to "${name}"`);
+  }
+
+  const basecampProjects = data.projects.filter((project) => project.integrationProviders.includes("basecamp"));
+  const standaloneProjects = data.projects.filter((project) => !project.integrationProviders.includes("basecamp"));
+
+  function projectRow(project: Project) {
+    const taskCount = data.workItems.filter((item) => item.projectId === project.id).length;
+    const activeCount = data.sources.filter((source) => source.projectId === project.id && source.status === "active").length;
+    if (renamingId === project.id) {
+      return <form key={project.id} className="project-row project-rename" onSubmit={(event) => { event.preventDefault(); void saveRename(project); }}>
+        <span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span>
+        <input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} onBlur={() => void saveRename(project)} onKeyDown={(event) => { if (event.key === "Escape") setRenamingId(null); }} maxLength={120} aria-label={`Rename ${project.name}`} />
+      </form>;
+    }
+    return <div key={project.id} className={`project-row-wrap ${selected === project.id ? "selected" : ""}`}>
+      <button className="project-row" onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>
+      <ProjectMenu project={project} busy={busy} onRename={() => startRename(project)} onManageAgents={() => setManagingProject(project)} onManageIntegrations={() => onManageIntegrations(project)} onDelete={() => void command({ action: "delete_project", projectId: project.id, idempotencyKey: requestId("delete-project") }, `Deleted "${project.name}"`)} />
+    </div>;
   }
 
   return <aside className={`project-rail ${open ? "open" : "collapsed"}`} aria-label="Projects and agent conversations">
@@ -585,20 +604,13 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
     {!open && <button className="icon-button sidebar-toggle collapsed-toggle" onClick={toggle} aria-label="Expand projects and agents" aria-expanded={open}><ArrowIcon direction="right" /></button>}
     {open && <><button className="new-project" onClick={onNew}><span>＋</span> New project</button>
     <div className="rail-label">Projects</div>
-    <div className="project-list">{data.projects.map((project) => {
-      const taskCount = data.workItems.filter((item) => item.projectId === project.id).length;
-      const activeCount = data.sources.filter((source) => source.projectId === project.id && source.status === "active").length;
-      if (renamingId === project.id) {
-        return <form key={project.id} className="project-row project-rename" onSubmit={(event) => { event.preventDefault(); void saveRename(project); }}>
-          <span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span>
-          <input autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} onBlur={() => void saveRename(project)} onKeyDown={(event) => { if (event.key === "Escape") setRenamingId(null); }} maxLength={120} aria-label={`Rename ${project.name}`} />
-        </form>;
-      }
-      return <div key={project.id} className={`project-row-wrap ${selected === project.id ? "selected" : ""}`}>
-        <button className="project-row" onClick={() => onSelect(project.id)} aria-current={selected === project.id ? "page" : undefined}><span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-copy"><strong>{project.name}</strong><small>{project.description || "Project workspace"}</small><span>{taskCount} {taskCount === 1 ? "task" : "tasks"}{activeCount ? ` · ${activeCount} active` : ""}</span></span></button>
-        <ProjectMenu project={project} busy={busy} onRename={() => startRename(project)} onManageAgents={() => setManagingProject(project)} onManageIntegrations={() => onManageIntegrations(project)} onDelete={() => void command({ action: "delete_project", projectId: project.id, idempotencyKey: requestId("delete-project") }, `Deleted "${project.name}"`)} />
-      </div>;
-    })}</div>
+    <div className="project-list">
+      {standaloneProjects.map(projectRow)}
+      {basecampProjects.length > 0 && <section className="project-provider-section">
+        <button className="project-provider-toggle" type="button" onClick={() => setBasecampExpanded((expanded) => !expanded)} aria-expanded={basecampExpanded} aria-controls="basecamp-projects"><span className="project-provider-glyph basecamp">B</span><strong>Basecamp</strong><small>{basecampProjects.length}</small><span className="project-provider-chevron" aria-hidden="true">{basecampExpanded ? "⌄" : "›"}</span></button>
+        {basecampExpanded && <div id="basecamp-projects" className="provider-project-list">{basecampProjects.map(projectRow)}</div>}
+      </section>}
+    </div>
     <div className="rail-divider" />
     <div className="rail-label">Chats & agents</div>
     <div className="agent-list"><button className={`source-row all-sources ${selectedSource === null ? "active" : ""}`} onClick={() => onSource(null)}><span className="all-agent-icon">◎</span><span><strong>All activity</strong><small>Every connected conversation</small></span></button>{sources.map((source) => <button key={source.id} className={`source-row ${selectedSource === source.id ? "active" : ""}`} onClick={() => onSource(source.id)}><ProviderIcon provider={source.provider} /><span><strong>{sourceName(source, railAmbiguousFamilies)}</strong><small>{source.title}</small></span><span className={`presence ${source.status}`} title={source.status} /></button>)}</div>

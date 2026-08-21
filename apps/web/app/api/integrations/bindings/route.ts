@@ -13,10 +13,13 @@ export async function POST(request: Request) {
     const connectionId = clean(body.connectionId, 120);
     const externalAccountId = clean(body.externalAccountId, 120);
     const externalProjectId = clean(body.externalProjectId, 120);
-    if (!projectId || !connectionId || !externalAccountId || !externalProjectId) return Response.json({ error: { code: "VALIDATION_FAILED", message: "projectId, connectionId, externalAccountId, and externalProjectId are required" } }, { status: 422 });
+    const provider = integrationProvider(String(body.provider ?? ""));
+    if (!connectionId || !externalAccountId || !externalProjectId) return Response.json({ error: { code: "VALIDATION_FAILED", message: "connectionId, externalAccountId, and externalProjectId are required" } }, { status: 422 });
+    if (!projectId && provider !== "basecamp") return Response.json({ error: { code: "VALIDATION_FAILED", message: "projectId is required for this provider" } }, { status: 422 });
     const data = await createBinding(env.DB, await principalFromRequest(env, request), {
-      projectId, connectionId, provider: integrationProvider(String(body.provider ?? "")), externalAccountId, externalProjectId,
+      projectId: projectId || null, connectionId, provider, externalAccountId, externalProjectId,
       filterQuery: clean(body.filterQuery, 2000), origin: new URL(request.url).origin,
+      projectIdempotencyKey: clean(body.idempotencyKey, 240) || undefined,
     });
     return Response.json({ data }, { status: 201 });
   } catch (error) { return errorResponse(error); }
@@ -32,4 +35,3 @@ export async function DELETE(request: Request) {
 }
 
 function clean(value: unknown, max: number) { return typeof value === "string" ? value.trim().slice(0, max) : ""; }
-

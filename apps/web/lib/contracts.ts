@@ -62,6 +62,9 @@ export type Project = {
   /** When true, work no human has accepted is kept out of the board's working columns and
    * listed in the Proposals queue instead. Off until a project turns it on. */
   gateProposals: boolean;
+  /** Active external work sources bound to this project. This is summary metadata for
+   * navigation grouping; the integration records remain authoritative. */
+  integrationProviders: string[];
 };
 
 export type CodingSpace = {

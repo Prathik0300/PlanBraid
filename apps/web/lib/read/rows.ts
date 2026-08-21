@@ -24,7 +24,8 @@ export type ProjectSettings = { gateProposals?: boolean };
 
 export function mapProject(row: Row): Project {
   const settings = parseJson<ProjectSettings>(text(row, "settings"), {});
-  return { id: text(row, "id"), name: text(row, "name"), description: text(row, "description"), directory: text(row, "directory"), gitRemote: nullable(row, "git_remote"), defaultBranch: text(row, "default_branch"), revision: number(row, "revision"), status: text(row, "status"), updatedAt: text(row, "updated_at"), gateProposals: settings.gateProposals === true };
+  const integrationProviders = Array.isArray(row.integration_providers) ? row.integration_providers.map(String) : parseJson<string[]>(text(row, "integration_providers"), []);
+  return { id: text(row, "id"), name: text(row, "name"), description: text(row, "description"), directory: text(row, "directory"), gitRemote: nullable(row, "git_remote"), defaultBranch: text(row, "default_branch"), revision: number(row, "revision"), status: text(row, "status"), updatedAt: text(row, "updated_at"), gateProposals: settings.gateProposals === true, integrationProviders };
 }
 
 export function mapSource(row: Row, now = Date.now()): Source {

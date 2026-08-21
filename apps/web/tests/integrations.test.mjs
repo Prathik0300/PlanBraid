@@ -3,9 +3,14 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 
 import { normalizeBasecampTodo, normalizeBasecampTodoList } from "@/lib/integrations/basecamp.ts";
+import { saveConnection } from "@/lib/integrations/core.ts";
 import { nextLink, providerFetch, ProviderHttpError } from "@/lib/integrations/http.ts";
+import { createBinding } from "@/lib/integrations/service.ts";
 import { normalizeJiraIssue, verifyJiraWebhookBearer } from "@/lib/integrations/jira.ts";
 import { stableJson, textFromAdf, textFromHtml } from "@/lib/integrations/utils.ts";
+import { loadDashboard, organizationFor } from "@/lib/store.ts";
+import { createTestDb } from "./support/local-pg.mjs";
+import { principal } from "./support/fixtures.mjs";
 
 test("Basecamp normalization preserves hierarchy and planning fields", () => {
   const list = normalizeBasecampTodoList({ id: 20, title: "Checkout", description: "<p>Ship &amp; verify</p>", status: "active", app_url: "https://3.basecamp.com/1/buckets/2/todolists/20" });
@@ -18,6 +23,40 @@ test("Basecamp normalization preserves hierarchy and planning fields", () => {
 test("Basecamp completed and trashed todos map to distinct terminal states", () => {
   assert.equal(normalizeBasecampTodo({ id: 1, content: "Done", completed: true }, null).normalizedStatus, "done");
   assert.equal(normalizeBasecampTodo({ id: 2, content: "Gone", status: "trashed" }, null).normalizedStatus, "cancelled");
+});
+
+test("a Basecamp binding without a destination creates and groups a same-named Planbraid project", async () => {
+  const previousSecret = process.env.BETTER_AUTH_SECRET;
+  process.env.BETTER_AUTH_SECRET = "integration-test-secret-that-is-long-enough";
+  try {
+    const db = await createTestDb();
+    const organizationId = await organizationFor(db, principal);
+    const connectionId = await saveConnection(db, {
+      organizationId, ownerUserId: principal.userId, provider: "basecamp", label: "Basecamp · RadioFX",
+      accessToken: "basecamp-token", refreshToken: "basecamp-refresh", expiresAt: null, scopes: [],
+    });
+    const fetcher = async (input) => {
+      const url = String(input);
+      if (url === "https://launchpad.37signals.com/authorization.json") return Response.json({ accounts: [{ product: "bc3", id: 4933376, name: "RadioFX", href: "https://3.basecampapi.com/4933376" }] });
+      if (url === "https://3.basecampapi.com/4933376/projects.json") return Response.json([{ id: 812, name: "US Dev Team", description: "<p>Build the product</p>", app_url: "https://3.basecamp.com/4933376/buckets/812" }]);
+      throw new Error(`Unexpected Basecamp URL: ${url}`);
+    };
+
+    const result = await createBinding(db, principal, {
+      projectId: null, provider: "basecamp", connectionId, externalAccountId: "4933376", externalProjectId: "812",
+      origin: "http://localhost:3000", projectIdempotencyKey: "basecamp-auto-project",
+    }, fetcher);
+
+    const dashboard = await loadDashboard(db, principal);
+    const project = dashboard.projects.find((entry) => entry.id === result.projectId);
+    assert.equal(result.projectCreated, true);
+    assert.equal(project.name, "US Dev Team");
+    assert.equal(project.description, "Build the product");
+    assert.deepEqual(project.integrationProviders, ["basecamp"]);
+    assert.equal((await db.prepare("SELECT project_id FROM integration_bindings WHERE id = ?").bind(result.bindingId).first()).project_id, result.projectId);
+  } finally {
+    if (previousSecret === undefined) delete process.env.BETTER_AUTH_SECRET; else process.env.BETTER_AUTH_SECRET = previousSecret;
+  }
 });
 
 test("Jira ADF, status, priority, parent and issue links normalize", () => {

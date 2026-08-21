@@ -21,28 +21,43 @@ export async function providerProjects(db: PgD1, principal: Principal, provider:
 }
 
 export async function createBinding(db: PgD1, principal: Principal, input: {
-  projectId: string;
+  projectId: string | null;
   provider: IntegrationProvider;
   connectionId: string;
   externalAccountId: string;
   externalProjectId: string;
   filterQuery?: string;
   origin: string;
+  projectIdempotencyKey?: string;
 }, fetcher: ProviderRequest = fetch) {
+  if (!input.projectId && input.provider !== "basecamp") throw domainError("VALIDATION_FAILED", "Choose a Planbraid project for this integration", 422);
   if (input.provider === "jira" && /\border\s+by\b/i.test(input.filterQuery ?? "")) {
     throw domainError("JIRA_FILTER_INVALID", "Enter only Jira filter conditions; Planbraid controls result ordering", 422);
   }
   const { organizationId } = await requireOwnedConnection(db, principal, input.connectionId, input.provider);
-  await requireOwnedProject(db, organizationId, input.projectId);
   const projects = await providerProjects(db, principal, input.provider, input.connectionId, input.externalAccountId, fetcher);
   const external = projects.find((project) => project.id === input.externalProjectId);
   if (!external) throw domainError("EXTERNAL_PROJECT_NOT_FOUND", "The selected external project is not available to this connection", 404);
+
+  let projectId = input.projectId;
+  let projectCreated = false;
+  if (!projectId) {
+    const created = await executeCommand(db, principal, {
+      action: "create_project",
+      name: external.name,
+      description: external.description,
+      idempotencyKey: input.projectIdempotencyKey ?? `basecamp-import-${crypto.randomUUID()}`,
+    }) as { projectId: string; status?: string };
+    projectId = String(created.projectId);
+    projectCreated = created.status === "created";
+  }
+  await requireOwnedProject(db, organizationId, projectId);
 
   const bindingId = integrationId("ibn");
   const callbackSecret = randomSecret(32);
   const callbackHash = await sha256(callbackSecret);
   const row = await db.prepare("INSERT INTO integration_bindings (id, organization_id, project_id, connection_id, provider, external_account_id, external_account_name, external_project_id, external_project_key, external_project_name, external_base_url, filter_query, settings, webhook_secret, webhook_secret_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project_id, provider, external_account_id, external_project_id) DO UPDATE SET connection_id = excluded.connection_id, external_account_name = excluded.external_account_name, external_project_key = excluded.external_project_key, external_project_name = excluded.external_project_name, external_base_url = excluded.external_base_url, filter_query = excluded.filter_query, settings = excluded.settings, status = 'active', updated_at = now() RETURNING *")
-    .bind(bindingId, organizationId, input.projectId, input.connectionId, input.provider, external.accountId, external.accountName, external.id, external.key, external.name, external.baseUrl, input.filterQuery?.trim().slice(0, 2000) ?? "", JSON.stringify({ externalProjectUrl: external.url }), await sealSecret(callbackSecret), callbackHash).first<Row>();
+    .bind(bindingId, organizationId, projectId, input.connectionId, input.provider, external.accountId, external.accountName, external.id, external.key, external.name, external.baseUrl, input.filterQuery?.trim().slice(0, 2000) ?? "", JSON.stringify({ externalProjectUrl: external.url }), await sealSecret(callbackSecret), callbackHash).first<Row>();
   if (!row) throw domainError("BINDING_SAVE_FAILED", "The integration binding could not be stored", 500);
 
   // Provider webhook destinations must be public HTTPS. Local development retains a
@@ -55,7 +70,7 @@ export async function createBinding(db: PgD1, principal: Principal, input: {
   } else {
     await markBindingError(db, String(row.id), "WEBHOOK_PENDING_HTTPS");
   }
-  return { bindingId: String(row.id), externalProject: external };
+  return { bindingId: String(row.id), externalProject: external, projectId, projectCreated };
 }
 
 export async function listBindings(db: PgD1, principal: Principal, projectId: string): Promise<IntegrationBindingSummary[]> {

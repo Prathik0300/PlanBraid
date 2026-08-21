@@ -188,7 +188,7 @@ async function removeGeneratedProjectShorthands(db: PgD1, organizationId: string
 export async function loadDashboard(db: PgD1, principal: Principal): Promise<DashboardState> {
   const organizationId = await organizationFor(db, principal);
   const presenceNow = Date.now();
-  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows, claimRows] = await db.batch([
+  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows, claimRows, integrationBindingRows] = await db.batch([
     db.prepare("SELECT * FROM projects WHERE organization_id = ? AND status <> 'archived' ORDER BY updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM coding_spaces WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
     db.prepare("SELECT sources.*, (pab.credential_id IS NOT NULL) AS access_blocked FROM sources LEFT JOIN project_access_blocks pab ON pab.project_id = sources.project_id AND pab.credential_id = sources.credential_id WHERE sources.organization_id = ? ORDER BY sources.last_seen_at DESC").bind(organizationId),
@@ -202,10 +202,16 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     // work_claims carries no organization_id of its own (F1's schema), so scoping goes
     // through work_items; only unexpired leases are ever worth shipping to a client.
     db.prepare("SELECT wc.* FROM work_claims wc JOIN work_items wi ON wi.id = wc.work_item_id WHERE wi.organization_id = ? AND wc.lease_expires_at > now()").bind(organizationId),
+    db.prepare("SELECT DISTINCT project_id, provider FROM integration_bindings WHERE organization_id = ? AND status <> 'disconnected'").bind(organizationId),
   ]);
+  const providersByProject = new Map<string, string[]>();
+  for (const row of integrationBindingRows.results as Row[]) {
+    const projectId = text(row, "project_id");
+    providersByProject.set(projectId, [...(providersByProject.get(projectId) ?? []), text(row, "provider")]);
+  }
   return {
     viewer: { id: principal.userId, name: principal.displayName, email: principal.email },
-    projects: (projects.results as Row[]).map(mapProject),
+    projects: (projects.results as Row[]).map((row) => mapProject({ ...row, integration_providers: providersByProject.get(text(row, "id")) ?? [] })),
     codingSpaces: (spaces.results as Row[]).map((row) => ({ id: text(row, "id"), projectId: text(row, "project_id"), label: text(row, "label"), safePath: text(row, "safe_path"), branch: text(row, "branch"), kind: text(row, "kind"), status: text(row, "status"), lastSeenAt: text(row, "last_seen_at") })),
     sources: (sources.results as Row[]).map((row) => mapSource(row, presenceNow)),
     workItems: (items.results as Row[]).map(mapItem),

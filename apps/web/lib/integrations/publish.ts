@@ -95,12 +95,16 @@ export async function updateChannelBinding(db: PgD1, principal: Principal, bindi
     .bind(eventTypes ? JSON.stringify(eventTypes) : null, input.excludedProjectIds ? JSON.stringify(input.excludedProjectIds.slice(0, 500)) : null, binding.id).run();
 }
 
+/** Returns the channel id Slack itself confirms it posted to (chat.postMessage echoes
+ * this back), not just the id we intended - the caller can compare the two directly
+ * instead of trusting our own binding row was the one that actually got hit. */
 export async function sendTestMessage(db: PgD1, principal: Principal, bindingId: string, fetcher: ProviderRequest = fetch) {
   const binding = await ownedChannelBinding(db, principal, bindingId);
-  await postSlackMessage(db, String(binding.connection_id), String(binding.external_channel_id), [
+  const result = await postSlackMessage(db, String(binding.connection_id), String(binding.external_channel_id), [
     { type: "section", text: { type: "mrkdwn", text: ":white_check_mark: *This channel is connected to Planbraid.*" } },
     { type: "context", elements: [{ type: "mrkdwn", text: String(binding.scope_type) === "all_projects" ? "Updates from every current and future eligible project will post here." : "Updates from one Planbraid project will post here." }] },
   ], "Planbraid test message", fetcher);
+  return { intendedChannelId: String(binding.external_channel_id), confirmedChannelId: result.channel };
 }
 
 export async function disconnectChannelBinding(db: PgD1, principal: Principal, bindingId: string) {

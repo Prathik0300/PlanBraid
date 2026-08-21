@@ -168,7 +168,15 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
 
   async function sendTest(binding: IntegrationChannelBindingSummary) {
     setBusy(`test:${binding.id}`);
-    try { await api(`/api/integrations/channel-bindings/${binding.id}/test`, { method: "POST" }); toast(`Test message sent to #${binding.channelName || binding.channelId}`); }
+    try {
+      const result = await api<{ intendedChannelId: string; confirmedChannelId: string }>(`/api/integrations/channel-bindings/${binding.id}/test`, { method: "POST" });
+      // Slack's own chat.postMessage response echoes back the channel it actually posted
+      // to - comparing that against the id this binding stores is the one check that
+      // can't be fooled by a stale cached channel name, on either side of that question.
+      toast(result.confirmedChannelId === result.intendedChannelId
+        ? `Slack confirms it posted to ${result.confirmedChannelId} - the id this binding stores. If that lands somewhere unexpected in your Slack client, the channel itself was likely renamed there.`
+        : `Mismatch: Planbraid asked for ${result.intendedChannelId} but Slack confirms it posted to ${result.confirmedChannelId}. This is a real bug - please report it.`);
+    }
     catch (error) { toast(messageOf(error)); }
     finally { setBusy(null); }
   }
@@ -212,13 +220,14 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   }
 
   async function saveBinding() {
-    if (!adding || !resourceId || !externalProjectId || !bindProjectId) return;
+    if (!adding || !resourceId || !externalProjectId || (adding !== "basecamp" && !bindProjectId)) return;
     const connection = connections.find((entry) => entry.provider === adding);
     if (!connection?.id) return;
     setBusy(`bind:${adding}`);
     try {
-      await api("/api/integrations/bindings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: bindProjectId, provider: adding, connectionId: connection.id, externalAccountId: resourceId, externalProjectId, filterQuery }) });
-      toast(`${LABEL[adding]} project connected`); setAdding(null); await refreshIntegrations();
+      const result = await api<{ projectId: string; projectCreated: boolean }>("/api/integrations/bindings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: bindProjectId || null, provider: adding, connectionId: connection.id, externalAccountId: resourceId, externalProjectId, filterQuery, idempotencyKey: `integration-project-${crypto.randomUUID()}` }) });
+      await onImported();
+      toast(result.projectCreated ? `${LABEL[adding]} project connected and Planbraid project created` : `${LABEL[adding]} project connected`); setAdding(null); await refreshIntegrations();
     } catch (error) { toast(messageOf(error)); }
     finally { setBusy(null); }
   }
@@ -272,7 +281,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   async function disconnect(binding: IntegrationBindingSummary) {
     if (!await confirm({ title: "Disconnect project", message: `Disconnect ${binding.externalProjectName} from Planbraid? Imported work stays in Planbraid.`, confirmLabel: "Disconnect", danger: true })) return;
     setBusy(`disconnect:${binding.id}`);
-    try { await api(`/api/integrations/bindings?bindingId=${encodeURIComponent(binding.id)}`, { method: "DELETE" }); setReviewing(null); queryClient.removeQueries({ queryKey: queryKeys.integrationCandidates(binding.id) }); await refreshIntegrations(); }
+    try { await api(`/api/integrations/bindings?bindingId=${encodeURIComponent(binding.id)}`, { method: "DELETE" }); setReviewing(null); queryClient.removeQueries({ queryKey: queryKeys.integrationCandidates(binding.id) }); await onImported(); await refreshIntegrations(); }
     catch (error) { toast(messageOf(error)); }
     finally { setBusy(null); }
   }
@@ -280,13 +289,28 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
   async function disconnectAccount(connection: IntegrationConnectionSummary) {
     if (!connection.id || !await confirm({ title: "Disconnect account", message: `Disconnect ${LABEL[connection.provider]} entirely? Every project binding for this account will stop syncing.`, confirmLabel: "Disconnect", danger: true })) return;
     setBusy(`account:${connection.id}`);
-    try { await api(`/api/integrations?connectionId=${encodeURIComponent(connection.id)}`, { method: "DELETE" }); setAdding(null); setAddingChannel(false); setReviewing(null); queryClient.removeQueries({ queryKey: ["integration", connection.provider, connection.id] }); await refreshIntegrations(); toast(`${LABEL[connection.provider]} account disconnected`); }
+    try { await api(`/api/integrations?connectionId=${encodeURIComponent(connection.id)}`, { method: "DELETE" }); setAdding(null); setAddingChannel(false); setReviewing(null); queryClient.removeQueries({ queryKey: ["integration", connection.provider, connection.id] }); await onImported(); await refreshIntegrations(); toast(`${LABEL[connection.provider]} account disconnected`); }
     catch (error) { toast(messageOf(error)); }
     finally { setBusy(null); }
   }
 
   const pendingCandidates = useMemo(() => candidates.filter((item) => item.reviewStatus === "pending"), [candidates]);
   const projectName = useCallback((id: string) => projects.find((entry) => entry.id === id)?.name ?? "Unknown project", [projects]);
+  const selectedExternalProject = externalProjects.find((entry) => entry.id === externalProjectId) ?? null;
+
+  // Caught here, before the request round-trip, rather than only surfaced after the fact
+  // via a binding's own "overlapping" flag - the exact "testing" channel bound twice this
+  // session is what this is for.
+  const duplicateChannelBinding = useMemo(() => {
+    if (!slackChannelId || !bindProjectId) return null;
+    const allProjects = bindProjectId === ALL_PROJECTS;
+    return channelBindings.find((binding) => binding.status !== "disconnected" && binding.channelId === slackChannelId
+      && (allProjects ? binding.scopeType === "all_projects" : binding.scopeType === "project" && binding.projectId === bindProjectId)) ?? null;
+  }, [channelBindings, slackChannelId, bindProjectId]);
+  const duplicateProjectBinding = useMemo(() => {
+    if (!adding || !bindProjectId || !externalProjectId) return null;
+    return bindings.find((binding) => binding.status !== "disconnected" && binding.provider === adding && binding.projectId === bindProjectId && binding.externalProjectId === externalProjectId) ?? null;
+  }, [bindings, adding, bindProjectId, externalProjectId]);
 
   if (loading) return <div className="integration-body">
     <section><h3>Accounts</h3><div className="integration-provider-grid">{Array.from({ length: 3 }, (_, index) => <Skeleton key={index} height={56} />)}</div></section>
@@ -302,19 +326,22 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
       <label>Planbraid project<select value={bindProjectId} onChange={(event) => { setBindProjectId(event.target.value); setSlackConfirmAll(false); }}><option value="">Choose…</option>{projects.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}<option value={ALL_PROJECTS}>All current and future projects</option></select></label>
       {bindProjectId === ALL_PROJECTS && <label className="integration-confirm-all"><input type="checkbox" checked={slackConfirmAll} onChange={(event) => setSlackConfirmAll(event.target.checked)} /> I understand every current and future eligible project will publish to this channel</label>}
       <div className="integration-add-events"><span className="label-row">Send updates for</span><div className="integration-event-toggles">{EVENT_TYPES.map((entry) => <label key={entry.value}><input type="checkbox" checked={slackEvents.has(entry.value)} onChange={() => setSlackEvents((current) => { const next = new Set(current); if (next.has(entry.value)) next.delete(entry.value); else next.add(entry.value); return next; })} /> {entry.label}</label>)}</div></div>
-      {!slackChannelId ? <small className="integration-add-hint">Choose a channel to continue.</small> : !bindProjectId ? <small className="integration-add-hint">Choose a Planbraid project to continue.</small> : bindProjectId === ALL_PROJECTS && !slackConfirmAll ? <small className="integration-add-hint">Check the confirmation above to continue.</small> : null}
-      <button className="integration-primary" disabled={!slackChannelId || !bindProjectId || (bindProjectId === ALL_PROJECTS && !slackConfirmAll) || busy !== null} onClick={() => void saveChannelBinding()}>Connect channel</button>
+      {duplicateChannelBinding
+        ? <small className="integration-add-warning">Already connected: #{duplicateChannelBinding.channelName || duplicateChannelBinding.channelId} already publishes {duplicateChannelBinding.scopeType === "all_projects" ? "to all projects" : `to ${projectName(bindProjectId)}`} with these permissions.</small>
+        : !slackChannelId ? <small className="integration-add-hint">Choose a channel to continue.</small> : !bindProjectId ? <small className="integration-add-hint">Choose a Planbraid project to continue.</small> : bindProjectId === ALL_PROJECTS && !slackConfirmAll ? <small className="integration-add-hint">Check the confirmation above to continue.</small> : null}
+      <button className="integration-primary" disabled={!slackChannelId || !bindProjectId || (bindProjectId === ALL_PROJECTS && !slackConfirmAll) || Boolean(duplicateChannelBinding) || busy !== null} onClick={() => void saveChannelBinding()}>Connect channel</button>
     </section>}
     <section><h3>Slack channels</h3>{channelBindings.length ? <div className="integration-bindings">{channelBindings.map((binding) => { const rowBusy = busy === `test:${binding.id}` || busy === `disconnect-channel:${binding.id}`; return <article key={binding.id}>
-      <span className="integration-provider-mark slack"><SlackMark /></span><div><strong>#{binding.channelName || binding.channelId}</strong><small>{binding.scopeType === "all_projects" ? "All projects" : binding.projectName ?? "Unknown project"} · {binding.status.replaceAll("_", " ")}{binding.overlapping ? " · overlaps another binding" : ""}{binding.lastErrorCode ? ` · ${binding.lastErrorCode}` : ""}</small></div><span className="integration-count">{binding.eventTypes.length} event{binding.eventTypes.length === 1 ? "" : "s"}</span>
+      <span className="integration-provider-mark slack"><SlackMark /></span><div><strong>#{binding.channelName || binding.channelId}</strong><small>{binding.channelId} · {binding.scopeType === "all_projects" ? "All projects" : binding.projectName ?? "Unknown project"} · {binding.status.replaceAll("_", " ")}{binding.overlapping ? " · overlaps another binding" : ""}{binding.lastErrorCode ? ` · ${binding.lastErrorCode}` : ""}</small></div><span className="integration-count">{binding.eventTypes.length} event{binding.eventTypes.length === 1 ? "" : "s"}</span>
       <button disabled={rowBusy} title="Post a confirmation message to this channel now, to check the bot can actually deliver here" onClick={() => void sendTest(binding)}>{busy === `test:${binding.id}` ? "Sending…" : "Send test"}</button><button className="integration-danger" disabled={rowBusy} onClick={() => void disconnectChannel(binding)}>Disconnect</button>
     </article>; })}</div> : <p className="integration-empty compact">No Slack channels are connected yet.</p>}</section>
     {adding && <section className="integration-add"><header><h3>Add a {LABEL[adding]} project</h3><button onClick={() => setAdding(null)}>Cancel</button></header>
-      <label>Planbraid project<select value={bindProjectId} onChange={(event) => setBindProjectId(event.target.value)}><option value="">Choose…</option>{projects.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select></label>
+      <label>Planbraid project<select value={bindProjectId} onChange={(event) => setBindProjectId(event.target.value)}><option value="">{adding === "basecamp" ? "Create automatically" : "Choose…"}</option>{projects.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select>{adding === "basecamp" && <small>If no Planbraid project is selected, Planbraid will create one with the same name as the Basecamp project{selectedExternalProject ? ` (“${selectedExternalProject.name}”)` : ""} and connect future syncs to it. An existing same-named Planbraid project will be reused.</small>}</label>
       <label>Account or site<select value={resourceId} onChange={(event) => { const connection = connections.find((entry) => entry.provider === adding); if (connection) void chooseResource(adding, connection.id, event.target.value); }}><option value="">Choose…</option>{resources.map((resource) => <option key={resource.id} value={resource.id}>{resource.name}</option>)}</select></label>
       <label>{LABEL[adding]} project<select value={externalProjectId} disabled={!resourceId || busy === `projects:${adding}`} onChange={(event) => setExternalProjectId(event.target.value)}><option value="">{busy === `projects:${adding}` ? "Loading…" : "Choose…"}</option>{externalProjects.map((entry) => <option key={entry.id} value={entry.id}>{entry.key ? `${entry.key} · ` : ""}{entry.name}</option>)}</select></label>
       {adding === "jira" && <label>Optional JQL conditions<input value={filterQuery} onChange={(event) => setFilterQuery(event.target.value)} placeholder="e.g. labels = planbraid" maxLength={2000} /><small>Do not include ORDER BY; Planbraid always scopes this to the selected project.</small></label>}
-      <button className="integration-primary" disabled={!externalProjectId || !bindProjectId || busy !== null} onClick={() => void saveBinding()}>Connect project</button>
+      {duplicateProjectBinding && <small className="integration-add-warning">Already connected: {duplicateProjectBinding.externalProjectKey ? `${duplicateProjectBinding.externalProjectKey} · ` : ""}{duplicateProjectBinding.externalProjectName} is already linked to {projectName(bindProjectId)}.</small>}
+      <button className="integration-primary" disabled={!externalProjectId || (adding !== "basecamp" && !bindProjectId) || Boolean(duplicateProjectBinding) || busy !== null} onClick={() => void saveBinding()}>{adding === "basecamp" && !bindProjectId ? "Create and connect project" : "Connect project"}</button>
     </section>}
     <section><h3>Connected projects</h3>{bindings.length ? <div className="integration-bindings">{bindings.map((binding) => { const rowBusy = busy === `sync:${binding.id}` || busy === `review:${binding.id}` || busy === `disconnect:${binding.id}`; return <article key={binding.id}>
       <span className={`integration-provider-mark ${binding.provider}`}><ProviderMark provider={binding.provider} /></span><div><strong>{binding.externalProjectKey ? `${binding.externalProjectKey} · ` : ""}{binding.externalProjectName}</strong><small>{LABEL[binding.provider]} · {projectName(binding.projectId)} · {binding.status.replaceAll("_", " ")}{binding.lastSyncAt ? ` · last synced ${new Date(binding.lastSyncAt).toLocaleString()}` : " · not synced yet"}{binding.lastErrorCode ? ` · ${binding.lastErrorCode}` : ""}</small></div><span className="integration-count">{binding.pendingCount} pending</span>
