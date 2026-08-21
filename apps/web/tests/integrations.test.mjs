@@ -5,12 +5,19 @@ import test from "node:test";
 import { normalizeBasecampTodo, normalizeBasecampTodoList } from "@/lib/integrations/basecamp.ts";
 import { saveConnection } from "@/lib/integrations/core.ts";
 import { nextLink, providerFetch, ProviderHttpError } from "@/lib/integrations/http.ts";
-import { createBinding } from "@/lib/integrations/service.ts";
+import { createBinding, disconnectBinding } from "@/lib/integrations/service.ts";
 import { normalizeJiraIssue, verifyJiraWebhookBearer } from "@/lib/integrations/jira.ts";
+import { IMPORT_ONLY_PROVIDERS, PUBLICATION_PROVIDERS } from "@/lib/integrations/types.ts";
 import { stableJson, textFromAdf, textFromHtml } from "@/lib/integrations/utils.ts";
 import { loadDashboard, organizationFor } from "@/lib/store.ts";
 import { createTestDb } from "./support/local-pg.mjs";
 import { principal } from "./support/fixtures.mjs";
+
+test("Basecamp and Jira are import-only while Slack is the only publication provider", () => {
+  assert.deepEqual(IMPORT_ONLY_PROVIDERS, ["basecamp", "jira"]);
+  assert.deepEqual(PUBLICATION_PROVIDERS, ["slack"]);
+  assert.equal(IMPORT_ONLY_PROVIDERS.some((provider) => PUBLICATION_PROVIDERS.includes(provider)), false);
+});
 
 test("Basecamp normalization preserves hierarchy and planning fields", () => {
   const list = normalizeBasecampTodoList({ id: 20, title: "Checkout", description: "<p>Ship &amp; verify</p>", status: "active", app_url: "https://3.basecamp.com/1/buckets/2/todolists/20" });
@@ -54,6 +61,12 @@ test("a Basecamp binding without a destination creates and groups a same-named P
     assert.equal(project.description, "Build the product");
     assert.deepEqual(project.integrationProviders, ["basecamp"]);
     assert.equal((await db.prepare("SELECT project_id FROM integration_bindings WHERE id = ?").bind(result.bindingId).first()).project_id, result.projectId);
+
+    await db.prepare("UPDATE integration_bindings SET webhook_id = 'provider-webhook-1' WHERE id = ?").bind(result.bindingId).run();
+    let providerCalls = 0;
+    await disconnectBinding(db, principal, result.bindingId, async () => { providerCalls += 1; throw new Error("Disconnect must not call Basecamp"); });
+    assert.equal(providerCalls, 0);
+    assert.deepEqual(await db.prepare("SELECT status, webhook_id FROM integration_bindings WHERE id = ?").bind(result.bindingId).first(), { status: "disconnected", webhook_id: null });
   } finally {
     if (previousSecret === undefined) delete process.env.BETTER_AUTH_SECRET; else process.env.BETTER_AUTH_SECRET = previousSecret;
   }

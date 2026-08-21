@@ -9,6 +9,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { authClient } from "@/lib/auth-client";
 import { firstValidationMessage, passwordSchema } from "@/lib/auth-validation";
 import { GoogleIcon } from "@/app/google-icon";
+import { ProviderMark } from "@/app/integration-provider-mark";
 import { IntegrationsDialog, IntegrationsPanel } from "@/app/integrations-dialog";
 import { ALLOWED_TRANSITIONS, type Command, type DashboardState, type Notification, type Project, type Provider, type Source, type WorkEvent, type WorkItem, type WorkStatus } from "@/lib/contracts";
 import { deriveColumn, isStartedWhileBlocked } from "@/lib/graph/column.ts";
@@ -27,6 +28,7 @@ import windsurfLogo from "@lobehub/icons-static-svg/icons/windsurf.svg";
 
 type View = "stream" | "board" | "proposals" | "decisions" | "list" | "inbox" | "agents";
 type Theme = "dark" | "light";
+type WorkIntegrationProvider = "basecamp" | "jira";
 type McpConnection = { id: string; name: string; scopes: string[]; lastUsedAt: string | null; createdAt: string };
 type CommandResult = { projectId?: string; status?: "created" | "matched" | "uncertain"; matchedOn?: string; project?: { id: string; name: string } };
 type GithubStatus = { connected: boolean; login: string | null; configured: boolean };
@@ -567,7 +569,7 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [managingProject, setManagingProject] = useState<Project | null>(null);
-  const [basecampExpanded, setBasecampExpanded] = useState(true);
+  const [expandedProviders, setExpandedProviders] = useState<Record<WorkIntegrationProvider, boolean>>({ basecamp: true, jira: true });
 
   function startRename(project: Project) { setRenamingId(project.id); setRenameDraft(project.name); }
   async function saveRename(project: Project) {
@@ -577,8 +579,11 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
     await command({ action: "update_project", projectId: project.id, name, idempotencyKey: requestId("rename-project") }, `Renamed to "${name}"`);
   }
 
-  const basecampProjects = data.projects.filter((project) => project.integrationProviders.includes("basecamp"));
-  const standaloneProjects = data.projects.filter((project) => !project.integrationProviders.includes("basecamp"));
+  const providerSections: Array<{ provider: WorkIntegrationProvider; label: string; projects: Project[] }> = [
+    { provider: "basecamp", label: "Basecamp", projects: data.projects.filter((project) => project.integrationProviders.includes("basecamp")) },
+    { provider: "jira", label: "Jira", projects: data.projects.filter((project) => project.integrationProviders.includes("jira")) },
+  ];
+  const standaloneProjects = data.projects.filter((project) => !providerSections.some((section) => section.projects.some((entry) => entry.id === project.id)));
 
   function projectRow(project: Project) {
     const taskCount = data.workItems.filter((item) => item.projectId === project.id).length;
@@ -606,10 +611,10 @@ function ProjectRail({ data, avatarUrl, selected, selectedSource, sources, onSel
     <div className="rail-label">Projects</div>
     <div className="project-list">
       {standaloneProjects.map(projectRow)}
-      {basecampProjects.length > 0 && <section className="project-provider-section">
-        <button className="project-provider-toggle" type="button" onClick={() => setBasecampExpanded((expanded) => !expanded)} aria-expanded={basecampExpanded} aria-controls="basecamp-projects"><span className="project-provider-glyph basecamp">B</span><strong>Basecamp</strong><small>{basecampProjects.length}</small><span className="project-provider-chevron" aria-hidden="true">{basecampExpanded ? "⌄" : "›"}</span></button>
-        {basecampExpanded && <div id="basecamp-projects" className="provider-project-list">{basecampProjects.map(projectRow)}</div>}
-      </section>}
+      {providerSections.map(({ provider, label, projects }) => projects.length > 0 && <section className="project-provider-section" key={provider}>
+        <button className="project-provider-toggle" type="button" onClick={() => setExpandedProviders((current) => ({ ...current, [provider]: !current[provider] }))} aria-expanded={expandedProviders[provider]} aria-controls={`${provider}-projects`}><span className={`project-provider-glyph ${provider}`}><ProviderMark provider={provider} /></span><strong>{label}</strong><small>{projects.length}</small><span className="project-provider-chevron" aria-hidden="true">{expandedProviders[provider] ? "⌄" : "›"}</span></button>
+        {expandedProviders[provider] && <div id={`${provider}-projects`} className="provider-project-list">{projects.map(projectRow)}</div>}
+      </section>)}
     </div>
     <div className="rail-divider" />
     <div className="rail-label">Chats & agents</div>

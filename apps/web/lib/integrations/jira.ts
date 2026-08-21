@@ -170,16 +170,6 @@ export async function refreshJiraWebhook(db: PgD1, binding: Json, fetcher: Provi
   return new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString();
 }
 
-export async function deleteJiraWebhook(db: PgD1, binding: Json, fetcher: ProviderRequest = fetch) {
-  if (!binding.webhook_id) return;
-  const token = await jiraAccessToken(db, String(binding.connection_id), fetcher);
-  const baseUrl = checkedJiraBaseUrl(String(binding.external_base_url), String(binding.external_account_id));
-  await providerFetch(`${baseUrl}/rest/api/3/webhook`, {
-    provider: "jira", fetcher, method: "DELETE", headers: { ...jiraHeaders(token), "content-type": "application/json" },
-    body: JSON.stringify({ webhookIds: [Number(binding.webhook_id)] }), maxRetries: 1,
-  });
-}
-
 /** Atlassian signs the OAuth webhook bearer token with the app client secret. Only HS256
  * is accepted, and temporal claims are checked when present. The high-entropy callback
  * path is a second independent binding check performed by the webhook route. */

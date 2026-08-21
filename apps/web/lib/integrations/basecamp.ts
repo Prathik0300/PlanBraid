@@ -150,13 +150,6 @@ export async function createBasecampWebhook(db: PgD1, binding: Json, callbackUrl
   return { id: String(body.id), expiresAt: null };
 }
 
-export async function deleteBasecampWebhook(db: PgD1, binding: Json, fetcher: ProviderRequest = fetch) {
-  if (!binding.webhook_id) return;
-  const token = await basecampAccessToken(db, String(binding.connection_id), fetcher);
-  const baseUrl = checkedBasecampBaseUrl(String(binding.external_base_url), String(binding.external_account_id));
-  await providerFetch(`${baseUrl}/webhooks/${encodeURIComponent(String(binding.webhook_id))}.json`, { provider: "basecamp", fetcher, method: "DELETE", headers: basecampHeaders(token), maxRetries: 1 });
-}
-
 function basecampHeaders(token: string) {
   return { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": userAgent() };
 }

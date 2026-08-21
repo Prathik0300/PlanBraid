@@ -1,8 +1,8 @@
 import type { PgD1 } from "@/db/pg-d1";
 import type { Proposal } from "@/lib/dedup/match";
-import { createBasecampWebhook, deleteBasecampWebhook, fetchBasecampProjectItems, fetchBasecampTodo, listBasecampProjects, listBasecampResources } from "@/lib/integrations/basecamp";
+import { createBasecampWebhook, fetchBasecampProjectItems, fetchBasecampTodo, listBasecampProjects, listBasecampResources } from "@/lib/integrations/basecamp";
 import { domainError, integrationProvider, requireOwnedConnection, requireOwnedProject } from "@/lib/integrations/core";
-import { createJiraWebhook, deleteJiraWebhook, fetchJiraIssue, fetchJiraProjectItems, listJiraProjects, listJiraResources, refreshJiraWebhook } from "@/lib/integrations/jira";
+import { createJiraWebhook, fetchJiraIssue, fetchJiraProjectItems, listJiraProjects, listJiraResources, refreshJiraWebhook } from "@/lib/integrations/jira";
 import type { ExternalCandidate, IntegrationBindingSummary, IntegrationProvider, NormalizedExternalItem, ProviderRequest } from "@/lib/integrations/types";
 import { constantTimeEqual, integrationId, parseJson, randomSecret, sha256, stableJson } from "@/lib/integrations/utils";
 import { openSecret, sealSecret } from "@/lib/crypto-box";
@@ -214,12 +214,11 @@ export async function ignoreCandidate(db: PgD1, principal: Principal, bindingId:
   if (!result) throw domainError("EXTERNAL_ITEM_NOT_FOUND", "External item not found", 404);
 }
 
-export async function disconnectBinding(db: PgD1, principal: Principal, bindingId: string, fetcher: ProviderRequest = fetch) {
+export async function disconnectBinding(db: PgD1, principal: Principal, bindingId: string) {
   const binding = await ownedBinding(db, principal, bindingId);
-  try {
-    if (binding.provider === "basecamp") await deleteBasecampWebhook(db, binding, fetcher);
-    else await deleteJiraWebhook(db, binding, fetcher);
-  } catch { /* disconnect locally even if the provider is unavailable */ }
+  // Disconnect is deliberately local-only. Planbraid must never delete Basecamp or
+  // Jira data or configuration, including provider-side webhook registrations. A stale
+  // provider delivery is harmless: this binding no longer resolves and is ignored.
   await db.prepare("UPDATE integration_bindings SET status = 'disconnected', webhook_id = NULL, updated_at = now() WHERE id = ? AND organization_id = ?")
     .bind(bindingId, binding.organization_id).run();
 }

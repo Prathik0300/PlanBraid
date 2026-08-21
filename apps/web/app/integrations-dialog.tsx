@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useConfirm } from "@/app/confirm-dialog";
+import { ProviderMark, SlackMark } from "@/app/integration-provider-mark";
 import type { Project } from "@/lib/contracts";
 import type { ExternalCandidate, ExternalProject, ExternalResource, IntegrationBindingSummary, IntegrationChannelBindingSummary, IntegrationConnectionSummary, IntegrationProvider } from "@/lib/integrations/types";
 import { fetchData, queryKeys } from "@/lib/query-cache";
@@ -28,39 +29,11 @@ const DEFAULT_EVENTS = new Set(["work_item.blocked", "work_item.downstream_unblo
  * stayed disabled after picking "This project only" and no project). */
 const ALL_PROJECTS = "__all_projects__";
 
-/** Solid brand-color badges (see .integration-provider-mark) rather than text on a
- * transparent background, so these render identically in light and dark theme without
- * any theme-conditional CSS - fill="currentColor" just picks up the badge's own fixed
- * white icon color either way.
- *
- * Basecamp, Jira, and Slack all use their real official marks - path data from
- * simple-icons (MIT-licensed, https://github.com/simple-icons/simple-icons), the
- * standard source for exactly this "show a third party's logo in your own product"
- * use case. Slack's own mark was removed from the current package release (most likely
- * a past trademark takedown against the project), so this one is pinned from
- * simple-icons@9.0.0, the last version that still shipped it, rather than the live
- * package the other two came from. */
-function SlackMark() {
-  return <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zM6.313 15.165a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zM8.834 6.313a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zM17.688 8.834a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zM15.165 18.956a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zM15.165 17.688a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z" /></svg>;
-}
-function BasecampMark() {
-  return <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.6516 22.453c-4.0328 0-7.575-1.5542-10.244-4.4946a1.11 1.11 0 0 1-.219-1.1338c.7008-1.8884 2.5935-6.2808 5.0205-6.2948h.0125c1.219 0 2.1312.9655 2.8648 1.7412.2192.2324.555.5875.7818.7611.5656-.5587 1.6775-2.4158 2.5422-4.2779.259-.5567.9203-.7985 1.4765-.5402.557.2584.7988.919.5404 1.4762-2.6217 5.6503-4.019 5.6503-4.478 5.6503-1.022 0-1.7628-.7843-2.4791-1.5422-.3208-.339-.9878-1.045-1.2482-1.045h-.0004c-.5665.095-1.8085 2.0531-2.6966 4.2034 2.1925 2.1722 4.9232 3.2726 8.1266 3.2726 4.3955 0 7.683-1.1964 9.0996-3.2953-.4888-5.585-3.5642-13.1634-9.0996-13.1634-4.6855 0-8.2152 3.264-10.4915 9.7007-.205.579-.8416.8828-1.4187.6776-.5789-.2047-.882-.8398-.6776-1.4185 2.624-7.421 6.859-11.1833 12.5878-11.1833 7.4826 0 10.9304 9.5613 11.3458 15.588a1.1154 1.1154 0 0 1-.1456.6314c-1.7407 3.0221-5.7182 4.6864-11.2002 4.6864Z" /></svg>;
-}
-function JiraMark() {
-  return <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-    <path d="M11.571 11.513H0a5.218 5.218 0 0 0 5.232 5.215h2.13v2.057A5.215 5.215 0 0 0 12.575 24V12.518a1.005 1.005 0 0 0-1.005-1.005z" />
-    <path d="M17.294 5.757H5.736a5.215 5.215 0 0 0 5.215 5.214h2.129v2.058a5.218 5.218 0 0 0 5.215 5.214V6.758a1.001 1.001 0 0 0-1.001-1.001z" />
-    <path d="M23.013 0H11.455a5.215 5.215 0 0 0 5.215 5.215h2.129v2.057A5.215 5.215 0 0 0 24 12.483V1.005A1.001 1.001 0 0 0 23.013 0z" />
-  </svg>;
-}
 /** Same shimmering-placeholder primitive as planbraid-app.tsx's Skeleton - duplicated
  * rather than imported since it's three lines and importing across that direction would
  * create planbraid-app.tsx <-> this file's existing one-way import cycle. */
 function Skeleton({ width, height }: { width?: string | number; height?: string | number }) {
   return <span className="skeleton" style={{ width, height }} aria-hidden="true" />;
-}
-function ProviderMark({ provider }: { provider: IntegrationProvider }) {
-  return provider === "basecamp" ? <BasecampMark /> : provider === "slack" ? <SlackMark /> : <JiraMark />;
 }
 
 /** The per-project entry point (project ⋯ menu → "Manage work integrations"). Thin chrome
@@ -69,7 +42,7 @@ function ProviderMark({ provider }: { provider: IntegrationProvider }) {
 export function IntegrationsDialog({ project, projects, close, onImported, toast }: DialogProps) {
   return <div className="dialog-backdrop integrations-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
     <section className="integrations-dialog" role="dialog" aria-modal="true" aria-labelledby="integrations-title">
-      <header><div><span className="eyebrow">WORK INTEGRATIONS</span><h2 id="integrations-title">Integrations for {project.name}</h2><p>Import external work into a review queue, and publish plan updates to Slack.</p></div><button className="icon-button" onClick={close} aria-label="Close">×</button></header>
+      <header><div><span className="eyebrow">WORK INTEGRATIONS</span><h2 id="integrations-title">Integrations for {project.name}</h2><p>Basecamp and Jira are read-only sources: review their work and import it into Planbraid. Only connected Slack channels receive Planbraid updates.</p></div><button className="icon-button" onClick={close} aria-label="Close">×</button></header>
       <IntegrationsPanel projectId={project.id} projects={projects} onImported={onImported} toast={toast} />
     </section>
   </div>;
@@ -237,7 +210,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
     try {
       const result = await api<{ fetched: number; changed: number }>(`/api/integrations/bindings/${binding.id}/sync`, { method: "POST" });
       await queryClient.invalidateQueries({ queryKey: queryKeys.integrationCandidates(binding.id) });
-      toast(`Found ${result.fetched} items; ${result.changed} changed`); await refreshIntegrations(); await openReview(binding);
+      toast(`Fetched ${result.fetched} items; ${result.changed} changed. Nothing is added to Planbraid until you import selected items.`); await refreshIntegrations(); await openReview(binding);
     } catch (error) { toast(messageOf(error)); }
     finally { setBusy(null); }
   }
@@ -261,7 +234,7 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
     try {
       const result = await api<{ created: number; matched: number }>(`/api/integrations/bindings/${reviewing.id}/candidates`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "apply", externalItemIds: [...selected] }) });
       await queryClient.invalidateQueries({ queryKey: queryKeys.integrationCandidates(reviewing.id) });
-      toast(`Imported ${result.created}; matched ${result.matched} existing items`); await onImported(); await openReview(reviewing); await refreshIntegrations();
+      toast(`Added ${result.created} Planbraid proposals; linked ${result.matched} to existing work`); await onImported(); await openReview(reviewing); await refreshIntegrations();
     } catch (error) { toast(messageOf(error)); }
     finally { setBusy(null); }
   }
@@ -343,12 +316,12 @@ export function IntegrationsPanel({ projectId, projects, onImported, toast }: Pa
       {duplicateProjectBinding && <small className="integration-add-warning">Already connected: {duplicateProjectBinding.externalProjectKey ? `${duplicateProjectBinding.externalProjectKey} · ` : ""}{duplicateProjectBinding.externalProjectName} is already linked to {projectName(bindProjectId)}.</small>}
       <button className="integration-primary" disabled={!externalProjectId || (adding !== "basecamp" && !bindProjectId) || Boolean(duplicateProjectBinding) || busy !== null} onClick={() => void saveBinding()}>{adding === "basecamp" && !bindProjectId ? "Create and connect project" : "Connect project"}</button>
     </section>}
-    <section><h3>Connected projects</h3>{bindings.length ? <div className="integration-bindings">{bindings.map((binding) => { const rowBusy = busy === `sync:${binding.id}` || busy === `review:${binding.id}` || busy === `disconnect:${binding.id}`; return <article key={binding.id}>
+    <section><h3>Connected projects</h3><p className="integration-section-help">Fetch latest reads external items into a private review queue. Review items lets you choose what becomes Planbraid work. Neither action changes Basecamp or Jira.</p>{bindings.length ? <div className="integration-bindings">{bindings.map((binding) => { const rowBusy = busy === `sync:${binding.id}` || busy === `review:${binding.id}` || busy === `disconnect:${binding.id}`; return <article key={binding.id}>
       <span className={`integration-provider-mark ${binding.provider}`}><ProviderMark provider={binding.provider} /></span><div><strong>{binding.externalProjectKey ? `${binding.externalProjectKey} · ` : ""}{binding.externalProjectName}</strong><small>{LABEL[binding.provider]} · {projectName(binding.projectId)} · {binding.status.replaceAll("_", " ")}{binding.lastSyncAt ? ` · last synced ${new Date(binding.lastSyncAt).toLocaleString()}` : " · not synced yet"}{binding.lastErrorCode ? ` · ${binding.lastErrorCode}` : ""}</small></div><span className="integration-count">{binding.pendingCount} pending</span>
-      <button disabled={rowBusy} onClick={() => void sync(binding)}>{busy === `sync:${binding.id}` ? "Syncing…" : "Sync"}</button><button disabled={rowBusy} onClick={() => void openReview(binding)}>Review</button><button className="integration-danger" disabled={rowBusy} onClick={() => void disconnect(binding)}>Disconnect</button>
+      <button disabled={rowBusy} title={`Read the latest work from ${LABEL[binding.provider]} into the review queue`} onClick={() => void sync(binding)}>{busy === `sync:${binding.id}` ? "Fetching…" : "Fetch latest"}</button><button disabled={rowBusy} title="Open the staged items without importing them" onClick={() => void openReview(binding)}>Review items</button><button className="integration-danger" disabled={rowBusy} onClick={() => void disconnect(binding)}>Disconnect</button>
     </article>; })}</div> : <p className="integration-empty compact">No external projects are connected yet.</p>}</section>
-    {reviewing && <section className="integration-review"><header><div><h3>Review {reviewing.externalProjectName}</h3><p>{pendingCandidates.length} items are awaiting a decision. Linked updates never overwrite Planbraid work.</p></div><button onClick={() => setReviewing(null)}>Close review</button></header>
-      <div className="integration-review-toolbar"><label><input type="checkbox" checked={pendingCandidates.length > 0 && pendingCandidates.every((item) => selected.has(item.id))} onChange={(event) => setSelected(event.target.checked ? new Set(pendingCandidates.map((item) => item.id)) : new Set())} /> Select pending</label><button className="integration-primary" disabled={!selected.size || busy !== null} onClick={() => void applySelected()}>{busy === `apply:${reviewing.id}` ? "Applying…" : `Apply selected (${selected.size})`}</button></div>
+    {reviewing && <section className="integration-review"><header><div><h3>Review before importing · {reviewing.externalProjectName}</h3><p>{pendingCandidates.length} items are staged only. Select what you want, then import it into Planbraid. Imported items appear as proposals in the project; nothing here writes work back to {LABEL[reviewing.provider]}.</p></div><button onClick={() => setReviewing(null)}>Close review</button></header>
+      <div className="integration-review-toolbar"><label><input type="checkbox" checked={pendingCandidates.length > 0 && pendingCandidates.every((item) => selected.has(item.id))} onChange={(event) => setSelected(event.target.checked ? new Set(pendingCandidates.map((item) => item.id)) : new Set())} /> Select pending</label><button className="integration-primary" disabled={!selected.size || busy !== null} onClick={() => void applySelected()}>{busy === `apply:${reviewing.id}` ? "Importing…" : `Import selected (${selected.size})`}</button></div>
       <div className="integration-candidates">{candidates.length ? candidates.map((candidate) => <article key={candidate.id} className={candidate.reviewStatus !== "pending" ? "decided" : ""}>
         <input type="checkbox" disabled={candidate.reviewStatus !== "pending"} checked={selected.has(candidate.id)} onChange={() => setSelected((current) => { const next = new Set(current); if (next.has(candidate.id)) next.delete(candidate.id); else next.add(candidate.id); return next; })} aria-label={`Select ${candidate.title}`} />
         <div><strong>{candidate.externalKey ? `${candidate.externalKey} · ` : ""}{candidate.title}</strong><small>{candidate.itemType} · {candidate.externalStatus || candidate.normalizedStatus} · {candidate.priority}{candidate.assignee ? ` · ${candidate.assignee}` : ""}</small>{candidate.planningHints.length > 0 && <p>{candidate.planningHints.join(" · ")}</p>}</div><a href={candidate.canonicalUrl} target="_blank" rel="noreferrer">Open</a>{candidate.reviewStatus === "pending" ? <button disabled={busy === `ignore:${candidate.id}`} onClick={() => void ignore(candidate)}>Ignore</button> : <span className="integration-decision">{candidate.workItemKey ?? candidate.reviewStatus}</span>}

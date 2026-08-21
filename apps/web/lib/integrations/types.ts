@@ -1,6 +1,13 @@
 export const INTEGRATION_PROVIDERS = ["basecamp", "jira", "slack"] as const;
 export type IntegrationProvider = (typeof INTEGRATION_PROVIDERS)[number];
 
+/** External work systems are ingestion-only. Planbraid may read their projects/items
+ * and register provider webhooks, but it never publishes task, comment, or status
+ * mutations back to them and never deletes provider data or configuration. Disconnects
+ * are local-only. Canonical work is changed only inside Planbraid. */
+export const IMPORT_ONLY_PROVIDERS = ["basecamp", "jira"] as const;
+export type ImportOnlyProvider = (typeof IMPORT_ONLY_PROVIDERS)[number];
+
 /** Providers that publish Planbraid updates outward, as opposed to importing external
  * work (basecamp, jira). Kept as its own list rather than a field on IntegrationProvider
  * because the two families use entirely different binding shapes - see
@@ -132,4 +139,3 @@ export type IntegrationChannelBindingSummary = {
    * this flag is advisory, not the enforcement point. */
   overlapping: boolean;
 };
-

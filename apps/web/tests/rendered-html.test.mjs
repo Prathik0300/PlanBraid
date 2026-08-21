@@ -133,8 +133,9 @@ test("ships the product UI, service worker, and manifest", async () => {
 });
 
 test("keeps primary navigation clear and every visible button actionable", async () => {
-  const [app, css, store, setup, oauth, mcp, mcpTools, mcpServer, contracts] = await Promise.all([
+  const [app, integrations, css, store, setup, oauth, mcp, mcpTools, mcpServer, contracts] = await Promise.all([
     readFile(new URL("../app/planbraid-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/integrations-dialog.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../lib/store.ts", import.meta.url), "utf8"),
     readFile(new URL("../db/setup.ts", import.meta.url), "utf8"),
@@ -146,11 +147,16 @@ test("keeps primary navigation clear and every visible button actionable", async
   ]);
   const sidebar = app.slice(app.indexOf("function ProjectRail"), app.indexOf("function Header"));
   assert.match(sidebar, /Projects/);
-  assert.match(sidebar, /basecampProjects/);
+  assert.match(sidebar, /providerSections/);
   assert.match(sidebar, /project-provider-toggle/);
-  assert.match(sidebar, /aria-expanded=\{basecampExpanded\}/);
+  assert.match(sidebar, /aria-expanded=\{expandedProviders\[provider\]\}/);
+  assert.match(sidebar, /<ProviderMark provider=\{provider\}/);
   assert.match(sidebar, /Chats & agents/);
   assert.match(sidebar, /All activity/);
+  assert.match(integrations, /Fetch latest/);
+  assert.match(integrations, /Review before importing/);
+  assert.match(integrations, /Import selected/);
+  assert.match(integrations, /nothing here writes work back to/);
   assert.doesNotMatch(sidebar, /codingSpaces|safePath|worktree|local main|branch/);
   assert.doesNotMatch(app, /function SourceRail|event-menu|Workspace settings|saved-views/);
   assert.match(app, /aria-pressed=\{view === entry\}/);
