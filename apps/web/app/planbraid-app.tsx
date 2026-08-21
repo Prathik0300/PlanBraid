@@ -556,7 +556,7 @@ function LoadingShell() {
     <div className="shell-skeleton-rail">{Array.from({ length: 5 }, (_, index) => <Skeleton key={index} />)}</div>
     <div className="shell-skeleton-main">
       <div className="shell-skeleton-header"><Skeleton /><Skeleton /></div>
-      <div className="shell-skeleton-body">{Array.from({ length: 5 }, (_, index) => <Skeleton key={index} />)}</div>
+      <div className="shell-skeleton-body"><div className="shell-skeleton-empty"><Skeleton /><Skeleton /><Skeleton /><Skeleton /><div className="shell-skeleton-empty-actions"><Skeleton /><Skeleton /></div></div></div>
     </div>
   </div>;
 }

@@ -322,8 +322,17 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .shell-skeleton-header { height: 52px; flex: 0 0 52px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; padding: 0 16px; }
 .shell-skeleton-header .skeleton:first-child { width: 140px; height: 15px; }
 .shell-skeleton-header .skeleton:last-child { width: 90px; height: 24px; margin-left: auto; border-radius: 6px; }
-.shell-skeleton-body { flex: 1; padding: 22px 26px; display: flex; flex-direction: column; gap: 10px; max-width: 640px; }
-.shell-skeleton-body .skeleton { height: 54px; border-radius: 9px; }
+/* Matches .empty-state's actual shape (min-height:300px, centered column, icon + title
+   + body + action row) - the content that lands in this exact spot on first load, so the
+   skeleton neither collapses nor visibly shifts alignment when real content replaces it. */
+.shell-skeleton-body { flex: 1; min-height: 300px; display: flex; align-items: center; justify-content: center; }
+.shell-skeleton-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.shell-skeleton-empty .skeleton:nth-child(1) { width: 40px; height: 40px; border-radius: 10px; }
+.shell-skeleton-empty .skeleton:nth-child(2) { width: 220px; height: 14px; margin-top: 6px; }
+.shell-skeleton-empty .skeleton:nth-child(3) { width: 280px; height: 12px; }
+.shell-skeleton-empty .skeleton:nth-child(4) { width: 240px; height: 12px; }
+.shell-skeleton-empty-actions { display: flex; gap: 8px; margin-top: 8px; }
+.shell-skeleton-empty-actions .skeleton { width: 108px; height: 34px; border-radius: 7px; }
 .mobile-nav, .mobile-only { display: none; }
 .sidebar-toggle { color: var(--muted); }
 .sidebar-toggle[aria-expanded="true"] { color: var(--text); }
@@ -667,12 +676,13 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .integration-body { overflow-y: auto; padding: 18px 20px 24px; display: flex; flex-direction: column; gap: 22px; }
 .integration-body section > h3, .integration-add header h3, .integration-review header h3 { margin: 0 0 9px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
 .integration-provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
-/* flex, not a rigid grid: at narrow widths (the account-tab's profile-dialog is much
-   narrower than the per-project dialog this was first built for) two action buttons no
-   longer crush the name/status text into a near-zero-width ellipsis - they wrap onto
-   their own line under it instead. */
-.integration-provider-card { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
-.integration-provider-card > div, .integration-bindings article > div, .integration-candidates article > div { min-width: 0; flex: 1 1 120px; display: flex; flex-direction: column; gap: 3px; }
+/* Every card is the same two-row shape regardless of how many action buttons it has:
+   icon+text on top, actions always on their own row below - never inline-right for one
+   button and wrapped-below for two, which is what made Basecamp/Jira/Slack look like
+   three different card designs instead of one. */
+.integration-provider-card { display: flex; flex-direction: column; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.integration-provider-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.integration-provider-top > div, .integration-bindings article > div, .integration-candidates article > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
 .integration-provider-card strong, .integration-bindings strong, .integration-candidates strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .integration-provider-card small, .integration-bindings small, .integration-candidates small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
 .integration-provider-mark { width: 32px; height: 32px; flex: 0 0 32px; display: grid; place-items: center; border-radius: 7px; color: #fff; }
@@ -682,7 +692,7 @@ kbd { color: var(--faint); font: 12px var(--font-geist-mono); border: 1px solid 
 .integration-provider-mark.slack { background: #350d36; }
 .integration-provider-card button, .integration-provider-card a, .integration-add button, .integration-bindings button, .integration-review button, .integration-candidates a { min-height: 29px; display: inline-flex; align-items: center; justify-content: center; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-3); color: var(--text); font-size: 12px; text-decoration: none; white-space: nowrap; }
 .integration-provider-card button:disabled, .integration-add button:disabled, .integration-bindings button:disabled, .integration-review button:disabled { opacity: .5; cursor: default; }
-.integration-provider-actions { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.integration-provider-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .integration-add { padding: 14px; display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 11px; border: 1px solid #3c4960; border-radius: 9px; background: #141a24; }
 .integration-add > header { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; }
 .integration-add > header h3 { margin: 0; }
