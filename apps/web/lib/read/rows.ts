@@ -6,7 +6,7 @@
  * path, and it keeps one definition of "what a work item row means" rather than two that
  * can drift — the mistake `PLANNING_INTELLIGENCE_ROADMAP.md` F14 records for the matcher.
  */
-import type { Maturity, Notification, Project, Resolution, Source, WorkEvent, WorkItem, WorkStatus } from "@/lib/contracts";
+import type { Maturity, Notification, Project, ProjectMember, Resolution, Source, WorkEvent, WorkItem, WorkStatus } from "@/lib/contracts";
 import { normalizeSourcePresence } from "@/lib/presence";
 
 export type Row = Record<string, unknown>;
@@ -36,7 +36,12 @@ export function mapSource(row: Row, now = Date.now()): Source {
 }
 
 export function mapItem(row: Row): WorkItem {
-  return { id: text(row, "id"), projectId: text(row, "project_id"), sequence: number(row, "sequence"), itemKey: text(row, "item_key"), type: text(row, "type"), title: text(row, "title"), description: text(row, "description"), status: text(row, "status") as WorkStatus, maturity: (nullable(row, "maturity") ?? "accepted") as Maturity, resolution: nullable(row, "resolution") as Resolution | null, resolutionReason: nullable(row, "resolution_reason"), deferredUntil: nullable(row, "deferred_until"), priority: text(row, "priority") as WorkItem["priority"], assignee: nullable(row, "assignee"), sourceId: nullable(row, "source_id"), codingSpaceId: nullable(row, "coding_space_id"), completionConfidence: text(row, "completion_confidence"), verificationStatus: text(row, "verification_status"), blockerReason: nullable(row, "blocker_reason"), statusProvenance: nullable(row, "status_provenance"), blockingCount: number(row, "blocking_count"), unblockedAt: nullable(row, "unblocked_at"), version: number(row, "version"), startedAt: nullable(row, "started_at"), completedAt: nullable(row, "completed_at"), createdAt: text(row, "created_at"), updatedAt: text(row, "updated_at") };
+  const memberIds = Array.isArray(row.assignee_member_ids) ? row.assignee_member_ids.map(String) : parseJson<string[]>(text(row, "assignee_member_ids"), []);
+  return { id: text(row, "id"), projectId: text(row, "project_id"), sequence: number(row, "sequence"), itemKey: text(row, "item_key"), type: text(row, "type"), title: text(row, "title"), description: text(row, "description"), status: text(row, "status") as WorkStatus, maturity: (nullable(row, "maturity") ?? "accepted") as Maturity, resolution: nullable(row, "resolution") as Resolution | null, resolutionReason: nullable(row, "resolution_reason"), deferredUntil: nullable(row, "deferred_until"), priority: text(row, "priority") as WorkItem["priority"], assignee: nullable(row, "assignee"), assigneeMemberIds: memberIds, sourceId: nullable(row, "source_id"), codingSpaceId: nullable(row, "coding_space_id"), completionConfidence: text(row, "completion_confidence"), verificationStatus: text(row, "verification_status"), blockerReason: nullable(row, "blocker_reason"), statusProvenance: nullable(row, "status_provenance"), blockingCount: number(row, "blocking_count"), unblockedAt: nullable(row, "unblocked_at"), version: number(row, "version"), startedAt: nullable(row, "started_at"), completedAt: nullable(row, "completed_at"), createdAt: text(row, "created_at"), updatedAt: text(row, "updated_at") };
+}
+
+export function mapProjectMember(row: Row): ProjectMember {
+  return { id: text(row, "id"), projectId: text(row, "project_id"), provider: text(row, "provider") as ProjectMember["provider"], externalId: nullable(row, "external_id"), name: text(row, "name"), email: nullable(row, "email"), avatarUrl: nullable(row, "avatar_url"), title: nullable(row, "title"), active: Boolean(row.active) };
 }
 
 export function mapEvent(row: Row): WorkEvent {

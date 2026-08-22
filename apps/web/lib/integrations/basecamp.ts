@@ -1,7 +1,7 @@
 import type { PgD1 } from "@/db/pg-d1";
 import { connectionCredentials, markConnectionError, providerConfig, replaceConnectionTokens } from "@/lib/integrations/core";
 import { nextLink, providerFetch, ProviderHttpError } from "@/lib/integrations/http";
-import type { ExternalProject, ExternalResource, NormalizedExternalItem, ProviderRequest } from "@/lib/integrations/types";
+import type { ExternalMember, ExternalProject, ExternalResource, NormalizedExternalItem, ProviderRequest } from "@/lib/integrations/types";
 import { safeIso, textFromHtml } from "@/lib/integrations/utils";
 
 type Json = Record<string, unknown>;
@@ -108,17 +108,31 @@ export async function fetchBasecampProjectItems(db: PgD1, binding: Json, fetcher
   return normalized;
 }
 
+export async function fetchBasecampProjectMembers(db: PgD1, binding: Json, fetcher: ProviderRequest = fetch): Promise<ExternalMember[]> {
+  const token = await basecampAccessToken(db, String(binding.connection_id), fetcher);
+  const baseUrl = checkedBasecampBaseUrl(String(binding.external_base_url), String(binding.external_account_id));
+  const projectId = String(binding.external_project_id);
+  return (await getAllPages<Json>(`${baseUrl}/projects/${encodeURIComponent(projectId)}/people.json`, token, fetcher)).map(normalizeBasecampPerson).filter((person) => person.externalId);
+}
+
+function normalizeBasecampPerson(person: Json): ExternalMember {
+  return { externalId: String(person.id ?? ""), name: String(person.name ?? "Unknown Basecamp member"), email: person.email_address ? String(person.email_address) : null, avatarUrl: person.avatar_url ? String(person.avatar_url) : null, title: person.title ? String(person.title) : null, active: person.status !== "inactive", raw: person };
+}
+
 export function normalizeBasecampTodoList(list: Json): NormalizedExternalItem {
   return {
     externalId: String(list.id), externalKey: null, itemType: "feature", title: String(list.title ?? "Untitled to-do list"),
     description: textFromHtml(list.description), externalStatus: String(list.status ?? "active"), normalizedStatus: list.status === "trashed" ? "cancelled" : "planned",
-    priority: "normal", assignee: null, dueAt: null, parentExternalId: null, canonicalUrl: String(list.app_url ?? ""),
+    priority: "normal", assignee: null, assignees: [], dueAt: null, parentExternalId: null, canonicalUrl: String(list.app_url ?? ""),
     externalRevision: safeIso(list.updated_at), relations: [], raw: list,
   };
 }
 
 export function normalizeBasecampTodo(todo: Json, fallbackParentId: string | null): NormalizedExternalItem {
-  const assignees = Array.isArray(todo.assignees) ? (todo.assignees as Json[]).map((person) => String(person.name ?? "")).filter(Boolean) : [];
+  const listedAssignees = Array.isArray(todo.assignees) ? (todo.assignees as Json[]).map(normalizeBasecampPerson) : [];
+  // Old snapshots/tests may contain a name without an id. Keep that display value for
+  // compatibility, but only stable provider identities enter the structured owner links.
+  const assignees = listedAssignees.filter((person) => person.externalId);
   const parent = todo.parent && typeof todo.parent === "object" ? todo.parent as Json : null;
   const completed = Boolean(todo.completed);
   const status = String(todo.status ?? "active");
@@ -126,7 +140,7 @@ export function normalizeBasecampTodo(todo: Json, fallbackParentId: string | nul
     externalId: String(todo.id), externalKey: null, itemType: "task", title: String(todo.content ?? todo.title ?? "Untitled to-do"),
     description: textFromHtml(todo.description), externalStatus: completed ? "completed" : status,
     normalizedStatus: status === "trashed" ? "cancelled" : completed ? "done" : "planned", priority: "normal",
-    assignee: assignees.length ? assignees.join(", ") : null, dueAt: safeIso(todo.due_on),
+    assignee: listedAssignees.length ? listedAssignees.map((person) => person.name).join(", ") : null, assignees, dueAt: safeIso(todo.due_on),
     parentExternalId: parent?.type === "Todolist" && parent.id ? String(parent.id) : fallbackParentId,
     canonicalUrl: String(todo.app_url ?? ""), externalRevision: safeIso(todo.updated_at), relations: [], raw: todo,
   };

@@ -130,7 +130,7 @@ export function AuthScreen() {
           <button className="auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "sign-in" ? "Sign in" : "Create account"}</button>
         </form>
         <p className="auth-switch">{mode === "sign-in" ? "New to Planbraid?" : "Already have an account?"} <button onClick={() => { setMode(mode === "sign-in" ? "sign-up" : "sign-in"); setMessage(null); setFieldErrors({}); }}>{mode === "sign-in" ? "Create an account" : "Sign in"}</button></p>
-        <footer>By continuing, you agree to keep your account credentials secure.</footer>
+        <footer>By continuing, you agree to keep your account credentials secure. See how we handle information in our <a href="/privacy">Privacy Policy</a>.</footer>
       </div>
     </section>
   </main>;

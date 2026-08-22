@@ -15,6 +15,7 @@ export function integrationProvider(value: string): IntegrationProvider {
 
 const PROVIDER_ENV_PREFIX: Record<IntegrationProvider, string> = { basecamp: "BASECAMP", jira: "JIRA", slack: "SLACK" };
 const PROVIDER_LABEL: Record<IntegrationProvider, string> = { basecamp: "Basecamp", jira: "Jira", slack: "Slack" };
+export const JIRA_OAUTH_SCOPES = ["read:jira-work", "read:jira-user", "manage:jira-webhook", "offline_access"] as const;
 
 export function providerConfigured(provider: IntegrationProvider) {
   const prefix = PROVIDER_ENV_PREFIX[provider];
@@ -79,7 +80,7 @@ export async function beginProviderOAuth(db: PgD1, principal: Principal, provide
   const url = new URL("https://auth.atlassian.com/authorize");
   url.searchParams.set("audience", "api.atlassian.com");
   url.searchParams.set("client_id", clientId);
-  url.searchParams.set("scope", "read:jira-work manage:jira-webhook offline_access");
+  url.searchParams.set("scope", JIRA_OAUTH_SCOPES.join(" "));
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("state", state);
   url.searchParams.set("response_type", "code");
@@ -182,4 +183,3 @@ export async function requireOwnedProject(db: PgD1, organizationId: string, proj
 export function domainError(code: string, message: string, status = 422, details?: Record<string, unknown>) {
   return Object.assign(new Error(message), { code, status, details });
 }
-

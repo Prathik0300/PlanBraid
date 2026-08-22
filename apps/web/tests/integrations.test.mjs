@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 
 import { normalizeBasecampTodo, normalizeBasecampTodoList } from "@/lib/integrations/basecamp.ts";
-import { saveConnection } from "@/lib/integrations/core.ts";
+import { JIRA_OAUTH_SCOPES, saveConnection } from "@/lib/integrations/core.ts";
 import { nextLink, providerFetch, ProviderHttpError } from "@/lib/integrations/http.ts";
 import { createBinding, disconnectBinding } from "@/lib/integrations/service.ts";
 import { normalizeJiraIssue, verifyJiraWebhookBearer } from "@/lib/integrations/jira.ts";
@@ -19,11 +19,16 @@ test("Basecamp and Jira are import-only while Slack is the only publication prov
   assert.equal(IMPORT_ONLY_PROVIDERS.some((provider) => PUBLICATION_PROVIDERS.includes(provider)), false);
 });
 
+test("Jira OAuth requests work, user, webhook, and refresh access", () => {
+  assert.deepEqual(JIRA_OAUTH_SCOPES, ["read:jira-work", "read:jira-user", "manage:jira-webhook", "offline_access"]);
+});
+
 test("Basecamp normalization preserves hierarchy and planning fields", () => {
   const list = normalizeBasecampTodoList({ id: 20, title: "Checkout", description: "<p>Ship &amp; verify</p>", status: "active", app_url: "https://3.basecamp.com/1/buckets/2/todolists/20" });
-  const todo = normalizeBasecampTodo({ id: 21, content: "Add tax", description: "<p>Use regional rates</p>", completed: false, status: "active", due_on: "2026-09-01", assignees: [{ name: "Rae" }], app_url: "https://3.basecamp.com/1/buckets/2/todos/21" }, "20");
+  const todo = normalizeBasecampTodo({ id: 21, content: "Add tax", description: "<p>Use regional rates</p>", completed: false, status: "active", due_on: "2026-09-01", assignees: [{ id: 7, name: "Rae", email_address: "rae@example.com" }], app_url: "https://3.basecamp.com/1/buckets/2/todos/21" }, "20");
   assert.equal(list.itemType, "feature"); assert.equal(list.description, "Ship & verify");
   assert.equal(todo.parentExternalId, "20"); assert.equal(todo.assignee, "Rae");
+  assert.deepEqual(todo.assignees.map(({ externalId, name, email }) => ({ externalId, name, email })), [{ externalId: "7", name: "Rae", email: "rae@example.com" }]);
   assert.equal(todo.dueAt, "2026-09-01T00:00:00.000Z"); assert.equal(todo.normalizedStatus, "planned");
 });
 
@@ -75,12 +80,13 @@ test("a Basecamp binding without a destination creates and groups a same-named P
 test("Jira ADF, status, priority, parent and issue links normalize", () => {
   const issue = normalizeJiraIssue({ id: "100", key: "APP-9", self: "https://example.atlassian.net/rest/api/3/issue/100", fields: {
     summary: "Implement checkout", description: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Fast " }, { type: "text", text: "and safe" }] }] },
-    status: { name: "In Review", statusCategory: { name: "In Progress" } }, priority: { name: "Highest" }, assignee: { displayName: "Sam" },
+    status: { name: "In Review", statusCategory: { name: "In Progress" } }, priority: { name: "Highest" }, assignee: { accountId: "jira-sam", displayName: "Sam", active: true },
     parent: { id: "90" }, issuetype: { name: "Story" }, project: { key: "APP" }, updated: "2026-08-20T12:00:00Z",
     issuelinks: [{ type: { outward: "blocks" }, outwardIssue: { id: "101" } }],
   }});
   assert.equal(issue.description, "Fast and safe"); assert.equal(issue.normalizedStatus, "in_review");
   assert.equal(issue.priority, "urgent"); assert.equal(issue.parentExternalId, "90");
+  assert.deepEqual(issue.assignees.map(({ externalId, name }) => ({ externalId, name })), [{ externalId: "jira-sam", name: "Sam" }]);
   assert.deepEqual(issue.relations, [{ externalId: "101", type: "blocks", label: "blocks" }]);
   assert.equal(issue.canonicalUrl, "https://example.atlassian.net/browse/APP-9");
 });

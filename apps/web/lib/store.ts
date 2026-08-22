@@ -15,7 +15,7 @@ import { opPayloadFrom } from "@/lib/ops/hash.ts";
 import { DAG_EDGE_TYPES, DAG_EDGE_TYPE_SQL_LIST, isDagEdgeType } from "@/lib/graph/edges.ts";
 import { accountDisplayName, agentAccountKey, normalizeAccountLabel, providerFamily } from "@/lib/providers.ts";
 import { provenanceFor, type Provenance } from "@/lib/trust/provenance.ts";
-import { mapAlias, mapClaim, mapDependency, mapEvent, mapEvidence, mapItem, mapNotification, mapProject, mapSource, nullable, number, parseJson, text, type Row } from "@/lib/read/rows.ts";
+import { mapAlias, mapClaim, mapDependency, mapEvent, mapEvidence, mapItem, mapNotification, mapProject, mapProjectMember, mapSource, nullable, number, parseJson, text, type Row } from "@/lib/read/rows.ts";
 import { itemKeysFor } from "@/lib/read/project-view.ts";
 import { SOURCE_ENDED_AFTER_MS } from "@/lib/presence.ts";
 
@@ -187,12 +187,18 @@ async function removeGeneratedProjectShorthands(db: PgD1, organizationId: string
 
 export async function loadDashboard(db: PgD1, principal: Principal): Promise<DashboardState> {
   const organizationId = await organizationFor(db, principal);
+  // Backfill the project creator/owner into assignment directories created before team
+  // ownership existed. external_id makes this idempotent without conflating same-name people.
+  await db.prepare(`INSERT INTO project_members (id, organization_id, project_id, provider, external_id, name, email)
+    SELECT 'pmem_' || replace(gen_random_uuid()::text, '-', ''), p.organization_id, p.id, 'planbraid', ?, ?, ? FROM projects p
+    WHERE p.organization_id = ? AND p.status <> 'archived' AND NOT EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = p.id AND pm.provider = 'planbraid' AND pm.external_id = ?)`)
+    .bind(principal.userId, principal.displayName, principal.email, organizationId, principal.userId).run();
   const presenceNow = Date.now();
-  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows, claimRows, integrationBindingRows] = await db.batch([
+  const [projects, spaces, sources, items, events, notifications, dependencies, evidenceRows, aliasRows, importRequestRows, claimRows, integrationBindingRows, memberRows] = await db.batch([
     db.prepare("SELECT * FROM projects WHERE organization_id = ? AND status <> 'archived' ORDER BY updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM coding_spaces WHERE organization_id = ? ORDER BY last_seen_at DESC").bind(organizationId),
     db.prepare("SELECT sources.*, (pab.credential_id IS NOT NULL) AS access_blocked FROM sources LEFT JOIN project_access_blocks pab ON pab.project_id = sources.project_id AND pab.credential_id = sources.credential_id WHERE sources.organization_id = ? ORDER BY sources.last_seen_at DESC").bind(organizationId),
-    db.prepare("SELECT * FROM work_items WHERE organization_id = ? AND archived_at IS NULL ORDER BY updated_at DESC").bind(organizationId),
+    db.prepare("SELECT wi.*, COALESCE(array_agg(wia.project_member_id ORDER BY wia.position) FILTER (WHERE wia.project_member_id IS NOT NULL), ARRAY[]::text[]) AS assignee_member_ids FROM work_items wi LEFT JOIN work_item_assignees wia ON wia.work_item_id = wi.id WHERE wi.organization_id = ? AND wi.archived_at IS NULL GROUP BY wi.id ORDER BY wi.updated_at DESC").bind(organizationId),
     db.prepare("SELECT * FROM work_events WHERE organization_id = ? ORDER BY created_at DESC, project_revision DESC LIMIT 250").bind(organizationId),
     db.prepare("SELECT * FROM notifications WHERE organization_id = ? AND recipient_user_id = ? ORDER BY created_at DESC LIMIT 100").bind(organizationId, principal.userId),
     db.prepare("SELECT * FROM dependencies WHERE organization_id = ?").bind(organizationId),
@@ -203,6 +209,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     // through work_items; only unexpired leases are ever worth shipping to a client.
     db.prepare("SELECT wc.* FROM work_claims wc JOIN work_items wi ON wi.id = wc.work_item_id WHERE wi.organization_id = ? AND wc.lease_expires_at > now()").bind(organizationId),
     db.prepare("SELECT DISTINCT project_id, provider FROM integration_bindings WHERE organization_id = ? AND status <> 'disconnected'").bind(organizationId),
+    db.prepare("SELECT * FROM project_members WHERE organization_id = ? AND active = true ORDER BY name").bind(organizationId),
   ]);
   const providersByProject = new Map<string, string[]>();
   for (const row of integrationBindingRows.results as Row[]) {
@@ -215,6 +222,7 @@ export async function loadDashboard(db: PgD1, principal: Principal): Promise<Das
     codingSpaces: (spaces.results as Row[]).map((row) => ({ id: text(row, "id"), projectId: text(row, "project_id"), label: text(row, "label"), safePath: text(row, "safe_path"), branch: text(row, "branch"), kind: text(row, "kind"), status: text(row, "status"), lastSeenAt: text(row, "last_seen_at") })),
     sources: (sources.results as Row[]).map((row) => mapSource(row, presenceNow)),
     workItems: (items.results as Row[]).map(mapItem),
+    projectMembers: (memberRows.results as Row[]).map(mapProjectMember),
     events: (events.results as Row[]).map(mapEvent),
     notifications: (notifications.results as Row[]).map(mapNotification),
     dependencies: (dependencies.results as Row[]).map(mapDependency),
@@ -387,6 +395,10 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
 
       const response = { projectId, projectRevision: 1, status: "created" as const };
       await tx.prepare("INSERT INTO projects (id, organization_id, project_key, name, description, directory, git_remote, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)").bind(projectId, organizationId, projectId, cleanName, command.description?.trim().slice(0, 2000) ?? "", command.directory?.trim().slice(0, 500) ?? "", command.gitRemote?.trim().slice(0, 500) || null, now).run();
+      // The creator is the first assignable participant. This is an assignment directory,
+      // not authorization: project_members never grants app access.
+      await tx.prepare("INSERT INTO project_members (id, organization_id, project_id, provider, external_id, name, email) VALUES (?, ?, ?, 'planbraid', ?, ?, ?)")
+        .bind(id("pmem"), organizationId, projectId, principal.userId, principal.displayName, principal.email).run();
       await tx.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, 1, ?, 'project.created', ?, ?)").bind(id("evt"), organizationId, projectId, principal.displayName, `${principal.displayName} created ${cleanName}`, now).run();
       await tx.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)).run();
       return response;
@@ -420,6 +432,42 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
         .bind(id("evt"), organizationId, command.projectId, nextRevision, principal.displayName, `${principal.displayName} updated ${changed}`, now),
       db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
     ]);
+    return response;
+  }
+
+  if (command.action === "add_project_member") {
+    const name = command.name.trim().slice(0, 160);
+    if (!name) throw domainError("VALIDATION_FAILED", "Member name is required", 422);
+    const memberId = id("pmem");
+    const response = { projectId: command.projectId, memberId, projectRevision: nextRevision };
+    await commitMutation(db, [
+      db.prepare("INSERT INTO project_members (id, organization_id, project_id, provider, name, email, title) VALUES (?, ?, ?, 'planbraid', ?, ?, ?)")
+        .bind(memberId, organizationId, command.projectId, name, command.email?.trim().slice(0, 320) || null, command.title?.trim().slice(0, 160) || null),
+      db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
+      db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'project.member_added', ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, nextRevision, principal.displayName, `${principal.displayName} added ${name} to the project team`, now),
+      db.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)),
+    ]);
+    return response;
+  }
+
+  if (command.action === "remove_project_member") {
+    const member = await db.prepare("SELECT * FROM project_members WHERE id = ? AND project_id = ? AND organization_id = ? AND active = true").bind(command.memberId, command.projectId, organizationId).first<Row>();
+    if (!member) throw domainError("NOT_FOUND", "Project member not found", 404);
+    const response = { projectId: command.projectId, memberId: command.memberId, projectRevision: nextRevision };
+    await db.transaction(async (tx) => {
+      const affected = await tx.prepare("SELECT DISTINCT work_item_id FROM work_item_assignees WHERE project_member_id = ?").bind(command.memberId).all<{ work_item_id: string }>();
+      await tx.prepare("UPDATE project_members SET active = false, updated_at = ? WHERE id = ?").bind(now, command.memberId).run();
+      await tx.prepare("DELETE FROM work_item_assignees WHERE project_member_id = ?").bind(command.memberId).run();
+      for (const row of affected.results) {
+        await tx.prepare("UPDATE work_items wi SET assignee = names.value, version = version + 1, updated_at = ? FROM (SELECT NULLIF(string_agg(pm.name, ', ' ORDER BY wia.position), '') AS value FROM work_item_assignees wia JOIN project_members pm ON pm.id = wia.project_member_id WHERE wia.work_item_id = ?) names WHERE wi.id = ?")
+          .bind(now, row.work_item_id, row.work_item_id).run();
+      }
+      await tx.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision).run();
+      await tx.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, 'project.member_removed', ?, ?)")
+        .bind(id("evt"), organizationId, command.projectId, nextRevision, principal.displayName, `${principal.displayName} removed ${text(member, "name")} from the project team`, now).run();
+      await tx.prepare("INSERT INTO idempotency_records (scope, idempotency_key, request_hash, response) VALUES (?, ?, ?, ?)").bind(scope, command.idempotencyKey, requestHash, JSON.stringify(response)).run();
+    });
     return response;
   }
 
@@ -768,13 +816,28 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
     if (!title) throw domainError("VALIDATION_FAILED", "Task title is required");
     const description = command.description == null ? text(item, "description") : command.description.trim().slice(0, 10000);
     const priority = command.priority ?? text(item, "priority");
-    const assignee = command.assignee === undefined ? nullable(item, "assignee") : command.assignee;
+    const requestedMemberIds = command.assigneeMemberIds === undefined ? undefined : [...new Set(command.assigneeMemberIds)].slice(0, 25);
+    let assignee = command.assignee === undefined ? nullable(item, "assignee") : command.assignee;
+    let selectedMembers: Row[] = [];
+    if (requestedMemberIds) {
+      if (requestedMemberIds.length) {
+        const result = await db.prepare("SELECT * FROM project_members WHERE organization_id = ? AND project_id = ? AND active = true AND id = ANY(?::text[])").bind(organizationId, command.projectId, requestedMemberIds).all<Row>();
+        const byId = new Map(result.results.map((row) => [text(row, "id"), row]));
+        if (byId.size !== requestedMemberIds.length) throw domainError("INVALID_ASSIGNEE", "Every owner must be an active member of this project", 422);
+        selectedMembers = requestedMemberIds.map((memberId) => byId.get(memberId)!);
+      }
+      assignee = selectedMembers.length ? selectedMembers.map((row) => text(row, "name")).join(", ") : null;
+    }
     const actor = await resolveActor(db, organizationId, principal, command.sourceId, nullable(item, "source_id"));
     const updateInteractionId = await activeInteractionId(db, command.sourceId ?? nullable(item, "source_id"));
     const response = { itemId: command.itemId, version: command.expectedVersion + 1, projectRevision: nextRevision };
     await commitMutation(db, [
       db.prepare("UPDATE projects SET revision = ?, updated_at = ? WHERE id = ? AND revision = ?").bind(nextRevision, now, command.projectId, currentRevision),
       db.prepare("UPDATE work_items SET title = ?, description = ?, priority = ?, assignee = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?").bind(title, description, priority, assignee, now, command.itemId, command.expectedVersion),
+      ...(requestedMemberIds === undefined ? [] : [
+        db.prepare("DELETE FROM work_item_assignees WHERE work_item_id = ?").bind(command.itemId),
+        ...selectedMembers.map((member, position) => db.prepare("INSERT INTO work_item_assignees (organization_id, project_id, work_item_id, project_member_id, position) VALUES (?, ?, ?, ?, ?)").bind(organizationId, command.projectId, command.itemId, text(member, "id"), position)),
+      ]),
       db.prepare("INSERT INTO work_events (id, organization_id, project_id, project_revision, work_item_id, source_id, interaction_id, actor_name, event_type, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'work_item.updated', ?, ?)").bind(id("evt"), organizationId, command.projectId, nextRevision, command.itemId, command.sourceId ?? nullable(item, "source_id"), updateInteractionId, actor, `${actor} updated ${itemKey}`, now),
       // Re-indexed rather than appended to: an edited title can *drop* an artifact, and an
       // index that only grows keeps matching a file the task no longer mentions.

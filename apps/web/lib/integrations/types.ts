@@ -40,6 +40,16 @@ export type ExternalRelation = {
   label: string;
 };
 
+export type ExternalMember = {
+  externalId: string;
+  name: string;
+  email: string | null;
+  avatarUrl: string | null;
+  title: string | null;
+  active: boolean;
+  raw: Record<string, unknown>;
+};
+
 export type NormalizedExternalItem = {
   externalId: string;
   externalKey: string | null;
@@ -50,6 +60,7 @@ export type NormalizedExternalItem = {
   normalizedStatus: "proposed" | "planned" | "in_progress" | "blocked" | "in_review" | "done" | "cancelled";
   priority: "urgent" | "high" | "normal" | "low" | "none";
   assignee: string | null;
+  assignees: ExternalMember[];
   dueAt: string | null;
   parentExternalId: string | null;
   canonicalUrl: string;

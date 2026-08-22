@@ -86,6 +86,40 @@ test("replaying the same update_project key returns the first result rather than
   assert.equal(replay.idempotentReplay, true);
 });
 
+test("project teams provide stable multi-owner choices and removing a member unassigns only that person", async () => {
+  const db = await createTestDb();
+  const { projectId } = await executeCommand(db, principal, { action: "create_project", name: "Team project", idempotencyKey: "team-project" });
+  const created = await executeCommand(db, principal, { action: "create_item", projectId, title: "Shared task", idempotencyKey: "team-task" });
+  const rae = await executeCommand(db, principal, { action: "add_project_member", projectId, name: "Rae", email: "rae@example.com", idempotencyKey: "member-rae" });
+  const sam = await executeCommand(db, principal, { action: "add_project_member", projectId, name: "Sam", idempotencyKey: "member-sam" });
+
+  await executeCommand(db, principal, { action: "update_item", projectId, itemId: created.itemId, expectedVersion: 1, assigneeMemberIds: [rae.memberId, sam.memberId], idempotencyKey: "assign-team" });
+  let dashboard = await loadDashboard(db, principal);
+  let item = dashboard.workItems.find((entry) => entry.id === created.itemId);
+  assert.equal(item.assignee, "Rae, Sam");
+  assert.deepEqual(item.assigneeMemberIds, [rae.memberId, sam.memberId]);
+  assert.equal(dashboard.projectMembers.some((member) => member.projectId === projectId && member.externalId === principal.userId), true, "the project creator is always an assignment choice");
+
+  await executeCommand(db, principal, { action: "remove_project_member", projectId, memberId: rae.memberId, idempotencyKey: "remove-rae" });
+  dashboard = await loadDashboard(db, principal);
+  item = dashboard.workItems.find((entry) => entry.id === created.itemId);
+  assert.equal(item.assignee, "Sam");
+  assert.deepEqual(item.assigneeMemberIds, [sam.memberId]);
+  assert.equal(dashboard.projectMembers.some((member) => member.id === rae.memberId), false);
+});
+
+test("an owner from another project cannot be assigned", async () => {
+  const db = await createTestDb();
+  const first = await executeCommand(db, principal, { action: "create_project", name: "First team", idempotencyKey: "first-team" });
+  const second = await executeCommand(db, principal, { action: "create_project", name: "Second team", idempotencyKey: "second-team" });
+  const item = await executeCommand(db, principal, { action: "create_item", projectId: first.projectId, title: "Scoped task", idempotencyKey: "scoped-task" });
+  const outsider = await executeCommand(db, principal, { action: "add_project_member", projectId: second.projectId, name: "Other team", idempotencyKey: "other-team-member" });
+  await assert.rejects(
+    executeCommand(db, principal, { action: "update_item", projectId: first.projectId, itemId: item.itemId, expectedVersion: 1, assigneeMemberIds: [outsider.memberId], idempotencyKey: "cross-project-owner" }),
+    (error) => error.code === "INVALID_ASSIGNEE",
+  );
+});
+
 test("remove_source hides one project session without deleting its historical provenance", async () => {
   const db = await createTestDb();
   const { projectId } = await executeCommand(db, principal, { action: "create_project", name: "Agent cleanup", idempotencyKey: "p7" });

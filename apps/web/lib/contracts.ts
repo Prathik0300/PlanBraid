@@ -67,6 +67,20 @@ export type Project = {
   integrationProviders: string[];
 };
 
+/** A person who can own work in one project. Imported people remain external
+ * participants rather than Planbraid login accounts; selecting them never grants access. */
+export type ProjectMember = {
+  id: string;
+  projectId: string;
+  provider: "planbraid" | "basecamp" | "jira";
+  externalId: string | null;
+  name: string;
+  email: string | null;
+  avatarUrl: string | null;
+  title: string | null;
+  active: boolean;
+};
+
 export type CodingSpace = {
   id: string;
   projectId: string;
@@ -123,6 +137,8 @@ export type WorkItem = {
   deferredUntil: string | null;
   priority: "urgent" | "high" | "normal" | "low" | "none";
   assignee: string | null;
+  /** Structured project-member identities. Basecamp supports more than one owner. */
+  assigneeMemberIds: string[];
   sourceId: string | null;
   codingSpaceId: string | null;
   completionConfidence: string;
@@ -183,6 +199,7 @@ export type DashboardState = {
   codingSpaces: CodingSpace[];
   sources: Source[];
   workItems: WorkItem[];
+  projectMembers: ProjectMember[];
   events: WorkEvent[];
   notifications: Notification[];
   dependencies: Array<{ id: string; fromWorkItemId: string; toWorkItemId: string; type: string; reason: string }>;
@@ -200,6 +217,8 @@ export type DashboardState = {
 export type Command =
   | { action: "create_project"; name: string; directory?: string; description?: string; gitRemote?: string; idempotencyKey: string }
   | { action: "update_project"; projectId: string; name?: string; description?: string; directory?: string; gitRemote?: string; gateProposals?: boolean; idempotencyKey: string }
+  | { action: "add_project_member"; projectId: string; name: string; email?: string; title?: string; idempotencyKey: string }
+  | { action: "remove_project_member"; projectId: string; memberId: string; idempotencyKey: string }
   /** Soft-delete: sets status to 'archived' rather than removing rows. Every project-scoped
    * table (work_items, sources, decisions, evidence, ...) has no ON DELETE CASCADE, so a
    * hard delete would need to touch two dozen tables correctly or leave orphans; archiving
@@ -217,7 +236,7 @@ export type Command =
    * call, and unaffected by that credential reconnecting under a new session or marker. */
   | { action: "set_project_access"; projectId: string; credentialId: string; blocked: boolean; idempotencyKey: string }
   | { action: "create_item"; projectId: string; title: string; description?: string; status?: WorkStatus; maturity?: Maturity; priority?: WorkItem["priority"]; sourceId?: string; contentFingerprint?: string; type?: string; idempotencyKey: string }
-  | { action: "update_item"; projectId: string; itemId: string; expectedVersion: number; title?: string; description?: string; priority?: WorkItem["priority"]; assignee?: string | null; sourceId?: string; idempotencyKey: string }
+  | { action: "update_item"; projectId: string; itemId: string; expectedVersion: number; title?: string; description?: string; priority?: WorkItem["priority"]; assignee?: string | null; assigneeMemberIds?: string[]; sourceId?: string; idempotencyKey: string }
   | { action: "transition_item"; projectId: string; itemId: string; expectedVersion: number; status: WorkStatus; reason?: string; resolution?: Resolution; resolutionReason?: string; deferredUntil?: string | null; sourceId?: string; idempotencyKey: string }
   /** Promote or demote planning maturity. `statedBy` names the person whose decision this
    * was, and is what lets an agent record an acceptance it witnessed without being able to

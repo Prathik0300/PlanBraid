@@ -1,9 +1,9 @@
 import type { PgD1 } from "@/db/pg-d1";
 import type { Proposal } from "@/lib/dedup/match";
-import { createBasecampWebhook, fetchBasecampProjectItems, fetchBasecampTodo, listBasecampProjects, listBasecampResources } from "@/lib/integrations/basecamp";
+import { createBasecampWebhook, fetchBasecampProjectItems, fetchBasecampProjectMembers, fetchBasecampTodo, listBasecampProjects, listBasecampResources } from "@/lib/integrations/basecamp";
 import { domainError, integrationProvider, requireOwnedConnection, requireOwnedProject } from "@/lib/integrations/core";
-import { createJiraWebhook, fetchJiraIssue, fetchJiraProjectItems, listJiraProjects, listJiraResources, refreshJiraWebhook } from "@/lib/integrations/jira";
-import type { ExternalCandidate, IntegrationBindingSummary, IntegrationProvider, NormalizedExternalItem, ProviderRequest } from "@/lib/integrations/types";
+import { createJiraWebhook, fetchJiraIssue, fetchJiraProjectItems, fetchJiraProjectMembers, listJiraProjects, listJiraResources, refreshJiraWebhook } from "@/lib/integrations/jira";
+import type { ExternalCandidate, ExternalMember, IntegrationBindingSummary, IntegrationProvider, NormalizedExternalItem, ProviderRequest } from "@/lib/integrations/types";
 import { constantTimeEqual, integrationId, parseJson, randomSecret, sha256, stableJson } from "@/lib/integrations/utils";
 import { openSecret, sealSecret } from "@/lib/crypto-box";
 import { createWorkItemsDeduplicated, executeCommand, organizationFor, type Principal } from "@/lib/store";
@@ -123,7 +123,10 @@ export async function syncBindingRow(db: PgD1, binding: Row, runType: string, fe
     .bind(runId, binding.organization_id, binding.project_id, binding.id, binding.provider, runType).run();
   try {
     const provider = integrationProvider(String(binding.provider));
-    const items = provider === "basecamp" ? await fetchBasecampProjectItems(db, binding, fetcher) : await fetchJiraProjectItems(db, binding, fetcher);
+    const [items, members] = await Promise.all(provider === "basecamp"
+      ? [fetchBasecampProjectItems(db, binding, fetcher), fetchBasecampProjectMembers(db, binding, fetcher)]
+      : [fetchJiraProjectItems(db, binding, fetcher), fetchJiraProjectMembers(db, binding, fetcher)]);
+    await persistProjectMembers(db, binding, [...members, ...items.flatMap((item) => item.assignees)], true);
     const changed = await persistExternalItems(db, binding, items, true);
     await db.batch([
       db.prepare("UPDATE integration_sync_runs SET status = 'completed', fetched_count = ?, changed_count = ?, tombstoned_count = ?, completed_at = now() WHERE id = ?")
@@ -197,6 +200,10 @@ export async function applyCandidates(db: PgD1, principal: Principal, bindingId:
       db.prepare("UPDATE external_items SET review_status = ?, updated_at = now() WHERE id = ?")
         .bind(result?.status === "matched" ? "matched" : "imported", row.id),
     ]);
+    // Only a newly-created Planbraid task adopts imported ownership automatically.
+    // A dedupe match may be established work with deliberately different owners; the
+    // external assignee remains visible in its import note instead of overwriting it.
+    if (result?.status === "created") await applyImportedAssignees(db, binding, row, workItemId);
   }
   await applyExternalRelations(db, integrationPrincipal, binding, rows.results);
   return {
@@ -340,6 +347,7 @@ async function ownedBinding(db: PgD1, principal: Principal, bindingId: string) {
 }
 
 async function persistExternalItems(db: PgD1, binding: Row, items: NormalizedExternalItem[], fullSync: boolean) {
+  await persistProjectMembers(db, binding, items.flatMap((item) => item.assignees));
   const seen: string[] = [];
   let changed = 0;
   for (const item of items) {
@@ -361,6 +369,37 @@ async function persistExternalItems(db: PgD1, binding: Row, items: NormalizedExt
     tombstoned = result.results.length;
   }
   return { changed, tombstoned };
+}
+
+async function persistProjectMembers(db: PgD1, binding: Row, members: ExternalMember[], fullSync = false) {
+  const unique = new Map(members.filter((member) => member.externalId).map((member) => [member.externalId, member]));
+  for (const member of unique.values()) {
+    await db.prepare(`INSERT INTO project_members (id, organization_id, project_id, provider, external_id, name, email, avatar_url, title, active, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (project_id, provider, external_id) WHERE external_id IS NOT NULL DO UPDATE SET name = excluded.name, email = excluded.email, avatar_url = excluded.avatar_url, title = excluded.title, active = excluded.active, metadata = excluded.metadata, updated_at = now()`)
+      .bind(integrationId("pmem"), binding.organization_id, binding.project_id, binding.provider, member.externalId, member.name.slice(0, 160), member.email?.slice(0, 320) ?? null, member.avatarUrl?.slice(0, 2000) ?? null, member.title?.slice(0, 160) ?? null, member.active, JSON.stringify(member.raw)).run();
+  }
+  if (fullSync) {
+    const externalIds = [...unique.keys()];
+    if (externalIds.length) await db.prepare("UPDATE project_members SET active = false, updated_at = now() WHERE project_id = ? AND provider = ? AND active = true AND NOT (external_id = ANY(?::text[]))").bind(binding.project_id, binding.provider, externalIds).run();
+    else await db.prepare("UPDATE project_members SET active = false, updated_at = now() WHERE project_id = ? AND provider = ? AND active = true").bind(binding.project_id, binding.provider).run();
+  }
+}
+
+async function applyImportedAssignees(db: PgD1, binding: Row, externalItem: Row, workItemId: string) {
+  const snapshot = parseJson<NormalizedExternalItem>(String(externalItem.normalized_snapshot ?? "{}"), {} as NormalizedExternalItem);
+  const externalIds = [...new Set((snapshot.assignees ?? []).map((person) => person.externalId).filter(Boolean))];
+  if (!externalIds.length) return;
+  const members = await db.prepare("SELECT id, name, external_id FROM project_members WHERE project_id = ? AND provider = ? AND active = true AND external_id = ANY(?::text[])")
+    .bind(binding.project_id, binding.provider, externalIds).all<Row>();
+  const byExternalId = new Map(members.results.map((member) => [String(member.external_id), member]));
+  const ordered = externalIds.map((externalId) => byExternalId.get(externalId)).filter((member): member is Row => Boolean(member));
+  if (!ordered.length) return;
+  await db.batch([
+    db.prepare("DELETE FROM work_item_assignees WHERE work_item_id = ?").bind(workItemId),
+    ...ordered.map((member, position) => db.prepare("INSERT INTO work_item_assignees (organization_id, project_id, work_item_id, project_member_id, position) VALUES (?, ?, ?, ?, ?)").bind(binding.organization_id, binding.project_id, workItemId, member.id, position)),
+    db.prepare("UPDATE work_items SET assignee = ?, version = version + 1, updated_at = now() WHERE id = ?").bind(ordered.map((member) => String(member.name)).join(", "), workItemId),
+  ]);
 }
 
 async function tombstoneExternalItem(db: PgD1, bindingId: string, externalId: string) {

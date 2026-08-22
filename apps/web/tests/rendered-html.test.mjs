@@ -76,6 +76,21 @@ test("server-renders the Planbraid application shell", async () => {
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
+test("publishes a public, integration-ready privacy policy", async () => {
+  const response = await render("/privacy");
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
+  const html = await response.text();
+  assert.match(html, /<title>Privacy Policy \| Planbraid<\/title>/i);
+  assert.match(html, /Effective and last updated:[^<]*(?:<!-- -->)?August 21, 2026/i);
+  assert.match(html, /Information we collect/i);
+  assert.match(html, /Connected services, workplace data, and AI agents/i);
+  assert.match(html, /We do not sell personal information/i);
+  assert.match(html, /does not create, edit, transition, archive, or delete Jira issues/i);
+  assert.match(html, /Your choices and privacy rights/i);
+  assert.match(html, /Questions, concerns, and requests concerning this policy/i);
+});
+
 test("publishes MCP OAuth discovery metadata", async () => {
   const protectedResponse = await render("/.well-known/oauth-protected-resource");
   assert.equal(protectedResponse.status, 200);
@@ -118,8 +133,14 @@ test("ships the product UI, service worker, and manifest", async () => {
   assert.match(app, /source\.status === "ended" && <button className="agent-reconnect"/);
   assert.match(app, /className="agent-manage-identity"/);
   assert.match(app, /createPortal\(<div ref=\{menuRef\} className="project-menu"/);
+  assert.match(app, /Manage project team/);
+  assert.match(app, /className="owner-picker"/);
+  assert.match(app, /assigneeMemberIds: memberIds/);
+  assert.match(app, /Imported members are refreshed from Basecamp or Jira/);
   assert.match(css, /\.agent-delete\s*\{[^}]*color:\s*#ff9ba2/);
   assert.match(css, /\.project-menu\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*2147483647/);
+  assert.match(css, /\.owner-picker-menu\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*60/);
+  assert.match(css, /:root\[data-theme="light"\] \.owner-picker-menu/);
   assert.match(css, /\.agent-manage-identity \.provider-icon\s*\{[^}]*background:\s*transparent/);
   assert.match(css, /grid-template-columns:\s*var\(--rail\)/);
   assert.match(css, /prefers-reduced-motion/);

@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { PgD1 } from "@/db/pg-d1";
 import { connectionCredentials, markConnectionError, providerConfig, replaceConnectionTokens } from "@/lib/integrations/core";
 import { providerFetch, ProviderHttpError } from "@/lib/integrations/http";
-import type { ExternalProject, ExternalRelation, ExternalResource, NormalizedExternalItem, ProviderRequest } from "@/lib/integrations/types";
+import type { ExternalMember, ExternalProject, ExternalRelation, ExternalResource, NormalizedExternalItem, ProviderRequest } from "@/lib/integrations/types";
 import { fromBase64url, safeIso, textFromAdf } from "@/lib/integrations/utils";
 
 type Json = Record<string, unknown>;
@@ -114,12 +114,27 @@ export async function fetchJiraProjectItems(db: PgD1, binding: Json, fetcher: Pr
   return items;
 }
 
+export async function fetchJiraProjectMembers(db: PgD1, binding: Json, fetcher: ProviderRequest = fetch): Promise<ExternalMember[]> {
+  const token = await jiraAccessToken(db, String(binding.connection_id), fetcher);
+  const baseUrl = checkedJiraBaseUrl(String(binding.external_base_url), String(binding.external_account_id));
+  const project = String(binding.external_project_key ?? binding.external_project_id);
+  const response = await providerFetch(`${baseUrl}/rest/api/3/user/assignable/search?project=${encodeURIComponent(project)}&maxResults=1000`, { provider: "jira", fetcher, headers: jiraHeaders(token) });
+  const people = await response.json() as Json[];
+  return (Array.isArray(people) ? people : []).map(normalizeJiraPerson).filter((person) => person.externalId);
+}
+
+function normalizeJiraPerson(person: Json): ExternalMember {
+  const avatars = person.avatarUrls && typeof person.avatarUrls === "object" ? person.avatarUrls as Json : {};
+  return { externalId: String(person.accountId ?? ""), name: String(person.displayName ?? "Unknown Jira member"), email: person.emailAddress ? String(person.emailAddress) : null, avatarUrl: avatars["48x48"] ? String(avatars["48x48"]) : null, title: null, active: person.active !== false, raw: person };
+}
+
 export function normalizeJiraIssue(issue: Json): NormalizedExternalItem {
   const fields = issue.fields && typeof issue.fields === "object" ? issue.fields as Json : {};
   const status = fields.status && typeof fields.status === "object" ? fields.status as Json : {};
   const category = status.statusCategory && typeof status.statusCategory === "object" ? status.statusCategory as Json : {};
   const priority = fields.priority && typeof fields.priority === "object" ? fields.priority as Json : {};
   const assignee = fields.assignee && typeof fields.assignee === "object" ? fields.assignee as Json : null;
+  const normalizedAssignee = assignee ? normalizeJiraPerson(assignee) : null;
   const parent = fields.parent && typeof fields.parent === "object" ? fields.parent as Json : null;
   const issueType = fields.issuetype && typeof fields.issuetype === "object" ? fields.issuetype as Json : {};
   const links = Array.isArray(fields.issuelinks) ? fields.issuelinks as Json[] : [];
@@ -127,7 +142,7 @@ export function normalizeJiraIssue(issue: Json): NormalizedExternalItem {
     externalId: String(issue.id), externalKey: issue.key ? String(issue.key) : null,
     itemType: normalizeJiraType(String(issueType.name ?? "task")), title: String(fields.summary ?? "Untitled Jira issue"),
     description: textFromAdf(fields.description), externalStatus: String(status.name ?? ""), normalizedStatus: normalizeJiraStatus(String(status.name ?? ""), String(category.name ?? category.key ?? "")),
-    priority: normalizeJiraPriority(String(priority.name ?? "")), assignee: assignee?.displayName ? String(assignee.displayName) : null,
+    priority: normalizeJiraPriority(String(priority.name ?? "")), assignee: normalizedAssignee?.externalId ? normalizedAssignee.name : null, assignees: normalizedAssignee?.externalId ? [normalizedAssignee] : [],
     dueAt: safeIso(fields.duedate), parentExternalId: parent?.id ? String(parent.id) : null,
     canonicalUrl: issue.key && fields.project && typeof fields.project === "object" ? jiraBrowseUrl(String(issue.self ?? ""), String(issue.key)) : String(issue.self ?? ""),
     externalRevision: safeIso(fields.updated), relations: links.flatMap(normalizeJiraLink), raw: issue,
