@@ -1,9 +1,9 @@
 # Planbraid Implementation Plan
 
 One ordered plan across the three design documents. This supersedes the individual
-phase tables in [`GRAPH_ARCHITECTURE.md`](./GRAPH_ARCHITECTURE.md),
-[`DEDUPLICATION_ARCHITECTURE.md`](./DEDUPLICATION_ARCHITECTURE.md), and
-[`LOCAL_MODE_ARCHITECTURE.md`](./LOCAL_MODE_ARCHITECTURE.md) — those remain the
+phase tables in [`GRAPH_ARCHITECTURE.md`](../architecture/GRAPH_ARCHITECTURE.md),
+[`DEDUPLICATION_ARCHITECTURE.md`](../architecture/DEDUPLICATION_ARCHITECTURE.md), and
+[`LOCAL_MODE_ARCHITECTURE.md`](../architecture/LOCAL_MODE_ARCHITECTURE.md) — those remain the
 reference for *why* and *how*; this is *what* and *in what order*.
 
 Sizes are relative: **S** = a sitting, **M** = a day or so, **L** = multi-day.
