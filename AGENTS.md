@@ -1,6 +1,6 @@
 # Planbraid repository guidance
 
-Read `PRODUCT_ARCHITECTURE_PLAN.md` before changing architecture or beginning a work package. It is the canonical product and implementation specification. `IMPLEMENTATION_PLAN.md` tracks what has actually shipped against it, milestone by milestone, and is the more current reference for present state.
+Read [`docs/architecture/PRODUCT_ARCHITECTURE_PLAN.md`](docs/architecture/PRODUCT_ARCHITECTURE_PLAN.md) before changing architecture or beginning a work package. It is the canonical product and implementation specification. [`docs/plans/IMPLEMENTATION_PLAN.md`](docs/plans/IMPLEMENTATION_PLAN.md) tracks what has actually shipped against it, milestone by milestone, and is the more current reference for present state. See [`docs/README.md`](docs/README.md) for the full documentation index.
 
 For project work, Planbraid is the source of truth:
 
