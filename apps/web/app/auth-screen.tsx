@@ -13,6 +13,14 @@ function safeReturnTo() {
   return value.startsWith("/") && !value.startsWith("//") ? value : "/";
 }
 
+/** better-auth's anonymous plugin (lib/auth.ts) still returns a session for a guest
+ * sandbox - that has to be told apart from a real sign-in, or this screen would bounce
+ * a guest straight back out before they ever see the "create an account" form that is
+ * the whole point of following the link. */
+function isAnonymousSession(session: { user: { isAnonymous?: boolean | null } }) {
+  return Boolean(session.user.isAnonymous);
+}
+
 export function AuthScreen() {
   const { data: session } = authClient.useSession();
   const [mode, setMode] = useState<Mode>("sign-in");
@@ -48,8 +56,13 @@ export function AuthScreen() {
     if (params.size === 1 && params.get("returnTo") === "/") window.history.replaceState(null, "", "/sign-in");
   }, []);
 
+  const isGuestSession = Boolean(session && isAnonymousSession(session));
+
   useEffect(() => {
-    if (session) { window.location.replace(safeReturnTo()); return; }
+    // A guest sandbox session is deliberately not treated as "already signed in" here:
+    // bouncing it home would make the sign-up form this screen exists to show
+    // unreachable for exactly the visitor it matters most to (see isAnonymousSession).
+    if (session && !isAnonymousSession(session)) { window.location.replace(safeReturnTo()); return; }
     void fetch("/api/auth-config", { cache: "no-store" }).then((response) => response.json()).then((body: { data?: { googleEnabled?: boolean } }) => setGoogleEnabled(Boolean(body.data?.googleEnabled))).catch(() => undefined);
   }, [session]);
 
@@ -106,6 +119,18 @@ export function AuthScreen() {
     }
   }
 
+  async function continueAsGuest() {
+    setBusy(true);
+    setMessage(null);
+    const result = await authClient.signIn.anonymous();
+    if (result?.error) {
+      setMessage(result.error.message || "Could not start the guest sandbox");
+      setBusy(false);
+      return;
+    }
+    window.location.assign(safeReturnTo());
+  }
+
   return <main className="auth-page">
     <button className={`theme-switch auth-theme-switch ${theme}`} role="switch" aria-checked={theme === "light"} onClick={toggleTheme} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}><span className="theme-switch-thumb" aria-hidden="true"><span className="theme-switch-icon moon">☾</span><span className="theme-switch-icon sun">☼</span></span></button>
     <section className="auth-story" aria-label="About Planbraid">
@@ -116,11 +141,12 @@ export function AuthScreen() {
     </section>
     <section className="auth-panel">
       <div className="auth-card">
-        <header><span className="auth-mobile-brand"><span className="planbraid-logo" aria-hidden="true" />Planbraid</span><h2>{mode === "sign-in" ? "Welcome back" : "Create your account"}</h2><p>{mode === "sign-in" ? "Sign in to open your unified workspace." : "Start a private workspace for all your agents."}</p></header>
+        <header><span className="auth-mobile-brand"><span className="planbraid-logo" aria-hidden="true" />Planbraid</span><h2>{isGuestSession ? "Save this sandbox" : mode === "sign-in" ? "Welcome back" : "Create your account"}</h2><p>{isGuestSession ? "Create a free account to keep this workspace, its tasks, and any agent you connected to it." : mode === "sign-in" ? "Sign in to open your unified workspace." : "Start a private workspace for all your agents."}</p></header>
         <button className="google-auth" type="button" disabled={!googleEnabled || busy} onClick={() => void continueWithGoogle()}>
           <GoogleIcon /> Continue with Google
         </button>
         {!googleEnabled && <p className="oauth-unavailable">Google sign-in is ready in the app but needs the deployment&apos;s Google OAuth credentials.</p>}
+        {!isGuestSession && !session && <button className="google-auth guest-auth" type="button" disabled={busy} onClick={() => void continueAsGuest()}>Explore a live sandbox, no account needed</button>}
         <div className="auth-divider"><span>or use email</span></div>
         <form className="auth-form" onSubmit={submit} noValidate>
           {mode === "sign-up" && <label><span>Name</span><input autoComplete="name" value={name} onChange={(event) => { setName(event.target.value); setFieldErrors((current) => ({ ...current, name: undefined })); }} required minLength={2} maxLength={80} placeholder="Your name" aria-invalid={Boolean(fieldErrors.name)} aria-describedby={fieldErrors.name ? "name-error" : undefined} />{fieldErrors.name && <small className="field-error" id="name-error">{fieldErrors.name}</small>}</label>}

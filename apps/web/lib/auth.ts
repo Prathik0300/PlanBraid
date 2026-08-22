@@ -1,5 +1,7 @@
 import { betterAuth } from "better-auth";
+import { anonymous } from "better-auth/plugins";
 import type { PgD1 } from "@/db/pg-d1";
+import { claimGuestOrganization } from "@/lib/guest";
 
 const LOCAL_SECRET = "planbraid-local-development-secret-change-before-hosting";
 const LOCAL_ORIGIN = "http://localhost:3000";
@@ -64,6 +66,19 @@ export function authFor(runtime: AuthEnvironment) {
     enabled: true,
     storage: "database",
   },
+  plugins: [
+    // Lets a Product Hunt / cold-traffic visitor land straight in a working sandbox
+    // (see lib/guest.ts) instead of a sign-up wall. onLinkAccount fires when that same
+    // browser later signs up or signs in for real, while the anonymous session cookie is
+    // still live — better-auth swaps the session for the new account automatically; this
+    // hook is only responsible for handing the sandbox's data over with it.
+    anonymous({
+      emailDomainName: "guest.planbraid.app",
+      onLinkAccount: async ({ anonymousUser, newUser }) => {
+        await claimGuestOrganization(runtime.DB, anonymousUser.user.id, newUser.user.id);
+      },
+    }),
+  ],
  });
 }
 

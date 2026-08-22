@@ -8,6 +8,10 @@
     {
       "path": "/api/integrations/slack/drain",
       "schedule": "43 4 * * *"
+    },
+    {
+      "path": "/api/guest/cleanup",
+      "schedule": "0 * * * *"
     }
   ]
 }

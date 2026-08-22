@@ -42,10 +42,15 @@ export async function principalFromRequest(runtime: AuthEnvironment, request: Re
   await ensureSchema(runtime.DB);
   const session = await authFor(runtime).api.getSession({ headers: request.headers });
   if (!session) throw authenticationRequired();
+  // better-auth's anonymous plugin (lib/auth.ts) stamps this on the user row; the base
+  // session type here has no plugin awareness, so it's read defensively rather than
+  // assumed present.
+  const isGuest = Boolean((session.user as { isAnonymous?: boolean | null }).isAnonymous);
   return {
     userId: await canonicalUserId(runtime.DB, request, session),
     email: session.user.email,
-    displayName: session.user.name || session.user.email.split("@")[0] || "You",
+    displayName: isGuest ? "Guest" : session.user.name || session.user.email.split("@")[0] || "You",
     authentication: "browser",
+    isGuest,
   };
 }

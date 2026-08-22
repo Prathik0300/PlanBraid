@@ -5,6 +5,7 @@ import type { IntegrationConnectionSummary, IntegrationProvider } from "@/lib/in
 import { INTEGRATION_PROVIDERS } from "@/lib/integrations/types";
 import { integrationId, parseJson, randomSecret, sha256 } from "@/lib/integrations/utils";
 import { organizationFor, type Principal } from "@/lib/store";
+import { guestIntegrationsDisabledError } from "@/lib/guest";
 
 type Row = Record<string, unknown>;
 
@@ -40,6 +41,10 @@ export function providerRedirectUri(provider: IntegrationProvider, request: Requ
 }
 
 export async function beginProviderOAuth(db: PgD1, principal: Principal, provider: IntegrationProvider, projectId: string | null, request: Request) {
+  // A guest sandbox never gets a real OAuth grant: storing a real, long-lived Basecamp/
+  // Jira/Slack token against a throwaway anonymous user, and the webhook/App-install
+  // that comes with it, would outlive the sandbox itself. See lib/guest.ts's header.
+  if (principal.isGuest) throw guestIntegrationsDisabledError();
   await ensureSchema(db);
   const organizationId = await organizationFor(db, principal);
   if (projectId) await requireOwnedProject(db, organizationId, projectId);

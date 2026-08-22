@@ -383,6 +383,19 @@ export const MIGRATION_STATEMENTS = [
   // other structured column here, so a future provider's own identity fields need no
   // schema change.
   `ALTER TABLE integration_connections ADD COLUMN IF NOT EXISTS metadata TEXT NOT NULL DEFAULT '{}'`,
+  // better-auth's anonymous plugin (lib/auth.ts) owns this column's meaning; it is
+  // declared here rather than left to a better-auth migration because this app manages
+  // its own schema (see the file header) and every other better-auth table follows the
+  // same pattern. Read by lib/app-principal.ts to mark a Principal as a guest.
+  `ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "isAnonymous" BOOLEAN NOT NULL DEFAULT false`,
+  // An unclaimed sandbox workspace for an anonymous (better-auth "isAnonymous") visitor —
+  // see lib/guest.ts. Real columns, not projects.settings-style JSON, because the cleanup
+  // cron needs to scan for expired ones by an indexed predicate, and a claim (a real
+  // sign-up while the sandbox is still open) simply flips is_guest back to false rather
+  // than deleting anything.
+  `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS guest_expires_at TIMESTAMPTZ`,
+  `CREATE INDEX IF NOT EXISTS idx_organizations_guest_expiry ON organizations(guest_expires_at) WHERE is_guest = true`,
 ] as const;
 
 let initialized = false;

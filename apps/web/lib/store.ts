@@ -18,6 +18,7 @@ import { provenanceFor, type Provenance } from "@/lib/trust/provenance.ts";
 import { mapAlias, mapClaim, mapDependency, mapEvent, mapEvidence, mapItem, mapNotification, mapProject, mapProjectMember, mapSource, nullable, number, parseJson, text, type Row } from "@/lib/read/rows.ts";
 import { itemKeysFor } from "@/lib/read/project-view.ts";
 import { SOURCE_ENDED_AFTER_MS } from "@/lib/presence.ts";
+import { assertMcpTokenCap, assertProjectCap, assertWorkItemCap, touchGuestOrganization } from "@/lib/guest.ts";
 
 export type Principal = {
   userId: string;
@@ -37,6 +38,13 @@ export type Principal = {
   credentialId?: string;
   agentAccountId?: string;
   agentAccountLabel?: string;
+  /** True for a better-auth anonymous session (lib/auth.ts) browsing an unclaimed guest
+   * sandbox. Still authentication: "browser" and still a human principal for
+   * maturity/authority purposes — the only things this gates are lib/guest.ts's caps and
+   * real third-party integrations (lib/integrations/core.ts,
+   * app/api/github/connect/route.ts). Set by lib/app-principal.ts from the session's own
+   * isAnonymous flag; absent (not false) for every non-browser principal. */
+  isGuest?: boolean;
 };
 
 // `ready` is derived from acceptance plus a clear graph (lib/graph/column.ts), not stored,
@@ -106,6 +114,11 @@ export async function organizationFor(db: PgD1, principal: Principal) {
     await removeLegacyDemoData(db, existing.id, suffix);
     await removeGeneratedProjectShorthands(db, existing.id);
     await resetUnearnedVerification(db, existing.id);
+    // Refreshes the TTL on every visit from a still-anonymous session, so an active guest
+    // exploration never expires mid-session. A claimed workspace (is_guest already
+    // flipped false by claimGuestOrganization) is never touched here: principal.isGuest
+    // is only ever true for a session that is still anonymous.
+    if (principal.isGuest) await touchGuestOrganization(db, existing.id);
     return existing.id;
   }
 
@@ -115,14 +128,57 @@ export async function organizationFor(db: PgD1, principal: Principal) {
   // point believing no organization exists yet. ON CONFLICT DO NOTHING makes the losing
   // insert a no-op instead of an unhandled unique-violation.
   await db.batch([
-    db.prepare("INSERT INTO organizations (id, name, owner_user_id) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING").bind(organizationId, `${principal.displayName}'s workspace`, principal.userId),
+    db.prepare("INSERT INTO organizations (id, name, owner_user_id) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING").bind(organizationId, principal.isGuest ? "Guest sandbox" : `${principal.displayName}'s workspace`, principal.userId),
     db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, LEGACY_DEMO_MIGRATION),
     db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, PROJECT_SHORTHAND_MIGRATION),
     // A brand-new organization has nothing to correct, so the marker is written up front
     // rather than making every future load re-check an empty table.
     db.prepare("INSERT INTO data_migrations (organization_id, migration_key) VALUES (?, ?) ON CONFLICT (organization_id, migration_key) DO NOTHING").bind(organizationId, VERIFICATION_HONESTY_MIGRATION),
   ]);
+  if (principal.isGuest) {
+    await touchGuestOrganization(db, organizationId);
+    await seedGuestWorkspace(db, principal);
+  }
   return organizationId;
+}
+
+/**
+ * Populates a brand-new guest organization's first project through executeCommand
+ * (rather than hand-written INSERTs) so the seed goes through the same invariant-
+ * maintaining path as everything else — blocking_count, revision numbers, work_events —
+ * instead of a second write path that could drift from it. Deliberately honest: no fake
+ * "connected agent" sources, since this codebase treats fabricated activity/verification
+ * as a bug class of its own (see VERIFICATION_HONESTY_MIGRATION above). The one thing it
+ * demonstrates live is auto-unblock: "Wire up the sign-in screen" is seeded blocked on
+ * "Build the sign-in API," so completing that item in front of a visitor (or their own
+ * connected agent) is what moves the blocked card to Ready without a second click.
+ */
+async function seedGuestWorkspace(db: PgD1, principal: Principal) {
+  const project = await executeCommand(db, principal, {
+    action: "create_project",
+    name: "Planbraid Demo",
+    description: "A sandbox pre-loaded with a small dependency graph — connect your own coding agent from Setup, or just click around.",
+    idempotencyKey: "guest-seed:project",
+  }) as { projectId: string };
+  const projectId = project.projectId;
+
+  async function item(title: string, description: string, priority: WorkItem["priority"], status?: WorkStatus) {
+    const created = await executeCommand(db, principal, {
+      action: "create_item", projectId, title, description, priority, status,
+      idempotencyKey: `guest-seed:item:${title}`,
+    }) as { itemId: string };
+    return created.itemId;
+  }
+
+  const auth = await item("Design the sign-in flow", "Pick the sign-in method and sketch the screens.", "high", "done");
+  const api = await item("Build the sign-in API", "Needs the sign-in flow decided first.", "high");
+  const ui = await item("Wire up the sign-in screen", "Needs the sign-in API to call.", "normal", "ready");
+  await item("Write onboarding emails", "Independent of the sign-in work — safe to pick up any time.", "low");
+  await item("Add rate limiting to the API", "Independent hardening task once the API exists.", "normal");
+
+  await executeCommand(db, principal, { action: "add_dependency", projectId, fromWorkItemId: auth, toWorkItemId: api, type: "blocks", reason: "Needs the sign-in flow decided first", idempotencyKey: "guest-seed:dep:auth-api" });
+  await executeCommand(db, principal, { action: "add_dependency", projectId, fromWorkItemId: api, toWorkItemId: ui, type: "blocks", reason: "Needs the sign-in API to call", idempotencyKey: "guest-seed:dep:api-ui" });
+  await executeCommand(db, principal, { action: "add_evidence", projectId, itemId: auth, type: "note", label: "Decision recorded", result: "Email + Google OAuth, matching the account model already in place.", idempotencyKey: "guest-seed:evidence:auth" });
 }
 
 const LEGACY_DEMO_MIGRATION = "2026-08-10-remove-built-in-demo-data";
@@ -335,6 +391,8 @@ export async function executeCommand(db: PgD1, principal: Principal, command: Co
   const requestHash = await digest(JSON.stringify(command));
   const replay = await idempotentResult(db, scope, command.idempotencyKey, requestHash);
   if (replay) return replay;
+  if (command.action === "create_project") await assertProjectCap(db, organizationId, principal.isGuest);
+  if (command.action === "create_item") await assertWorkItemCap(db, organizationId, principal.isGuest);
 
   if (command.action === "mark_notification") {
     const now = new Date().toISOString();
@@ -1133,6 +1191,7 @@ export function errorResponse(error: unknown) {
 
 export async function createMcpToken(db: PgD1, principal: Principal, name: string) {
   const organizationId = await organizationFor(db, principal);
+  await assertMcpTokenCap(db, organizationId, principal.isGuest);
   const tokenId = id("tok");
   const tokenName = name.trim().slice(0, 120) || "Agent connection";
   const secretBytes = crypto.getRandomValues(new Uint8Array(32));
